@@ -2,20 +2,25 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
 
-	cache "github.com/pmylund/go-cache"
-
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/config"
 	"github.com/TykTechnologies/tyk/ctx"
-	"github.com/TykTechnologies/tyk/headers"
+	"github.com/TykTechnologies/tyk/header"
+	tykerrors "github.com/TykTechnologies/tyk/internal/errors"
+	graphqlinternal "github.com/TykTechnologies/tyk/internal/graphql"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/httputil"
+	"github.com/TykTechnologies/tyk/internal/otel"
 	"github.com/TykTechnologies/tyk/request"
 	"github.com/TykTechnologies/tyk/user"
 )
@@ -23,17 +28,6 @@ import (
 const (
 	keyDataDeveloperID    = "tyk_developer_id"
 	keyDataDeveloperEmail = "tyk_developer_email"
-)
-
-var (
-	// key session memory cache
-	SessionCache = cache.New(10*time.Second, 5*time.Second)
-
-	// org session memory cache
-	ExpiryCache = cache.New(600*time.Second, 10*time.Minute)
-
-	// memory cache to store arbitrary items
-	UtilCache = cache.New(time.Hour, 10*time.Minute)
 )
 
 type ProxyResponse struct {
@@ -46,12 +40,12 @@ type ProxyResponse struct {
 type ReturningHttpHandler interface {
 	ServeHTTP(http.ResponseWriter, *http.Request) ProxyResponse
 	ServeHTTPForCache(http.ResponseWriter, *http.Request) ProxyResponse
-	CopyResponse(io.Writer, io.Reader)
+	CopyResponse(io.Writer, io.Reader, time.Duration) error
 }
 
 // SuccessHandler represents the final ServeHTTP() request for a proxied API request
 type SuccessHandler struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func tagHeaders(r *http.Request, th []string, tags []string) []string {
@@ -128,9 +122,86 @@ func getSessionTags(session *user.SessionState) []string {
 	return tags
 }
 
-func (s *SuccessHandler) RecordHit(r *http.Request, timing Latency, code int, responseCopy *http.Response) {
+func recordGraphDetails(rec *analytics.AnalyticsRecord, r *http.Request, resp *http.Response, spec *APISpec) {
+	if !spec.GraphQL.Enabled || spec.GraphQL.ExecutionMode == apidef.GraphQLExecutionModeSubgraph {
+		return
+	}
+	logger := log.WithField("location", "recordGraphDetails")
+	if r.Body == nil {
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	defer func() {
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewBuffer(body))
+	}()
+	if err != nil {
+		logger.WithError(err).Error("error recording graph analytics")
+		return
+	}
+	var (
+		respBody []byte
+	)
+	if resp.Body != nil {
+		httputil.RemoveResponseTransferEncoding(resp, "chunked")
+		// respBodyReader tries to decompress the response body if the Accept-Encoding
+		// header is a non-empty string.
+		resp.Body = respBodyReader(r, resp)
+		respBody, err = io.ReadAll(resp.Body)
+		defer func() {
+			_ = resp.Body.Close()
+			// Create a new Reader and assign it to the response body.
+			resp.Body = io.NopCloser(bytes.NewBuffer(respBody))
+		}()
+		if err != nil {
+			logger.WithError(err).Error("error recording graph analytics")
+			return
+		}
+	}
 
-	if s.Spec.DoNotTrack {
+	extractor := graphqlinternal.NewGraphStatsExtractor()
+	stats, err := extractor.ExtractStats(string(body), string(respBody), spec.GraphQL.Schema)
+	if err != nil {
+		logger.WithError(err).Error("error recording graph analytics")
+		return
+	}
+	rec.GraphQLStats = stats
+}
+
+func recordMCPDetails(rec *analytics.AnalyticsRecord, r *http.Request) {
+	rec.MCPStats = analytics.MCPStats{
+		IsMCP:            true,
+		JSONRPCErrorCode: ctxGetJSONRPCErrorCode(r),
+		JSONRPCMethod:    ctxGetMCPMethod(r),
+		PrimitiveType:    ctxGetMCPPrimitiveType(r),
+		PrimitiveName:    ctxGetMCPPrimitiveName(r),
+	}
+	if protocolContext := httpctx.GetMCPProtocolContext(r); protocolContext != nil {
+		if rec.MCPStats.JSONRPCMethod == "" && protocolContext.Envelope != nil {
+			rec.MCPStats.JSONRPCMethod = protocolContext.Envelope.Method
+			rec.MCPStats.PrimitiveType = primitiveTypeForMethod(protocolContext.Envelope.Method)
+		}
+		rec.MCPStats.EffectiveProtocolVersion = protocolContext.EffectiveProtocolVersion
+		rec.MCPStats.DeclaredProtocolVersion = protocolContext.DeclaredProtocolVersion
+		rec.MCPStats.ProtocolVersionSource = string(protocolContext.ProtocolVersionSource)
+	}
+}
+
+const traceTagPrefix = "trace-id-"
+
+func (s *SuccessHandler) addTraceIDTag(reqCtx context.Context, tags []string) []string {
+	if !s.Gw.GetConfig().OpenTelemetry.TracesEnabled() {
+		return tags
+	}
+	if id := otel.ExtractTraceID(reqCtx); id != "" {
+		tags = append(tags, traceTagPrefix+id)
+	}
+	return tags
+}
+
+func (s *SuccessHandler) RecordHit(r *http.Request, timing analytics.Latency, code int, responseCopy *http.Response, cached bool) {
+
+	if s.Spec.DoNotTrack || ctxGetDoNotTrack(r) {
 		return
 	}
 
@@ -163,14 +234,22 @@ func (s *SuccessHandler) RecordHit(r *http.Request, timing Latency, code int, re
 			tags = tagHeaders(r, s.Spec.TagHeaders, tags)
 		}
 
+		if len(s.Spec.Tags) > 0 {
+			tags = append(tags, s.Spec.Tags...)
+		}
+
+		if cached {
+			tags = append(tags, "cached-response")
+		}
+
+		tags = s.addTraceIDTag(r.Context(), tags)
+
 		rawRequest := ""
 		rawResponse := ""
 
 		if recordDetail(r, s.Spec) {
-			// Get the wire format representation
-			var wireFormatReq bytes.Buffer
-			r.Write(&wireFormatReq)
-			rawRequest = base64.StdEncoding.EncodeToString(wireFormatReq.Bytes())
+			rawRequest = getRawRequest(r, s.Spec)
+
 			// responseCopy, unlike requestCopy, can be nil
 			// here - if the response was cached in
 			// mw_redis_cache, RecordHit gets passed a nil
@@ -178,8 +257,11 @@ func (s *SuccessHandler) RecordHit(r *http.Request, timing Latency, code int, re
 			// TODO: pass a copy of the cached response in
 			// mw_redis_cache instead? is there a reason not
 			// to include that in the analytics?
-			if responseCopy != nil {
-				contents, err := ioutil.ReadAll(responseCopy.Body)
+			if responseCopy != nil && responseCopy.Body != nil {
+				// we need to delete the chunked transfer encoding header to avoid malformed body in our rawResponse
+				httputil.RemoveResponseTransferEncoding(responseCopy, "chunked")
+
+				responseContent, err := io.ReadAll(responseCopy.Body)
 				if err != nil {
 					log.Error("Couldn't read response body", err)
 				}
@@ -189,14 +271,14 @@ func (s *SuccessHandler) RecordHit(r *http.Request, timing Latency, code int, re
 				// Get the wire format representation
 				var wireFormatRes bytes.Buffer
 				responseCopy.Write(&wireFormatRes)
-				responseCopy.Body = ioutil.NopCloser(bytes.NewBuffer(contents))
+				responseCopy.Body = ioutil.NopCloser(bytes.NewBuffer(responseContent))
 				rawResponse = base64.StdEncoding.EncodeToString(wireFormatRes.Bytes())
 			}
 		}
 
 		trackEP := false
 		trackedPath := r.URL.Path
-		if p := ctxGetTrackedPath(r); p != "" && !ctxGetDoNotTrack(r) {
+		if p := ctxGetTrackedPath(r); p != "" {
 			trackEP = true
 			trackedPath = p
 		}
@@ -206,43 +288,57 @@ func (s *SuccessHandler) RecordHit(r *http.Request, timing Latency, code int, re
 			host = s.Spec.target.Host
 		}
 
-		record := AnalyticsRecord{
-			r.Method,
-			host,
-			trackedPath,
-			r.URL.Path,
-			r.ContentLength,
-			r.Header.Get(headers.UserAgent),
-			t.Day(),
-			t.Month(),
-			t.Year(),
-			t.Hour(),
-			code,
-			token,
-			t,
-			version,
-			s.Spec.Name,
-			s.Spec.APIID,
-			s.Spec.OrgID,
-			oauthClientID,
-			timing.Total,
-			timing,
-			rawRequest,
-			rawResponse,
-			ip,
-			GeoData{},
-			NetworkStats{},
-			tags,
-			alias,
-			trackEP,
-			t,
+		record := analytics.AnalyticsRecord{
+			Method:        r.Method,
+			Host:          host,
+			Path:          trackedPath,
+			RawPath:       r.URL.Path,
+			OriginalPath:  ctxGetOriginalRequestPath(r),
+			ListenPath:    s.Spec.Proxy.ListenPath,
+			ContentLength: r.ContentLength,
+			UserAgent:     r.Header.Get(header.UserAgent),
+			Day:           t.Day(),
+			Month:         t.Month(),
+			Year:          t.Year(),
+			Hour:          t.Hour(),
+			ResponseCode:  code,
+			APIKey:        token,
+			TimeStamp:     t,
+			APIVersion:    version,
+			APIName:       s.Spec.Name,
+			APIID:         s.Spec.APIID,
+			OrgID:         s.Spec.OrgID,
+			OauthID:       oauthClientID,
+			RequestTime:   timing.Total,
+			RawRequest:    rawRequest,
+			RawResponse:   rawResponse,
+			IPAddress:     ip,
+			Geo:           analytics.GeoData{},
+			Network:       analytics.NetworkStats{},
+			Latency:       timing,
+			Tags:          tags,
+			Alias:         alias,
+			TrackPath:     trackEP,
+			ExpireAt:      t,
 		}
 
 		if s.Spec.GlobalConfig.AnalyticsConfig.EnableGeoIP {
-			record.GetGeo(ip)
+			record.GetGeo(ip, s.Gw.Analytics.GeoIPDB)
+		}
+
+		recordGraphDetails(&record, r, responseCopy, s.Spec)
+		// skip tagging subgraph requests for graphpump, it only handles generated supergraph requests
+		if s.Spec.GraphQL.Enabled && s.Spec.GraphQL.ExecutionMode != apidef.GraphQLExecutionModeSubgraph {
+			record.Tags = append(record.Tags, "tyk-graph-analytics")
+			record.ApiSchema = base64.StdEncoding.EncodeToString([]byte(s.Spec.GraphQL.Schema))
+		}
+
+		if s.Spec.IsMCP() {
+			recordMCPDetails(&record, r)
 		}
 
 		expiresAfter := s.Spec.ExpireAnalyticsAfter
+
 		if s.Spec.GlobalConfig.EnforceOrgDataAge {
 			orgExpireDataTime := s.OrgSessionExpiry(s.Spec.OrgID)
 
@@ -254,47 +350,43 @@ func (s *SuccessHandler) RecordHit(r *http.Request, timing Latency, code int, re
 		record.SetExpiry(expiresAfter)
 
 		if s.Spec.GlobalConfig.AnalyticsConfig.NormaliseUrls.Enabled {
-			record.NormalisePath(&s.Spec.GlobalConfig)
+			NormalisePath(&record, &s.Spec.GlobalConfig)
 		}
 
-		analytics.RecordHit(&record)
+		if s.Spec.AnalyticsPlugin.Enabled {
+
+			//send to plugin
+			_ = s.Spec.AnalyticsPluginConfig.processRecord(&record)
+
+		}
+
+		err := s.Gw.Analytics.RecordHit(&record)
+		if err != nil {
+			log.WithError(err).Error("could not store analytic record")
+		}
 	}
 
 	// Report in health check
 	reportHealthValue(s.Spec, RequestLog, strconv.FormatInt(timing.Total, 10))
-
-	if memProfFile != nil {
-		pprof.WriteHeapProfile(memProfFile)
-	}
 }
 
-func recordDetail(r *http.Request, spec *APISpec) bool {
-	if spec.EnableDetailedRecording {
-		return true
-	}
-
-	session := ctxGetSession(r)
-	if session != nil {
-		if session.EnableDetailedRecording || session.EnableDetailRecording {
-			return true
+// classifyUpstreamError classifies upstream responses for structured access logs.
+// Currently handles 5XX status codes; can be extended for other error classifications.
+// If a classification was already set earlier in the request lifecycle (e.g. NHU from
+// the load balancer director), it is preserved.
+func (s *SuccessHandler) classifyUpstreamError(r *http.Request, statusCode int) {
+	if statusCode >= 500 && statusCode <= 599 {
+		// Don't overwrite a more specific classification set earlier (e.g. NHU).
+		if ctx.GetErrorClassification(r) != nil {
+			return
 		}
+		target := r.URL.Host
+		if target == "" && s.Spec.target != nil {
+			target = s.Spec.target.Host
+		}
+		errClass := tykerrors.ClassifyUpstreamResponse(statusCode, target)
+		ctx.SetErrorClassification(r, errClass)
 	}
-
-	// Are we even checking?
-	if !spec.GlobalConfig.EnforceOrgDataDetailLogging {
-		return spec.GlobalConfig.AnalyticsConfig.EnableDetailedRecording
-	}
-
-	// We are, so get session data
-	ses := r.Context().Value(ctx.OrgSessionContext)
-	if ses == nil {
-		// no session found, use global config
-		return spec.GlobalConfig.AnalyticsConfig.EnableDetailedRecording
-	}
-
-	// Session found
-	sess := ses.(user.SessionState)
-	return sess.EnableDetailRecording || sess.EnableDetailedRecording
 }
 
 // ServeHTTP will store the request details in the analytics store if necessary and proxy the request to it's
@@ -304,40 +396,65 @@ func (s *SuccessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) *http
 	log.Debug("Started proxy")
 	defer s.Base().UpdateRequestSession(r)
 
-	versionDef := s.Spec.VersionDefinition
-	if !s.Spec.VersionData.NotVersioned && versionDef.Location == "url" && versionDef.StripPath {
-		part := s.Spec.getVersionFromRequest(r)
-
-		log.Info("Stripping version from url: ", part)
-
-		r.URL.Path = strings.Replace(r.URL.Path, part+"/", "", 1)
-		r.URL.RawPath = strings.Replace(r.URL.RawPath, part+"/", "", 1)
-	}
-
 	// Make sure we get the correct target URL
-	if s.Spec.Proxy.StripListenPath {
-		log.Debug("Stripping: ", s.Spec.Proxy.ListenPath)
-		r.URL.Path = s.Spec.StripListenPath(r, r.URL.Path)
-		r.URL.RawPath = s.Spec.StripListenPath(r, r.URL.RawPath)
-		log.Debug("Upstream Path is: ", r.URL.Path)
-	}
+	s.Spec.SanitizeProxyPaths(r)
 
 	addVersionHeader(w, r, s.Spec.GlobalConfig)
 
-	t1 := time.Now()
-	resp := s.Proxy.ServeHTTP(w, r)
+	proxyWriter := w
+	var mcpResponseObserver *mcpCompletionObserver
+	if s.Spec.IsMCP() && !s.Spec.IsSyntheticMCPAdapter() {
+		mcpResponseObserver, proxyWriter = observeMCPCompletion(w)
+	}
 
-	millisec := DurationToMillisecond(time.Since(t1))
+	t1 := time.Now()
+	var resp ProxyResponse
+	if s.Spec.GraphQL.Enabled {
+		resp = s.Proxy.ServeHTTPForCache(proxyWriter, r)
+	} else {
+		resp = s.Proxy.ServeHTTP(proxyWriter, r)
+	}
+
+	t2 := time.Now()
+	if mcpResponseObserver != nil {
+		if code, ok := jsonRPCCompletionErrorCode(mcpResponseObserver.observedBody()); ok {
+			ctxSetJSONRPCErrorCode(r, code)
+		}
+	}
+	proxyDuration := t2.Sub(t1)
+	millisec := DurationToMillisecond(proxyDuration)
 	log.Debug("Upstream request took (ms): ", millisec)
 
 	if resp.Response != nil {
-		latency := Latency{
-			Total:    int64(millisec),
-			Upstream: int64(DurationToMillisecond(resp.UpstreamLatency)),
+		upstreamMs := int64(DurationToMillisecond(resp.UpstreamLatency))
+
+		// Calculate total time including all middlewares
+		var totalMs int64
+		requestStartTime := ctxGetRequestStartTime(r)
+		if !requestStartTime.IsZero() {
+			totalMs = int64(DurationToMillisecond(t2.Sub(requestStartTime)))
+			log.Debugf("Request start time found (UTC): %s, total time: %dms", requestStartTime.UTC().Format(time.RFC3339), totalMs)
+		} else {
+			// Fallback to proxy duration if start time not set
+			totalMs = int64(millisec)
+			log.Debug("Request start time NOT found, using proxy duration as fallback")
 		}
-		s.RecordHit(r, latency, resp.Response.StatusCode, resp.Response)
+
+		latency := analytics.Latency{
+			Total:    totalMs,
+			Upstream: upstreamMs,
+			Gateway:  totalMs - upstreamMs,
+		}
+
+		s.classifyUpstreamError(r, resp.Response.StatusCode)
+
+		s.RecordHit(r, latency, resp.Response.StatusCode, resp.Response, false)
+		s.RecordAccessLog(r, resp.Response, latency)
+
+		s.Base().RecordMetrics(w, r, resp.Response.StatusCode, latency, resp.Response)
 	}
 	log.Debug("Done proxy")
+
 	return nil
 }
 
@@ -346,36 +463,43 @@ func (s *SuccessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) *http
 // Spec states the path is Ignored Itwill also return a response object for the cache
 func (s *SuccessHandler) ServeHTTPWithCache(w http.ResponseWriter, r *http.Request) ProxyResponse {
 
-	versionDef := s.Spec.VersionDefinition
-	if !s.Spec.VersionData.NotVersioned && versionDef.Location == "url" && versionDef.StripPath {
-		part := s.Spec.getVersionFromRequest(r)
-
-		log.Debug("Stripping version from URL: ", part)
-
-		r.URL.Path = strings.Replace(r.URL.Path, part+"/", "", 1)
-		r.URL.RawPath = strings.Replace(r.URL.RawPath, part+"/", "", 1)
-	}
-
 	// Make sure we get the correct target URL
-	if s.Spec.Proxy.StripListenPath {
-		r.URL.Path = s.Spec.StripListenPath(r, r.URL.Path)
-		r.URL.RawPath = s.Spec.StripListenPath(r, r.URL.RawPath)
-	}
+	s.Spec.SanitizeProxyPaths(r)
 
 	t1 := time.Now()
 	inRes := s.Proxy.ServeHTTPForCache(w, r)
-	millisec := DurationToMillisecond(time.Since(t1))
+	t2 := time.Now()
+	proxyDuration := t2.Sub(t1)
+	millisec := DurationToMillisecond(proxyDuration)
 
 	addVersionHeader(w, r, s.Spec.GlobalConfig)
 
 	log.Debug("Upstream request took (ms): ", millisec)
 
 	if inRes.Response != nil {
-		latency := Latency{
-			Total:    int64(millisec),
-			Upstream: int64(DurationToMillisecond(inRes.UpstreamLatency)),
+		upstreamMs := int64(DurationToMillisecond(inRes.UpstreamLatency))
+
+		// Calculate total time including all middlewares
+		var totalMs int64
+		if requestStartTime := ctxGetRequestStartTime(r); !requestStartTime.IsZero() {
+			totalMs = int64(DurationToMillisecond(t2.Sub(requestStartTime)))
+		} else {
+			// Fallback to proxy duration if start time not set
+			totalMs = int64(millisec)
 		}
-		s.RecordHit(r, latency, inRes.Response.StatusCode, inRes.Response)
+
+		latency := analytics.Latency{
+			Total:    totalMs,
+			Upstream: upstreamMs,
+			Gateway:  totalMs - upstreamMs,
+		}
+
+		s.classifyUpstreamError(r, inRes.Response.StatusCode)
+
+		s.RecordHit(r, latency, inRes.Response.StatusCode, inRes.Response, false)
+		s.RecordAccessLog(r, inRes.Response, latency)
+
+		s.Base().RecordMetrics(w, r, inRes.Response.StatusCode, latency, inRes.Response)
 	}
 
 	return inRes

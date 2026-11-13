@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/TykTechnologies/tyk/apidef"
@@ -8,8 +9,34 @@ import (
 )
 
 func TestMethodTransform(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
+
+	t.Run("disabled", func(t *testing.T) {
+		api := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/"
+			UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
+				v.UseExtendedPaths = true
+				v.ExtendedPaths.MethodTransforms = []apidef.MethodTransformMeta{
+					{
+						Disabled: false,
+						Path:     "/",
+						Method:   http.MethodGet,
+						ToMethod: http.MethodPost,
+					},
+				}
+			})
+		})[0]
+
+		_, _ = ts.Run(t, test.TestCase{Method: http.MethodGet, Path: "/", BodyMatch: `"Method":"POST"`})
+
+		versions := api.VersionData.Versions["v1"]
+		versions.ExtendedPaths.MethodTransforms[0].Disabled = true
+		api.VersionData.Versions["v1"] = versions
+		ts.Gw.LoadAPI(api)
+
+		_, _ = ts.Run(t, test.TestCase{Method: http.MethodGet, Path: "/", BodyMatch: `"Method":"GET"`, BodyNotMatch: `"Method":"POST"`})
+	})
 
 	t.Run("Using URL rewrite", func(t *testing.T) {
 
@@ -24,7 +51,7 @@ func TestMethodTransform(t *testing.T) {
 		urlRewrite.MatchPattern = "/get(.*)"
 		urlRewrite.RewriteTo = "/post$1"
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 			UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
 				v.UseExtendedPaths = true
@@ -46,7 +73,7 @@ func TestMethodTransform(t *testing.T) {
 		methodTransform.Method = "GET"
 		methodTransform.ToMethod = "POST"
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.CacheOptions = apidef.CacheOptions{
 				CacheTimeout: 120,
 				EnableCache:  true,

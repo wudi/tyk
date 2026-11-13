@@ -1,0 +1,502 @@
+package gateway
+
+import (
+	"context"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/routers"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/apidef/oas"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/internal/agentprotocol"
+	"github.com/TykTechnologies/tyk/internal/certcheck"
+	"github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/graphengine"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/httputil"
+	"github.com/TykTechnologies/tyk/internal/jsonrpc"
+	restmcpadapter "github.com/TykTechnologies/tyk/internal/mcp/adapter"
+
+	_ "github.com/TykTechnologies/tyk/internal/mcp" // registers MCP VEM prefixes
+)
+
+// APISpec represents a path specification for an API, to avoid enumerating multiple nested lists, a single
+// flattened URL list is checked for matching paths and then it's status evaluated if found.
+type APISpec struct {
+	*apidef.APIDefinition
+	OAS oas.OAS
+
+	sync.RWMutex
+
+	Checksum         string
+	RxPaths          map[string][]URLSpec
+	WhiteListEnabled map[string]bool
+	target           *url.URL
+	AuthManager      SessionHandler
+	OAuthManager     OAuthManagerInterface
+
+	OrgSessionManager        SessionHandler
+	EventPaths               map[apidef.TykEvent][]config.TykEventHandler
+	Health                   HealthChecker
+	JSVM                     JSVM
+	GojaJSVM                 GojaJSVM
+	ResponseChain            []TykResponseHandler
+	RoundRobin               RoundRobin
+	URLRewriteEnabled        bool
+	CircuitBreakerEnabled    bool
+	EnforcedTimeoutEnabled   bool
+	LastGoodHostList         *apidef.HostList
+	HasRun                   bool
+	ServiceRefreshInProgress bool
+	HTTPTransport            *TykRoundTripper
+	HTTPTransportCreated     time.Time
+	WSTransport              http.RoundTripper
+	WSTransportCreated       time.Time
+	GlobalConfig             config.Config
+	OrgHasNoSession          bool
+	AnalyticsPluginConfig    *GoAnalyticsPlugin
+
+	// Swapped by a reload while requests read it, so the reads stay lock-free.
+	dnsDiscovery atomic.Pointer[dnsDiscoveryPlan]
+
+	// So reconciling a spec twice does not stack unload hooks.
+	dnsDiscoveryHooked bool
+
+	unloadHooks []func()
+
+	network analytics.NetworkStats
+
+	GraphEngine graphengine.Engine
+
+	oasRouter routers.Router
+
+	// UpstreamCertExpiryBatcher handles upstream certificate expiry checking
+	UpstreamCertExpiryBatcher      certcheck.BackgroundBatcher
+	upstreamCertExpiryCheckContext context.Context
+	upstreamCertExpiryCancelFunc   context.CancelFunc
+	upstreamCertExpiryInitOnce     sync.Once
+
+	// MCPPrimitives maps primitive identifiers to their VEM paths for JSON-RPC routing.
+	// Key format: "tool:{name}", "resource:{pattern}", "prompt:{name}"
+	// Value: VEM path (e.g., "/mcp-tool:get-weather")
+	MCPPrimitives map[string]string
+
+	// MCPAdapter holds runtime-only REST-as-MCP synthetic adapter state. It is
+	// never extracted to/persisted from API definitions or OAS documents.
+	MCPAdapter MCPAdapterRuntime
+
+	JSONRPCRouter jsonrpc.Router
+
+	// OperationsAllowListEnabled is true if any JSON-RPC operation (method-level) has
+	// an allow rule enabled. Pre-calculated during API loading.
+	OperationsAllowListEnabled bool
+
+	// ToolsAllowListEnabled is true if any MCP tool has an allow rule enabled.
+	// Pre-calculated during API loading.
+	ToolsAllowListEnabled bool
+
+	// ResourcesAllowListEnabled is true if any MCP resource has an allow rule enabled.
+	// Pre-calculated during API loading.
+	ResourcesAllowListEnabled bool
+
+	// PromptsAllowListEnabled is true if any MCP prompt has an allow rule enabled.
+	// Pre-calculated during API loading.
+	PromptsAllowListEnabled bool
+
+	// MCPAllowListEnabled is true if any MCP primitive (tool, resource, prompt) has an
+	// allow rule enabled. Pre-calculated during API loading to avoid iterating through
+	// all primitives on every JSON-RPC request that doesn't match a VEM.
+	// This is a convenience flag that combines ToolsAllowListEnabled, ResourcesAllowListEnabled, and PromptsAllowListEnabled.
+	MCPAllowListEnabled bool
+
+	// compiledErrorOverrides holds the indexed error override rules for O(1) lookup.
+	// Built from apidef.ErrorOverrides during gateway startup.
+	compiledErrorOverrides atomic.Pointer[CompiledErrorOverrides]
+
+	// MCP origin-security configuration is immutable for a loaded spec. Parse it
+	// once and retain the canonical origins/proxy networks off the request path.
+	mcpOriginConfigOnce     sync.Once
+	mcpTrustedOrigins       map[string]struct{}
+	mcpTrustedProxyPrefixes []netip.Prefix
+	mcpOriginConfigErr      error
+}
+
+// MCPAdapterRuntime groups runtime-only state for a synthetic REST-as-MCP
+// adapter API.
+type MCPAdapterRuntime struct {
+	Synthetic                bool
+	SourceRESTAPIID          string
+	SDKAdapter               *restmcpadapter.SDKAdapter
+	AllowedCallerProxyAPIIDs []string
+	ToolViews                map[string]oas.MCPToolView
+	UnionTools               []oas.DerivedTool
+}
+
+// GetJSRunner returns the active JSRunner for this API spec based on the
+// configured middleware driver. Returns nil if no JS VM is initialized.
+func (a *APISpec) GetJSRunner() JSRunner {
+	if a.CustomMiddleware.Driver == apidef.JavaScriptDriver {
+		if a.GojaJSVM.Ready() {
+			return &a.GojaJSVM
+		}
+		return nil
+	}
+	if a.JSVM.Ready() {
+		return &a.JSVM
+	}
+	return nil
+}
+
+// CheckSpecMatchesStatus checks if a URL spec has a specific status.
+// Deprecated: The function doesn't follow go return conventions (T, ok); use FindSpecMatchesStatus;
+func (a *APISpec) CheckSpecMatchesStatus(r *http.Request, rxPaths []URLSpec, mode URLStatus) (bool, interface{}) {
+	matchPath, method := a.getMatchPathAndMethod(r, mode)
+
+	for i := range rxPaths {
+		if rxPaths[i].Status != mode {
+			continue
+		}
+		if !rxPaths[i].matchesMethod(method) {
+			continue
+		}
+		if !rxPaths[i].matchesPath(matchPath, a) {
+			continue
+		}
+
+		if spec, ok := rxPaths[i].modeSpecificSpec(mode); ok {
+			return true, spec
+		}
+	}
+	return false, nil
+}
+
+func (a *APISpec) GetTykExtension() *oas.XTykAPIGateway {
+	if !a.IsOAS {
+		return nil
+	}
+	res := a.OAS.GetTykExtension()
+	if res == nil {
+		log.Warn("APISpec is an invalid OAS API")
+	}
+	return res
+}
+
+// GetCompiledErrorOverrides returns the compiled error overrides for O(1) lookup.
+func (a *APISpec) GetCompiledErrorOverrides() *CompiledErrorOverrides {
+	return a.compiledErrorOverrides.Load()
+}
+
+// SetCompiledErrorOverrides stores the compiled error overrides.
+func (a *APISpec) SetCompiledErrorOverrides(compiled *CompiledErrorOverrides) {
+	a.compiledErrorOverrides.Store(compiled)
+}
+
+// GetPRMConfig returns the Protected Resource Metadata configuration
+// for the API.
+//
+// Resolution order:
+//  1. If the OAS doc has an explicit `protectedResourceMetadata` block with
+//     `enabled: true`, return it as configured.
+//  2. If the API is MCP-managed and no explicit PRM block is provided (or the
+//     authentication block is missing entirely), synthesise a default
+//     `enabled: true, mode: ""` so mirror mode kicks in automatically.
+//     The empty-mode + no-resource shape resolves to mirror in
+//     EffectiveMode, so users can put Tyk in front of an MCP-managed API
+//     with zero PRM-specific config.
+//  3. Otherwise return nil — the API has no PRM serving.
+func (a *APISpec) GetPRMConfig() *oas.ProtectedResourceMetadata {
+	ext := a.GetTykExtension()
+	var prm *oas.ProtectedResourceMetadata
+	if ext != nil && ext.Server.Authentication != nil {
+		prm = ext.Server.Authentication.ProtectedResourceMetadata
+	}
+
+	if prm != nil && prm.Enabled {
+		return prm
+	}
+
+	// MCP-managed default: mirror without any explicit PRM config.
+	if prm == nil && a.IsMCPManaged() {
+		return &oas.ProtectedResourceMetadata{Enabled: true}
+	}
+	return nil
+}
+
+// GetOAuth2Config returns a configured oauth2 security scheme on this
+// API, if any. Returns the scheme's name and the typed config.
+// Duplicate oauth2 schemes are not validated at load time (matching the
+// behaviour of every other auth scheme on this map); when more than one
+// is configured, the choice is map-iteration dependent.
+func (a *APISpec) GetOAuth2Config() (string, *oas.OAuth2) {
+	if !a.IsOAS {
+		return "", nil
+	}
+	ext := a.GetTykExtension()
+	if ext == nil || ext.Server.Authentication == nil {
+		return "", nil
+	}
+	for name := range ext.Server.Authentication.SecuritySchemes {
+		if cfg := a.OAS.GetTykOAuth2Config(name); cfg != nil {
+			return name, cfg
+		}
+	}
+	return "", nil
+}
+
+// GetOAuth2PRMConfig returns the new-style PRM config carried under the
+// oauth2 security scheme and its scheme name, when enabled; ("", nil)
+// otherwise. Wins over the deprecated top-level block (GetPRMConfig)
+// when both exist.
+func (a *APISpec) GetOAuth2PRMConfig() (string, *oas.OAuth2PRM) {
+	name, cfg := a.GetOAuth2Config()
+	if cfg == nil || cfg.ProtectedResourceMetadata == nil || !cfg.ProtectedResourceMetadata.Enabled {
+		return "", nil
+	}
+	return name, cfg.ProtectedResourceMetadata
+}
+
+// IsPRMEnabled reports whether this API serves Protected Resource Metadata
+// via either location: the new oauth2 security scheme block
+// (GetOAuth2PRMConfig, which wins) or the deprecated top-level block
+// (GetPRMConfig). Callers that only need to know "is PRM on" should use this
+// rather than probing one location, so both config styles are honoured.
+func (a *APISpec) IsPRMEnabled() bool {
+	if name, _ := a.GetOAuth2PRMConfig(); name != "" {
+		return true
+	}
+	return a.GetPRMConfig() != nil
+}
+
+// FindSpecMatchesStatus checks if a URL spec has a specific status and returns the URLSpec for it.
+func (a *APISpec) FindSpecMatchesStatus(r *http.Request, rxPaths []URLSpec, mode URLStatus) (*URLSpec, bool) {
+	matchPath, method := a.getMatchPathAndMethod(r, mode)
+
+	for i := range rxPaths {
+		if rxPaths[i].Status != mode {
+			continue
+		}
+		if !rxPaths[i].matchesMethod(method) {
+			continue
+		}
+		if !rxPaths[i].matchesPath(matchPath, a) {
+			continue
+		}
+
+		return &rxPaths[i], true
+	}
+	return nil, false
+}
+
+// isJSONRPCVEMPath returns true if the request is a JSON-RPC routed request
+// targeting a protocol VEM path. In this case, the listen path should not be
+// stripped as the VEM path is already in its final form.
+func isJSONRPCVEMPath(r *http.Request, path string) bool {
+	return httpctx.IsJsonRPCRouting(r) && agentprotocol.IsProtocolVEMPath(path)
+}
+
+// getMatchPathAndMethod retrieves the match path and method from the request based on the mode.
+func (a *APISpec) getMatchPathAndMethod(r *http.Request, mode URLStatus) (string, string) {
+	var (
+		matchPath = r.URL.Path
+		method    = r.Method
+	)
+
+	if mode == TransformedJQResponse || mode == HeaderInjectedResponse || mode == TransformedResponse {
+		matchPath = ctxGetUrlRewritePath(r)
+		method = ctxGetRequestMethod(r)
+		if matchPath == "" {
+			matchPath = r.URL.Path
+		}
+	}
+
+	if a.Proxy.ListenPath != "/" && !isJSONRPCVEMPath(r, matchPath) {
+		matchPath = a.StripListenPath(matchPath)
+	}
+
+	if !strings.HasPrefix(matchPath, "/") {
+		matchPath = "/" + matchPath
+	}
+
+	return matchPath, method
+}
+
+func (a *APISpec) injectIntoReqContext(req *http.Request) {
+	if a.IsOAS {
+		ctx.SetOASDefinition(req, &a.OAS)
+	} else {
+		ctx.SetDefinition(req, a.APIDefinition)
+	}
+}
+
+// findOASRoute matches the request to an OAS route via the API's OAS
+// router (path templates included). Returns nil when none matches.
+func (a *APISpec) findOASRoute(r *http.Request) (*routers.Route, map[string]string) {
+	if a.oasRouter == nil {
+		log.Warningf("OAS router not initialized properly. Unable to find route for %s %v", r.Method, r.URL)
+		return nil, nil
+	}
+
+	rClone := *r
+	rClone.URL = ctxGetInternalRedirectTarget(r)
+
+	route, pathParams, err := a.oasRouter.FindRoute(&rClone)
+
+	if errors.Is(err, routers.ErrPathNotFound) {
+		log.Tracef("Unable to find route for %s %v at spec %v", r.Method, r.URL, a.Id)
+		return nil, nil
+	}
+
+	if err != nil {
+		log.Errorf("Error finding route: %v", err)
+		return nil, nil
+	}
+
+	return route, pathParams
+}
+
+func (a *APISpec) findOperation(r *http.Request) *Operation {
+	middleware := a.OAS.GetTykMiddleware()
+	if middleware == nil {
+		return nil
+	}
+
+	route, pathParams := a.findOASRoute(r)
+	if route == nil {
+		return nil
+	}
+
+	operation, ok := middleware.Operations[route.Operation.OperationID]
+	if !ok {
+		log.Warningf("No operation found for ID: %s", route.Operation.OperationID)
+		return nil
+	}
+
+	return &Operation{
+		Operation:  operation,
+		route:      route,
+		pathParams: pathParams,
+	}
+}
+
+// findRouteForOASPath finds the OAS route using the OAS path pattern (e.g., "/users/{id}")
+// and method, rather than the actual request path. This is used when gateway path matching
+// (prefix/suffix) matches a broader pattern than the exact OAS path.
+// The actualPath parameter is the request path stripped of the listen path.
+// The fullRequestPath is the original request path (used for regexp listen paths).
+func (a *APISpec) findRouteForOASPath(oasPath, method, actualPath, fullRequestPath string) (*routers.Route, map[string]string, error) {
+	if a.oasRouter == nil {
+		return nil, nil, errors.New("OAS router not initialized")
+	}
+
+	// For listen paths with mux-style variables (regexp), we need to use the actual
+	// request path because the OAS router's server URL contains the variable pattern.
+	// For regular listen paths, we build a synthetic path.
+	var routePath string
+	if httputil.IsMuxTemplate(a.Proxy.ListenPath) {
+		// For regexp listen paths like /product-regexp1/{name:.*}
+		// Use the full request path as the OAS router expects actual values
+		routePath = fullRequestPath
+	} else {
+		// For regular listen paths, combine listen path + OAS path
+		routePath = strings.TrimSuffix(a.Proxy.ListenPath, "/") + oasPath
+	}
+
+	syntheticURL, err := url.Parse(routePath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	syntheticReq := &http.Request{
+		Method: method,
+		URL:    syntheticURL,
+	}
+
+	route, _, err := a.oasRouter.FindRoute(syntheticReq)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Extract path parameters from the actual request path by matching against
+	// the OAS path pattern. This handles cases where the OAS path has parameters
+	// like /users/{id} and we need to extract the actual id value from the request.
+	pathParams := extractPathParams(oasPath, actualPath)
+
+	return route, pathParams, nil
+}
+
+// matchCandidatePath looks up the path item and operation from the OAS spec for a
+// candidate path+method, extracts path parameters from the actual request path, and
+// validates them against the operation's path parameter schemas. Returns the operation,
+// path params, and true if the candidate matches; false otherwise.
+// This is the shared disambiguation logic used by both validate request and mock response.
+func (a *APISpec) matchCandidatePath(oasPath, oasMethod, strippedPath string) (*openapi3.PathItem, *openapi3.Operation, map[string]string, bool) {
+	pathItem := a.OAS.Paths.Value(oasPath)
+	if pathItem == nil {
+		return nil, nil, nil, false
+	}
+	operation := pathItem.GetOperation(oasMethod)
+	if operation == nil {
+		return nil, nil, nil, false
+	}
+
+	pathParams := extractPathParams(oasPath, strippedPath)
+	if !pathParamsMatchOperation(pathParams, operation) {
+		return nil, nil, nil, false
+	}
+
+	return pathItem, operation, pathParams, true
+}
+
+// extractPathParams extracts path parameter values from actualPath based on the
+// OAS path pattern. For example, if oasPath is "/users/{id}" and actualPath is
+// "/users/123", it returns map[string]string{"id": "123"}.
+func extractPathParams(oasPath, actualPath string) map[string]string {
+	params := make(map[string]string)
+
+	oasParts := strings.Split(strings.Trim(oasPath, "/"), "/")
+	actualParts := strings.Split(strings.Trim(actualPath, "/"), "/")
+
+	for i, oasPart := range oasParts {
+		if i >= len(actualParts) {
+			break
+		}
+		// Check if this is a path parameter (wrapped in {})
+		if strings.HasPrefix(oasPart, "{") && strings.HasSuffix(oasPart, "}") {
+			paramName := oasPart[1 : len(oasPart)-1]
+			params[paramName] = actualParts[i]
+		}
+	}
+
+	return params
+}
+
+// APIType returns the api_type string for the given API spec.
+// Precedence: mcp > graphql > oas > classic.
+func (a *APISpec) APIType() string {
+	switch {
+	case a.IsMCP():
+		return "mcp"
+	case a.GraphQL.Enabled:
+		return "graphql"
+	case a.IsOAS:
+		return "oas"
+	default:
+		return "classic"
+	}
+}
+
+// IsSyntheticMCPAdapter reports whether this spec is a hidden runtime-only
+// adapter synthesized for a REST-as-MCP proxy/source pairing.
+func (a *APISpec) IsSyntheticMCPAdapter() bool {
+	return a != nil && a.MCPAdapter.Synthetic
+}

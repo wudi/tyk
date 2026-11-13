@@ -1,19 +1,44 @@
 package gateway
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/TykTechnologies/tyk/apidef"
-	cache "github.com/pmylund/go-cache"
+	"github.com/justinas/alice"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 
+	"github.com/TykTechnologies/opentelemetry/metric/metrictest"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/config"
+	ctxpkg "github.com/TykTechnologies/tyk/ctx"
+	headers2 "github.com/TykTechnologies/tyk/header"
+	"github.com/TykTechnologies/tyk/internal/cache"
+	"github.com/TykTechnologies/tyk/internal/otel"
+	"github.com/TykTechnologies/tyk/internal/otel/apimetrics"
+	"github.com/TykTechnologies/tyk/internal/uuid"
+	"github.com/TykTechnologies/tyk/storage"
+	storagemock "github.com/TykTechnologies/tyk/storage/mock"
+	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
 
 type mockStore struct {
 	SessionHandler
+	//DetailNotFound is used to make mocked SessionDetail return (x,false), as if it don't find the session in the mocked storage.
+	DetailNotFound bool
 }
 
 var sess = user.SessionState{
@@ -21,12 +46,30 @@ var sess = user.SessionState{
 	DataExpires: 110,
 }
 
-func (mockStore) SessionDetail(orgID string, keyName string, hashed bool) (user.SessionState, bool) {
-	return sess, true
+type requestConditionalMiddleware struct {
+	*BaseMiddleware
+	calls int
+}
+
+func (m *requestConditionalMiddleware) Name() string {
+	return "requestConditionalMiddleware"
+}
+
+//nolint:staticcheck // ST1008: middleware interface requires (error, int).
+func (m *requestConditionalMiddleware) ProcessRequest(http.ResponseWriter, *http.Request, interface{}) (error, int) {
+	m.calls++
+	return nil, http.StatusOK
+}
+
+func (m mockStore) SessionDetail(orgID string, keyName string, hashed bool) (user.SessionState, bool) {
+	return sess.Clone(), !m.DetailNotFound
 }
 
 func TestBaseMiddleware_OrgSessionExpiry(t *testing.T) {
-	m := BaseMiddleware{
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	m := &BaseMiddleware{
 		Spec: &APISpec{
 			GlobalConfig: config.Config{
 				EnforceOrgDataAge: true,
@@ -34,19 +77,46 @@ func TestBaseMiddleware_OrgSessionExpiry(t *testing.T) {
 			OrgSessionManager: mockStore{},
 		},
 		logger: mainLog,
+		Gw:     ts.Gw,
 	}
-	v := int64(100)
-	ExpiryCache.Set(sess.OrgID, v, cache.DefaultExpiration)
 
-	got := m.OrgSessionExpiry(sess.OrgID)
-	if got != v {
-		t.Errorf("expected %d got %d", v, got)
-	}
-	ExpiryCache.Delete(sess.OrgID)
-	got = m.OrgSessionExpiry(sess.OrgID)
-	if got != sess.DataExpires {
-		t.Errorf("expected %d got %d", sess.DataExpires, got)
-	}
+	t.Run("Returns cached value when present", func(t *testing.T) {
+		v := int64(100)
+		ts.Gw.ExpiryCache.Set(sess.OrgID, v, cache.DefaultExpiration)
+
+		got := m.OrgSessionExpiry(sess.OrgID)
+		assert.Equal(t, v, got)
+		ts.Gw.ExpiryCache.Delete(sess.OrgID)
+	})
+
+	t.Run("Returns default on cache miss, then fetches in background", func(t *testing.T) {
+		// Cache miss, should return default immediately
+		got := m.OrgSessionExpiry(sess.OrgID)
+		assert.Equal(t, DEFAULT_ORG_SESSION_EXPIRATION, got)
+
+		// Wait for background fetch to complete
+		time.Sleep(50 * time.Millisecond)
+
+		// Now should have cached value from background fetch
+		got = m.OrgSessionExpiry(sess.OrgID)
+		assert.Equal(t, sess.DataExpires, got)
+		ts.Gw.ExpiryCache.Delete(sess.OrgID)
+	})
+
+	t.Run("Returns default when org session not found", func(t *testing.T) {
+		m.Spec.OrgSessionManager = mockStore{DetailNotFound: true}
+		noOrgSess := "nonexistent_org"
+
+		got := m.OrgSessionExpiry(noOrgSess)
+		assert.Equal(t, DEFAULT_ORG_SESSION_EXPIRATION, got)
+
+		// Wait for background fetch
+		time.Sleep(50 * time.Millisecond)
+
+		// Should still return default since org doesn't exist
+		got = m.OrgSessionExpiry(noOrgSess)
+		assert.Equal(t, DEFAULT_ORG_SESSION_EXPIRATION, got)
+	})
 }
 
 func TestBaseMiddleware_getAuthType(t *testing.T) {
@@ -61,7 +131,10 @@ func TestBaseMiddleware_getAuthType(t *testing.T) {
 		"oidc":      {AuthHeaderName: "h7"},
 	}
 
-	baseMid := BaseMiddleware{Spec: spec}
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	baseMid := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
 
 	r, _ := http.NewRequest(http.MethodGet, "", nil)
 	r.Header.Set("h1", "t1")
@@ -81,13 +154,13 @@ func TestBaseMiddleware_getAuthType(t *testing.T) {
 	oidc := &OpenIDMW{BaseMiddleware: baseMid}
 
 	// test getAuthType
-	assert.Equal(t, authTokenType, authKey.getAuthType())
-	assert.Equal(t, basicType, basic.getAuthType())
-	assert.Equal(t, coprocessType, coprocess.getAuthType())
-	assert.Equal(t, hmacType, hmac.getAuthType())
-	assert.Equal(t, jwtType, jwt.getAuthType())
-	assert.Equal(t, oauthType, oauth.getAuthType())
-	assert.Equal(t, oidcType, oidc.getAuthType())
+	assert.Equal(t, apidef.AuthTokenType, authKey.getAuthType())
+	assert.Equal(t, apidef.BasicType, basic.getAuthType())
+	assert.Equal(t, apidef.CoprocessType, coprocess.getAuthType())
+	assert.Equal(t, apidef.HMACType, hmac.getAuthType())
+	assert.Equal(t, apidef.JWTType, jwt.getAuthType())
+	assert.Equal(t, apidef.OAuthType, oauth.getAuthType())
+	assert.Equal(t, apidef.OIDCType, oidc.getAuthType())
 
 	// test getAuthToken
 	getToken := func(authType string, getAuthToken func(authType string, r *http.Request) (string, apidef.AuthConfig)) string {
@@ -102,4 +175,1387 @@ func TestBaseMiddleware_getAuthType(t *testing.T) {
 	assert.Equal(t, "t5", getToken(jwt.getAuthType(), jwt.getAuthToken))
 	assert.Equal(t, "t6", getToken(oauth.getAuthType(), oauth.getAuthToken))
 	assert.Equal(t, "t7", getToken(oidc.getAuthType(), oidc.getAuthToken))
+}
+
+func TestCheckSessionAndIdentityForValidKey_CachesSessionWithoutSharingAccessRights(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HashKeys = false
+		globalConf.LocalSessionCache.DisableCacheSessionState = false
+	})
+	defer ts.Close()
+
+	api := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.APIID = uuid.New()
+		spec.UseKeylessAccess = false
+		spec.Auth.AuthHeaderName = "authorization"
+	})[0]
+
+	key := "cache-isolation-" + uuid.New()
+	session := CreateStandardSession()
+	session.AccessRights = map[string]user.AccessDefinition{
+		api.APIID: {
+			APIID:    api.APIID,
+			Versions: []string{"Default"},
+			Limit: user.APILimit{
+				RateLimit: user.RateLimit{
+					Rate: 100,
+					Per:  60,
+				},
+			},
+		},
+	}
+	require.NoError(t, ts.Gw.GlobalSessionManager.UpdateSession(key, session, 60, false))
+	defer ts.Gw.GlobalSessionManager.RemoveSession(session.OrgID, key, false)
+	defer ts.Gw.SessionCache.Delete(key)
+
+	baseMid := NewBaseMiddleware(ts.Gw, api, nil, nil)
+	got, ok := baseMid.CheckSessionAndIdentityForValidKey(key, httptest.NewRequest(http.MethodGet, "/", nil))
+	require.True(t, ok)
+	require.Equal(t, api.APIID, got.AccessRights[api.APIID].AllowanceScope)
+
+	cachedVal, found := ts.Gw.SessionCache.Get(key)
+	require.True(t, found)
+
+	cached := cachedVal.(user.SessionState)
+	require.Empty(t, cached.AccessRights[api.APIID].AllowanceScope)
+}
+
+func TestCheckSessionAndIdentityForValidKey_AuthStorePath_CachesClonedSession(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HashKeys = false
+		globalConf.LocalSessionCache.DisableCacheSessionState = false
+	})
+	defer ts.Close()
+
+	api := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.APIID = uuid.New()
+		spec.UseKeylessAccess = false
+		spec.UseOauth2 = true
+		spec.Auth.AuthHeaderName = "authorization"
+	})[0]
+
+	key := "auth-store-" + uuid.New()
+	session := CreateStandardSession()
+	session.AccessRights = map[string]user.AccessDefinition{
+		api.APIID: {
+			APIID:    api.APIID,
+			Versions: []string{"Default"},
+			Limit: user.APILimit{
+				RateLimit: user.RateLimit{
+					Rate: 100,
+					Per:  60,
+				},
+			},
+		},
+	}
+
+	require.NoError(t, api.AuthManager.UpdateSession(key, session, 60, false))
+	defer api.AuthManager.RemoveSession(session.OrgID, key, false)
+
+	baseMid := NewBaseMiddleware(ts.Gw, api, nil, nil)
+	got, ok := baseMid.CheckSessionAndIdentityForValidKey(key, httptest.NewRequest(http.MethodGet, "/", nil))
+	require.True(t, ok, "session should be found in auth store")
+
+	require.Equal(t, api.APIID, got.AccessRights[api.APIID].AllowanceScope)
+
+	time.Sleep(100 * time.Millisecond)
+
+	cacheKey := key
+	if ts.Gw.GetConfig().HashKeys {
+		cacheKey = storage.HashStr(key, storage.HashMurmur64)
+	}
+
+	cachedVal, found := ts.Gw.SessionCache.Get(cacheKey)
+	require.True(t, found, "session should be cached after auth store lookup")
+
+	cached := cachedVal.(user.SessionState)
+	require.Empty(t, cached.AccessRights[api.APIID].AllowanceScope, "cached session should not have AllowanceScope set by policy application")
+
+	ts.Gw.SessionCache.Delete(cacheKey)
+}
+
+func TestBaseMiddleware_getAuthToken(t *testing.T) {
+	t.Run("should get token from cookie", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": {CookieName: "c1", UseCookie: true},
+		}
+
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		baseMid := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
+
+		r, _ := http.NewRequest(http.MethodGet, "", nil)
+		r.AddCookie(&http.Cookie{
+			Name:  "c1",
+			Value: "t1",
+		})
+
+		authKey := &AuthKey{BaseMiddleware: baseMid}
+
+		// test getAuthToken
+		getToken := func(authType string, getAuthToken func(authType string, r *http.Request) (string, apidef.AuthConfig)) string {
+			token, _ := getAuthToken(authType, r)
+			return token
+		}
+
+		assert.Equal(t, "t1", getToken(authKey.getAuthType(), authKey.getAuthToken))
+	})
+
+	t.Run("should not get token from cookie when use cookie is false", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": {CookieName: "c1", UseCookie: false},
+		}
+
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		baseMid := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
+
+		r, _ := http.NewRequest(http.MethodGet, "", nil)
+		r.AddCookie(&http.Cookie{
+			Name:  "c1",
+			Value: "t1",
+		})
+
+		authKey := &AuthKey{BaseMiddleware: baseMid}
+
+		// test getAuthToken
+		getToken := func(authType string, getAuthToken func(authType string, r *http.Request) (string, apidef.AuthConfig)) string {
+			token, _ := getAuthToken(authType, r)
+			return token
+		}
+
+		assert.Empty(t, getToken(authKey.getAuthType(), authKey.getAuthToken))
+	})
+
+	t.Run("should get token from header", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": {AuthHeaderName: "h1"},
+		}
+
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		baseMid := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
+
+		r, _ := http.NewRequest(http.MethodGet, "", nil)
+		r.Header.Set("h1", "t1")
+
+		authKey := &AuthKey{BaseMiddleware: baseMid}
+
+		// test getAuthToken
+		getToken := func(authType string, getAuthToken func(authType string, r *http.Request) (string, apidef.AuthConfig)) string {
+			token, _ := getAuthToken(authType, r)
+			return token
+		}
+
+		assert.Equal(t, "t1", getToken(authKey.getAuthType(), authKey.getAuthToken))
+	})
+
+	t.Run("should get token from query", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": {ParamName: "q1", UseParam: true},
+		}
+
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		baseMid := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
+
+		r, _ := http.NewRequest(http.MethodGet, "", nil)
+		r.URL.RawQuery = "q1=t1"
+
+		authKey := &AuthKey{BaseMiddleware: baseMid}
+
+		// test getAuthToken
+		getToken := func(authType string, getAuthToken func(authType string, r *http.Request) (string, apidef.AuthConfig)) string {
+			token, _ := getAuthToken(authType, r)
+			return token
+		}
+
+		assert.Equal(t, "t1", getToken(authKey.getAuthType(), authKey.getAuthToken))
+	})
+
+	t.Run("should get token from query when use param is disabled", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": {ParamName: "q1", UseParam: false},
+		}
+
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		baseMid := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
+
+		r, _ := http.NewRequest(http.MethodGet, "", nil)
+		r.URL.RawQuery = "q1=t1"
+
+		authKey := &AuthKey{BaseMiddleware: baseMid}
+
+		// test getAuthToken
+		getToken := func(authType string, getAuthToken func(authType string, r *http.Request) (string, apidef.AuthConfig)) string {
+			token, _ := getAuthToken(authType, r)
+			return token
+		}
+
+		assert.Equal(t, "", getToken(authKey.getAuthType(), authKey.getAuthToken))
+	})
+
+}
+
+func TestSessionLimiter_RedisQuotaExceeded_PerAPI(t *testing.T) {
+	t.Skip() // DeleteAllKeys interferes with other tests.
+
+	g := StartTest(nil)
+	defer g.Close()
+
+	g.Gw.GlobalSessionManager.Store().DeleteAllKeys()       // exclusive
+	defer g.Gw.GlobalSessionManager.Store().DeleteAllKeys() // exclusive
+
+	api := func(spec *APISpec) {
+		spec.APIID = uuid.New()
+		spec.UseKeylessAccess = false
+		spec.Proxy.ListenPath = fmt.Sprintf("/%s/", spec.APIID)
+	}
+	apis := BuildAPI(api, api, api)
+
+	g.Gw.LoadAPI(apis...)
+
+	const globalQuotaMax int64 = 25
+
+	session, key := g.CreateSession(func(s *user.SessionState) {
+		s.AccessRights = map[string]user.AccessDefinition{
+			apis[0].APIID: {
+				APIID: apis[0].APIID,
+				Limit: user.APILimit{
+					QuotaMax: 10,
+				},
+			},
+			apis[1].APIID: {
+				APIID: apis[1].APIID,
+				Limit: user.APILimit{
+					QuotaMax: 2,
+				},
+			},
+			apis[2].APIID: {
+				APIID: apis[2].APIID,
+			},
+		}
+		s.QuotaMax = globalQuotaMax
+		s.QuotaRemaining = globalQuotaMax
+	})
+
+	headers := map[string]string{
+		headers2.Authorization: key,
+	}
+
+	// Check allowance scope is equal to api id because per api is enabled for api1 and api2
+	assert.Equal(t, session.AccessRights[apis[0].APIID].AllowanceScope, apis[0].APIID)
+	assert.Equal(t, session.AccessRights[apis[1].APIID].AllowanceScope, apis[1].APIID)
+
+	// Check allowance scope is equal to "" because per api is not enabled for api3
+	assert.Equal(t, session.AccessRights[apis[2].APIID].AllowanceScope, "")
+
+	sendReqAndCheckQuota := func(t *testing.T, apiID string, expectedQuotaRemaining int64, perAPI bool) {
+		t.Helper()
+		_, _ = g.Run(t, test.TestCase{Path: fmt.Sprintf("/%s/", apiID), Headers: headers, Code: http.StatusOK})
+
+		resp, _ := g.Run(t, test.TestCase{Path: "/tyk/keys/" + key, AdminAuth: true, Code: http.StatusOK})
+		bodyInBytes, _ := ioutil.ReadAll(resp.Body)
+		var session user.SessionState
+		_ = json.Unmarshal(bodyInBytes, &session)
+
+		if perAPI {
+			assert.Equal(t, expectedQuotaRemaining, session.AccessRights[apiID].Limit.QuotaRemaining)
+			assert.Equal(t, globalQuotaMax, session.QuotaRemaining) // global quota should remain same
+		} else {
+			assert.Equal(t, expectedQuotaRemaining, session.QuotaRemaining) // if not per api, fallback to global
+		}
+	}
+
+	t.Run("For api1 - per api", func(t *testing.T) {
+		sendReqAndCheckQuota(t, apis[0].APIID, 9, true)
+		sendReqAndCheckQuota(t, apis[0].APIID, 8, true)
+		sendReqAndCheckQuota(t, apis[0].APIID, 7, true)
+	})
+
+	t.Run("For api2 - per api", func(t *testing.T) {
+		sendReqAndCheckQuota(t, apis[1].APIID, 1, true)
+		sendReqAndCheckQuota(t, apis[1].APIID, 0, true)
+	})
+
+	t.Run("For api3 - global", func(t *testing.T) {
+		sendReqAndCheckQuota(t, apis[2].APIID, 24, false)
+		sendReqAndCheckQuota(t, apis[2].APIID, 23, false)
+		sendReqAndCheckQuota(t, apis[2].APIID, 22, false)
+		sendReqAndCheckQuota(t, apis[2].APIID, 21, false)
+		sendReqAndCheckQuota(t, apis[2].APIID, 20, false)
+	})
+}
+
+func TestSessionLimiter_RedisQuotaExceeded_ExpiredAtReset(t *testing.T) {
+	g := StartTest(nil)
+	defer g.Close()
+
+	g.Gw.GlobalSessionManager.Store().DeleteAllKeys()
+	defer g.Gw.GlobalSessionManager.Store().DeleteAllKeys()
+
+	t.Run("expiredAt is set to now.Add(quotaRenewalRate) when lock succeeds", func(t *testing.T) {
+		quotaKey := "test-quota-key-expired-at"
+		quotaRenewalRate := int64(3600)
+		quotaMax := int64(100)
+		expectedTTL := time.Duration(quotaRenewalRate) * time.Second
+
+		limiter := g.Gw.SessionLimiter
+
+		session := &user.SessionState{
+			KeyID: "test-key-expired-at",
+			AccessRights: map[string]user.AccessDefinition{
+				"api1": {
+					Limit: user.APILimit{
+						QuotaMax:         quotaMax,
+						QuotaRenewalRate: quotaRenewalRate,
+					},
+					AllowanceScope: "",
+				},
+			},
+		}
+
+		req := &http.Request{}
+
+		rawKey := QuotaKeyPrefix + quotaKey
+		g.Gw.GlobalSessionManager.Store().DeleteRawKey(rawKey)
+
+		limit := &user.APILimit{
+			QuotaMax:         quotaMax,
+			QuotaRenewalRate: quotaRenewalRate,
+		}
+
+		beforeTime := time.Now()
+		blocked := limiter.RedisQuotaExceeded(req, session, quotaKey, "", limit, false, false)
+		afterTime := time.Now()
+
+		assert.Equal(t, quotaMax-1, session.QuotaRemaining, "Quota remaining should be quotaMax - 1 after increment")
+		assert.Greater(t, session.QuotaRenews, int64(0), "QuotaRenews should be set to a future timestamp")
+
+		expectedRenewTimeMin := beforeTime.Add(expectedTTL).Unix()
+		expectedRenewTimeMax := afterTime.Add(expectedTTL).Unix()
+		assert.GreaterOrEqual(t, session.QuotaRenews, expectedRenewTimeMin,
+			"QuotaRenews should be >= beforeTime + quotaRenewalRate (verifies line 510: expiredAt = now.Add(quotaRenewalRate))")
+		assert.LessOrEqual(t, session.QuotaRenews, expectedRenewTimeMax,
+			"QuotaRenews should be <= afterTime + quotaRenewalRate (verifies line 510: expiredAt = now.Add(quotaRenewalRate))")
+
+		ttl, err := g.Gw.GlobalSessionManager.Store().GetExp(rawKey)
+		if err == nil && ttl > 0 {
+			assert.InDelta(t, int64(expectedTTL.Seconds()), ttl, 5,
+				"Key TTL should be approximately quotaRenewalRate (verifies line 509: Set(rawKey, 0, quotaRenewalRate))")
+		}
+
+		assert.False(t, blocked, "Request should not be blocked when quota is not exceeded")
+	})
+
+	t.Run("expiredAt is set correctly for scoped quota", func(t *testing.T) {
+		quotaKey := "test-quota-key-scoped-expired-at"
+		scope := "scope1"
+		quotaRenewalRate := int64(1800)
+		quotaMax := int64(50)
+		expectedTTL := time.Duration(quotaRenewalRate) * time.Second
+
+		limiter := g.Gw.SessionLimiter
+
+		session := &user.SessionState{
+			KeyID: "test-key-scoped-expired-at",
+			AccessRights: map[string]user.AccessDefinition{
+				"api1": {
+					Limit: user.APILimit{
+						QuotaMax:         quotaMax,
+						QuotaRenewalRate: quotaRenewalRate,
+					},
+					AllowanceScope: scope,
+				},
+			},
+		}
+
+		req := &http.Request{}
+
+		rawKey := QuotaKeyPrefix + scope + "-" + quotaKey
+		g.Gw.GlobalSessionManager.Store().DeleteRawKey(rawKey)
+
+		limit := &user.APILimit{
+			QuotaMax:         quotaMax,
+			QuotaRenewalRate: quotaRenewalRate,
+		}
+
+		beforeTime := time.Now()
+		blocked := limiter.RedisQuotaExceeded(req, session, quotaKey, scope, limit, false, false)
+		afterTime := time.Now()
+
+		accessDef := session.AccessRights["api1"]
+		assert.Equal(t, quotaMax-1, accessDef.Limit.QuotaRemaining, "Quota remaining should be quotaMax - 1 after increment")
+		assert.Greater(t, accessDef.Limit.QuotaRenews, int64(0), "QuotaRenews should be set to a future timestamp")
+
+		expectedRenewTimeMin := beforeTime.Add(expectedTTL).Unix()
+		expectedRenewTimeMax := afterTime.Add(expectedTTL).Unix()
+		assert.GreaterOrEqual(t, accessDef.Limit.QuotaRenews, expectedRenewTimeMin,
+			"QuotaRenews should be >= beforeTime + quotaRenewalRate (verifies line 510: expiredAt = now.Add(quotaRenewalRate))")
+		assert.LessOrEqual(t, accessDef.Limit.QuotaRenews, expectedRenewTimeMax,
+			"QuotaRenews should be <= afterTime + quotaRenewalRate (verifies line 510: expiredAt = now.Add(quotaRenewalRate))")
+
+		assert.False(t, blocked, "Request should not be blocked when quota is not exceeded")
+	})
+}
+
+func TestCopyAllowedURLs(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input []user.AccessSpec
+	}{
+		{
+			name: "Copy non-empty slice of AccessSpec with non-empty Methods",
+			input: []user.AccessSpec{
+				{
+					URL:     "http://example.com",
+					Methods: []string{"GET", "POST"},
+				},
+				{
+					URL:     "http://example.org",
+					Methods: []string{"GET"},
+				},
+			},
+		},
+		{
+			name: "Copy non-empty slice of AccessSpec with empty Methods",
+			input: []user.AccessSpec{
+				{
+					URL:     "http://example.com",
+					Methods: []string{},
+				},
+				{
+					URL:     "http://example.org",
+					Methods: []string{},
+				},
+			},
+		},
+		{
+			name: "Copy non-empty slice of AccessSpec with nil Methods",
+			input: []user.AccessSpec{
+				{
+					URL:     "http://example.com",
+					Methods: nil,
+				},
+				{
+					URL:     "http://example.org",
+					Methods: nil,
+				},
+			},
+		},
+		{
+			name:  "Copy empty slice of AccessSpec",
+			input: []user.AccessSpec{},
+		},
+		{
+			name:  "Copy nil slice of AccessSpec",
+			input: []user.AccessSpec(nil),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			copied := copyAllowedURLs(tc.input)
+			assert.Equal(t, tc.input, copied)
+		})
+	}
+}
+
+func TestQuotaNotAppliedWithURLRewrite(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	spec := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.Proxy.ListenPath = "/quota-test"
+		spec.UseKeylessAccess = false
+		UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
+			v.UseExtendedPaths = true
+			v.ExtendedPaths.URLRewrite = []apidef.URLRewriteMeta{{
+				Path:         "/abc",
+				Method:       http.MethodGet,
+				MatchPattern: "/abc",
+				RewriteTo:    "tyk://self/anything",
+			}}
+		})
+	})[0]
+
+	_, authKey := ts.CreateSession(func(s *user.SessionState) {
+		s.AccessRights = map[string]user.AccessDefinition{
+			spec.APIID: {
+				APIName:  spec.Name,
+				APIID:    spec.APIID,
+				Versions: []string{"default"},
+				Limit: user.APILimit{
+					QuotaMax:         2,
+					QuotaRenewalRate: 3600,
+				},
+				AllowanceScope: spec.APIID,
+			},
+		}
+		s.OrgID = spec.OrgID
+	})
+
+	authorization := map[string]string{
+		"Authorization": authKey,
+	}
+	_, _ = ts.Run(t, []test.TestCase{
+		{
+			Headers: authorization,
+			Path:    "/quota-test/abc",
+			Code:    http.StatusOK,
+		},
+		{
+			Headers: authorization,
+			Path:    "/quota-test/abc",
+			Code:    http.StatusOK,
+		},
+		{
+			Headers: authorization,
+			Path:    "/quota-test/abc",
+			Code:    http.StatusForbidden,
+		},
+	}...)
+}
+
+func TestRecordAccessLog_TraceID(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	tests := []struct {
+		name          string
+		otelEnabled   bool
+		hasTraceCtx   bool
+		expectTraceID bool
+	}{
+		{
+			name:          "OTel disabled - no trace_id field",
+			otelEnabled:   false,
+			hasTraceCtx:   false,
+			expectTraceID: false,
+		},
+		{
+			name:          "OTel enabled, no trace context - no trace_id field",
+			otelEnabled:   true,
+			hasTraceCtx:   false,
+			expectTraceID: false,
+		},
+		{
+			name:          "OTel enabled, valid trace context - trace_id present",
+			otelEnabled:   true,
+			hasTraceCtx:   true,
+			expectTraceID: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, hook := logrustest.NewNullLogger()
+
+			gwConfig := ts.Gw.GetConfig()
+			gwConfig.AccessLogs.Enabled = true
+			gwConfig.OpenTelemetry.Enabled = tc.otelEnabled
+			ts.Gw.SetConfig(gwConfig)
+
+			spec := &APISpec{
+				APIDefinition: &apidef.APIDefinition{},
+				GlobalConfig:  gwConfig,
+			}
+
+			baseMw := &BaseMiddleware{
+				Spec:   spec,
+				Gw:     ts.Gw,
+				logger: logger.WithField("prefix", "test"),
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "http://example.com/path", nil)
+
+			// Add trace context if needed
+			if tc.hasTraceCtx && tc.otelEnabled {
+				// Create a real OTel provider and span
+				otelCfg := &otel.OpenTelemetry{BaseOpenTelemetry: otel.BaseOpenTelemetry{
+					Enabled: true,
+					ExporterConfig: otel.ExporterConfig{
+						Exporter: "http",
+						Endpoint: "http://localhost:4318", // Won't actually connect
+					},
+				}}
+				provider := otel.InitOpenTelemetry(context.Background(), logger, otelCfg, "test-gw", "v1.0.0", false, "", false, nil)
+				_, span := provider.Tracer().Start(context.Background(), "test-span")
+				defer span.End()
+
+				ctx := otel.ContextWithSpan(req.Context(), span)
+				req = req.WithContext(ctx)
+			}
+
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+			}
+
+			latency := analytics.Latency{
+				Total:    100,
+				Upstream: 80,
+				Gateway:  20,
+			}
+
+			baseMw.RecordAccessLog(req, resp, latency)
+
+			// Check the logged fields
+			assert.NotEmpty(t, hook.Entries, "Expected a log entry")
+			lastEntry := hook.LastEntry()
+
+			_, hasTraceID := lastEntry.Data["trace_id"]
+			assert.Equal(t, tc.expectTraceID, hasTraceID, "trace_id field presence mismatch")
+
+			if tc.expectTraceID {
+				traceID := lastEntry.Data["trace_id"].(string)
+				assert.NotEmpty(t, traceID, "trace_id should not be empty when present")
+			}
+
+			hook.Reset()
+		})
+	}
+}
+
+func TestRecordAccessLog_OriginalPath(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	tests := []struct {
+		name               string
+		originalPath       string
+		expectOriginalPath bool
+	}{
+		{
+			name:               "AL-1: original_path present when context value is non-empty",
+			originalPath:       "/api/v1/users",
+			expectOriginalPath: true,
+		},
+		{
+			name:               "AL-2: original_path omitted when context value is empty",
+			originalPath:       "",
+			expectOriginalPath: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, hook := logrustest.NewNullLogger()
+
+			gwConfig := ts.Gw.GetConfig()
+			gwConfig.AccessLogs.Enabled = true
+			ts.Gw.SetConfig(gwConfig)
+
+			spec := &APISpec{
+				APIDefinition: &apidef.APIDefinition{},
+				GlobalConfig:  gwConfig,
+			}
+
+			baseMw := &BaseMiddleware{
+				Spec:   spec,
+				Gw:     ts.Gw,
+				logger: logger.WithField("prefix", "test"),
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "http://example.com/path", nil)
+
+			if tc.originalPath != "" {
+				reqCtx := context.WithValue(req.Context(), ctxpkg.OriginalRequestPath, tc.originalPath)
+				req = req.WithContext(reqCtx)
+			}
+
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+			}
+
+			latency := analytics.Latency{
+				Total:    100,
+				Upstream: 80,
+				Gateway:  20,
+			}
+
+			baseMw.RecordAccessLog(req, resp, latency)
+
+			assert.NotEmpty(t, hook.Entries, "Expected a log entry")
+			lastEntry := hook.LastEntry()
+
+			_, hasOriginalPath := lastEntry.Data["original_path"]
+			assert.Equal(t, tc.expectOriginalPath, hasOriginalPath,
+				"original_path field presence mismatch")
+
+			if tc.expectOriginalPath {
+				assert.Equal(t, tc.originalPath, lastEntry.Data["original_path"],
+					"original_path value should match context value")
+			}
+
+			hook.Reset()
+		})
+	}
+}
+
+func TestGateway_isDisabledForMCP(t *testing.T) {
+	gw := &Gateway{}
+
+	t.Run("RedisCacheMiddleware enabled for MCP APIs with request-level safety", func(t *testing.T) {
+		mcpSpec := BuildAPI(func(spec *APISpec) {
+			spec.APIID = "mcp-test"
+			spec.MarkAsMCP()
+		})[0]
+
+		baseMid := &BaseMiddleware{Spec: mcpSpec}
+		cacheMW := &RedisCacheMiddleware{
+			BaseMiddleware: baseMid,
+			store:          nil, // store not needed for this test
+		}
+
+		result := gw.isDisabledForMCP(cacheMW)
+		assert.False(t, result, "MCP cache safety is evaluated per request")
+	})
+
+	t.Run("RedisCacheMiddleware enabled for non-MCP APIs", func(t *testing.T) {
+		nonMCPSpec := BuildAPI(func(spec *APISpec) {
+			spec.APIID = "regular-api"
+		})[0]
+
+		baseMid := &BaseMiddleware{Spec: nonMCPSpec}
+		cacheMW := &RedisCacheMiddleware{
+			BaseMiddleware: baseMid,
+			store:          nil,
+		}
+
+		result := gw.isDisabledForMCP(cacheMW)
+		assert.False(t, result, "RedisCacheMiddleware should be enabled for non-MCP APIs")
+	})
+
+	t.Run("other middleware not affected for MCP APIs", func(t *testing.T) {
+		mcpSpec := BuildAPI(func(spec *APISpec) {
+			spec.APIID = "mcp-test"
+			spec.MarkAsMCP()
+		})[0]
+
+		baseMid := &BaseMiddleware{Spec: mcpSpec}
+		// Test with a non-restricted middleware (e.g., RequestSigning)
+		signingMW := &RequestSigning{BaseMiddleware: baseMid}
+
+		result := gw.isDisabledForMCP(signingMW)
+		assert.False(t, result, "Non-restricted middleware should work for MCP APIs")
+	})
+}
+
+func TestGateway_mwAppendEnabled_MCP(t *testing.T) {
+	gw := &Gateway{}
+
+	t.Run("appends cache middleware for MCP APIs", func(t *testing.T) {
+		mcpSpec := BuildAPI(func(spec *APISpec) {
+			spec.APIID = "mcp-test"
+			spec.CacheOptions.EnableCache = true // Even if enabled in config
+			spec.MarkAsMCP()
+		})[0]
+
+		baseMid := &BaseMiddleware{Spec: mcpSpec}
+		cacheMW := &RedisCacheMiddleware{
+			BaseMiddleware: baseMid,
+			store:          nil,
+		}
+
+		var chain []alice.Constructor
+		result := gw.mwAppendEnabled(&chain, cacheMW)
+
+		assert.True(t, result, "cache middleware should evaluate MCP safety per request")
+		assert.Len(t, chain, 1)
+	})
+
+	t.Run("appends cache middleware for non-MCP APIs", func(t *testing.T) {
+		nonMCPSpec := BuildAPI(func(spec *APISpec) {
+			spec.APIID = "regular-api"
+			spec.CacheOptions.EnableCache = true
+		})[0]
+
+		baseMid := &BaseMiddleware{Spec: nonMCPSpec, Gw: gw}
+		cacheMW := &RedisCacheMiddleware{
+			BaseMiddleware: baseMid,
+			store:          nil,
+		}
+
+		var chain []alice.Constructor
+		result := gw.mwAppendEnabled(&chain, cacheMW)
+
+		assert.True(t, result, "mwAppendEnabled should return true for cache on non-MCP APIs")
+		assert.Len(t, chain, 1, "Chain should have cache middleware for non-MCP APIs")
+	})
+
+	t.Run("appends non-restricted middleware for MCP APIs", func(t *testing.T) {
+		mcpSpec := BuildAPI(func(spec *APISpec) {
+			spec.APIID = "mcp-test"
+			spec.RequestSigning.IsEnabled = true
+			spec.MarkAsMCP()
+		})[0]
+
+		baseMid := &BaseMiddleware{Spec: mcpSpec, Gw: gw}
+		signingMW := &RequestSigning{BaseMiddleware: baseMid}
+
+		var chain []alice.Constructor
+		result := gw.mwAppendEnabled(&chain, signingMW)
+
+		assert.True(t, result, "mwAppendEnabled should return true for non-restricted middleware on MCP")
+		assert.Len(t, chain, 1, "Chain should have non-restricted middleware for MCP APIs")
+	})
+}
+
+func TestGateway_mwAppendEnabledForRequest(t *testing.T) {
+	gw := &Gateway{}
+	gw.SetConfig(config.Config{})
+
+	spec := BuildAPI(func(spec *APISpec) {
+		spec.APIID = "request-conditional-api"
+	})[0]
+	mw := &requestConditionalMiddleware{
+		BaseMiddleware: &BaseMiddleware{Spec: spec, Gw: gw},
+	}
+
+	var chain []alice.Constructor
+	appended := gw.mwAppendEnabledForRequest(&chain, mw, func(r *http.Request) bool {
+		return r.Header.Get("X-Run-Middleware") == "true"
+	})
+	require.True(t, appended)
+	require.Len(t, chain, 1)
+
+	nextCalls := 0
+	handler := alice.New(chain...).Then(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nextCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/without-marker", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	assert.Equal(t, http.StatusNoContent, recorder.Code)
+	assert.Zero(t, mw.calls)
+	assert.Equal(t, 1, nextCalls)
+
+	req = httptest.NewRequest(http.MethodGet, "/with-marker", nil)
+	req.Header.Set("X-Run-Middleware", "true")
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	assert.Equal(t, http.StatusNoContent, recorder.Code)
+	assert.Equal(t, 1, mw.calls)
+	assert.Equal(t, 2, nextCalls)
+}
+
+// testMetricInstruments creates MetricInstruments backed by a real in-memory
+// provider so tests can assert recorded metric values. If defs is non-nil,
+// an API metric registry is configured with the given definitions.
+func testMetricInstruments(t *testing.T, defs []apimetrics.APIMetricDefinition) (*otel.MetricInstruments, *metrictest.TestProvider) {
+	t.Helper()
+	tp := metrictest.NewProvider(t)
+	inst := otel.NewMetricInstruments(tp, logrus.New())
+	if defs != nil {
+		inst.SetRegistry(tp, defs)
+	}
+	return inst, tp
+}
+
+func TestBaseMiddleware_RecordMetrics(t *testing.T) {
+	t.Run("records tyk.http.requests counter", func(t *testing.T) {
+		inst, tp := testMetricInstruments(t, nil)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api", Name: "TestAPI"}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		bm.RecordMetrics(nil, r, 200, analytics.Latency{Total: 150, Upstream: 100, Gateway: 50}, nil)
+
+		m := tp.FindMetric(t, "tyk.http.requests")
+		metrictest.AssertSum(t, m, int64(1))
+	})
+
+	t.Run("skipped when DoNotTrack on spec", func(t *testing.T) {
+		inst, tp := testMetricInstruments(t, nil)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api", DoNotTrack: true}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		bm.RecordMetrics(nil, r, 200, analytics.Latency{}, nil)
+
+		names := tp.MetricNames()
+		assert.NotContains(t, names, "tyk.http.requests")
+	})
+
+	t.Run("skipped when DoNotTrack on context", func(t *testing.T) {
+		inst, tp := testMetricInstruments(t, nil)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api"}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		setCtxValue(r, ctxpkg.DoNotTrackThisEndpoint, true)
+		bm.RecordMetrics(nil, r, 200, analytics.Latency{}, nil)
+
+		names := tp.MetricNames()
+		assert.NotContains(t, names, "tyk.http.requests")
+	})
+
+	t.Run("response_header dimension from proxy response", func(t *testing.T) {
+		defs := []apimetrics.APIMetricDefinition{{
+			Name: "test.by.version",
+			Type: "counter",
+			Dimensions: []apimetrics.DimensionDefinition{
+				{Source: "response_header", Key: "X-Version", Label: "version", Default: "unknown"},
+			},
+		}}
+		inst, tp := testMetricInstruments(t, defs)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api"}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		resp := &http.Response{Header: http.Header{"X-Version": []string{"v2.0"}}}
+		bm.RecordMetrics(nil, r, 200, analytics.Latency{}, resp)
+
+		m := tp.FindMetric(t, "test.by.version")
+		metrictest.AssertSum(t, m, int64(1))
+	})
+
+	t.Run("response_header fallback to ResponseWriter", func(t *testing.T) {
+		defs := []apimetrics.APIMetricDefinition{{
+			Name: "test.by.version",
+			Type: "counter",
+			Dimensions: []apimetrics.DimensionDefinition{
+				{Source: "response_header", Key: "X-Version", Label: "version", Default: "unknown"},
+			},
+		}}
+		inst, tp := testMetricInstruments(t, defs)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api"}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		w := httptest.NewRecorder()
+		w.Header().Set("X-Version", "v3.0")
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		// nil response forces the ResponseWriter fallback path.
+		bm.RecordMetrics(w, r, 200, analytics.Latency{}, nil)
+
+		m := tp.FindMetric(t, "test.by.version")
+		metrictest.AssertSum(t, m, int64(1))
+	})
+
+	t.Run("response_header default when both response and writer nil", func(t *testing.T) {
+		defs := []apimetrics.APIMetricDefinition{{
+			Name: "test.by.version",
+			Type: "counter",
+			Dimensions: []apimetrics.DimensionDefinition{
+				{Source: "response_header", Key: "X-Version", Label: "version", Default: "unknown"},
+			},
+		}}
+		inst, tp := testMetricInstruments(t, defs)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api"}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		bm.RecordMetrics(nil, r, 500, analytics.Latency{}, nil)
+
+		m := tp.FindMetric(t, "test.by.version")
+		metrictest.AssertSum(t, m, int64(1))
+	})
+
+	t.Run("error path nil response does not panic", func(t *testing.T) {
+		inst, _ := testMetricInstruments(t, nil)
+		bm := &BaseMiddleware{
+			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{APIID: "test-api"}},
+			Gw:   &Gateway{MetricInstruments: inst},
+		}
+
+		r := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+		assert.NotPanics(t, func() {
+			bm.RecordMetrics(nil, r, 500, analytics.Latency{}, nil)
+		})
+	})
+}
+
+func TestRecordAccessLog_APIType(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	tests := []struct {
+		name        string
+		givenAPIDef func(spec *APISpec)
+		givenSetup  func(req *http.Request)
+		validate    func(t *testing.T, fields logrus.Fields)
+	}{
+		{
+			name:        "classic API",
+			givenAPIDef: func(_ *APISpec) {},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "classic", fields["api_type"])
+				assert.NotContains(t, fields, "mcp_method")
+				assert.NotContains(t, fields, "mcp_primitive_type")
+				assert.NotContains(t, fields, "mcp_primitive_name")
+				assert.NotContains(t, fields, "mcp_error_code")
+			},
+		},
+		{
+			name: "OAS API",
+			givenAPIDef: func(s *APISpec) {
+				s.IsOAS = true
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "oas", fields["api_type"])
+				assert.NotContains(t, fields, "mcp_method")
+			},
+		},
+		{
+			name: "GraphQL API",
+			givenAPIDef: func(s *APISpec) {
+				s.GraphQL.Enabled = true
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "graphql", fields["api_type"])
+				assert.NotContains(t, fields, "mcp_method")
+			},
+		},
+		{
+			name: "GraphQL takes precedence over OAS",
+			givenAPIDef: func(s *APISpec) {
+				s.GraphQL.Enabled = true
+				s.IsOAS = true
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "graphql", fields["api_type"])
+			},
+		},
+		{
+			name: "MCP takes precedence over OAS",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+				s.IsOAS = true
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+			},
+		},
+		{
+			name: "MCP tools/call with all fields",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+				s.IsOAS = true
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "tools/call")
+				ctxSetMCPPrimitiveType(req, "tool")
+				ctxSetMCPPrimitiveName(req, "get_weather")
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+				assert.Equal(t, "tools/call", fields["mcp_method"])
+				assert.Equal(t, "tool", fields["mcp_primitive_type"])
+				assert.Equal(t, "get_weather", fields["mcp_primitive_name"])
+				assert.NotContains(t, fields, "mcp_error_code")
+			},
+		},
+		{
+			name: "MCP error includes error code",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "tools/call")
+				ctxSetMCPPrimitiveType(req, "tool")
+				ctxSetMCPPrimitiveName(req, "unknown_tool")
+				ctxSetJSONRPCErrorCode(req, -32601)
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+				assert.Equal(t, "tools/call", fields["mcp_method"])
+				assert.Equal(t, "tool", fields["mcp_primitive_type"])
+				assert.Equal(t, "unknown_tool", fields["mcp_primitive_name"])
+				assert.Equal(t, int64(-32601), fields["mcp_error_code"])
+			},
+		},
+		{
+			name: "MCP initialize has method only",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "initialize")
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+				assert.Equal(t, "initialize", fields["mcp_method"])
+				assert.NotContains(t, fields, "mcp_primitive_type")
+				assert.NotContains(t, fields, "mcp_primitive_name")
+				assert.NotContains(t, fields, "mcp_error_code")
+			},
+		},
+		{
+			name: "MCP without context values has api_type only",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+				assert.NotContains(t, fields, "mcp_method")
+				assert.NotContains(t, fields, "mcp_primitive_type")
+				assert.NotContains(t, fields, "mcp_primitive_name")
+				assert.NotContains(t, fields, "mcp_error_code")
+			},
+		},
+		{
+			name: "MCP resources/read",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "resources/read")
+				ctxSetMCPPrimitiveType(req, "resource")
+				ctxSetMCPPrimitiveName(req, "docs://api/readme")
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+				assert.Equal(t, "resources/read", fields["mcp_method"])
+				assert.Equal(t, "resource", fields["mcp_primitive_type"])
+				assert.Equal(t, "docs://api/readme", fields["mcp_primitive_name"])
+			},
+		},
+		{
+			name: "MCP prompts/get",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "prompts/get")
+				ctxSetMCPPrimitiveType(req, "prompt")
+				ctxSetMCPPrimitiveName(req, "summarize")
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "mcp", fields["api_type"])
+				assert.Equal(t, "prompts/get", fields["mcp_method"])
+				assert.Equal(t, "prompt", fields["mcp_primitive_type"])
+				assert.Equal(t, "summarize", fields["mcp_primitive_name"])
+			},
+		},
+		{
+			name: "template filters to api_type only",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "tools/call")
+				ctxSetMCPPrimitiveType(req, "tool")
+				ctxSetMCPPrimitiveName(req, "get_weather")
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				// Template filtering is validated via allowedFields in the harness below.
+				// This case uses the "api_type" template set by givenAPIDef override.
+				assert.Contains(t, fields, "api_type")
+				assert.NotContains(t, fields, "mcp_method")
+				assert.NotContains(t, fields, "mcp_primitive_type")
+				assert.NotContains(t, fields, "mcp_primitive_name")
+			},
+		},
+		{
+			name: "template allows api_type and mcp_method",
+			givenAPIDef: func(s *APISpec) {
+				s.MarkAsMCP()
+			},
+			givenSetup: func(req *http.Request) {
+				ctxSetMCPMethod(req, "tools/call")
+				ctxSetMCPPrimitiveType(req, "tool")
+				ctxSetMCPPrimitiveName(req, "get_weather")
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Contains(t, fields, "api_type")
+				assert.Contains(t, fields, "mcp_method")
+				assert.NotContains(t, fields, "mcp_primitive_type")
+				assert.NotContains(t, fields, "mcp_primitive_name")
+			},
+		},
+		{
+			name: "all api types produce common access log fields",
+			givenAPIDef: func(s *APISpec) {
+				s.APIID = "test-api"
+				s.Name = "Test API"
+				s.OrgID = "org-123"
+			},
+			validate: func(t *testing.T, fields logrus.Fields) {
+				assert.Equal(t, "classic", fields["api_type"])
+				// Verify common access log fields are still present alongside api_type
+				assert.Equal(t, "test-api", fields["api_id"])
+				assert.Equal(t, "Test API", fields["api_name"])
+				assert.Equal(t, "org-123", fields["org_id"])
+				assert.Contains(t, fields, "method")
+				assert.Contains(t, fields, "path")
+				assert.Contains(t, fields, "status")
+				assert.Contains(t, fields, "latency_total")
+			},
+		},
+	}
+
+	// Template overrides keyed by test name. If a test name appears here,
+	// the gwConfig.AccessLogs.Template is set to this value instead of nil.
+	templateOverrides := map[string][]string{
+		"template filters to api_type only":       {"api_type"},
+		"template allows api_type and mcp_method": {"api_type", "mcp_method"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, hook := logrustest.NewNullLogger()
+
+			gwConfig := ts.Gw.GetConfig()
+			gwConfig.AccessLogs.Enabled = true
+			gwConfig.AccessLogs.Template = templateOverrides[tc.name]
+			ts.Gw.SetConfig(gwConfig)
+
+			spec := &APISpec{
+				APIDefinition: &apidef.APIDefinition{},
+				GlobalConfig:  gwConfig,
+			}
+			tc.givenAPIDef(spec)
+
+			baseMw := &BaseMiddleware{
+				Spec:   spec,
+				Gw:     ts.Gw,
+				logger: logger.WithField("prefix", "test"),
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/test", nil)
+			if tc.givenSetup != nil {
+				tc.givenSetup(req)
+			}
+
+			resp := &http.Response{StatusCode: http.StatusOK}
+			latency := analytics.Latency{Total: 100, Upstream: 80, Gateway: 20}
+
+			baseMw.RecordAccessLog(req, resp, latency)
+
+			assert.NotEmpty(t, hook.Entries, "expected a log entry")
+			tc.validate(t, hook.LastEntry().Data)
+
+			hook.Reset()
+		})
+	}
+}
+
+func TestBaseMiddleware_CopyNilLogger_Concurrent(t *testing.T) {
+	spec := &APISpec{}
+	proxy := ReturningHttpHandler(nil)
+	gw := &Gateway{}
+
+	bm := &BaseMiddleware{Spec: spec, Proxy: proxy, Gw: gw}
+
+	const n = 100
+	var wg sync.WaitGroup
+	wg.Add(n)
+	results := make([]*BaseMiddleware, n)
+
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			require.NotPanics(t, func() { results[i] = bm.Copy() })
+		}()
+	}
+	wg.Wait()
+
+	for i, got := range results {
+		require.NotNil(t, got, "goroutine %d", i)
+		assert.Nil(t, got.logger, "Copy of nil logger should leave logger nil (goroutine %d)", i)
+	}
+}
+
+func TestCheckSessionAndIdentityForValidKey_AuthStorePath_MarksSessionAsNew(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HashKeys = false
+		globalConf.LocalSessionCache.DisableCacheSessionState = false
+	})
+	defer ts.Close()
+
+	api := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.APIID = uuid.New()
+		spec.UseKeylessAccess = false
+		spec.UseOauth2 = true
+		spec.Auth.AuthHeaderName = "authorization"
+	})[0]
+
+	// rpc/mdcb storage
+	apiStorageHandler := storagemock.NewMockHandler(ctrl)
+	api.AuthManager = &DefaultSessionManager{
+		store: apiStorageHandler,
+		orgID: api.OrgID,
+		Gw:    ts.Gw,
+	}
+
+	// local storage
+	globalStorageHandler := storagemock.NewMockHandler(ctrl)
+	ts.Gw.GlobalSessionManager = &DefaultSessionManager{
+		store: globalStorageHandler,
+		orgID: api.OrgID,
+		Gw:    ts.Gw,
+	}
+
+	key := "auth-store-new-" + uuid.New()
+	session := CreateStandardSession()
+	session.AccessRights = map[string]user.AccessDefinition{
+		api.APIID: {
+			APIID:    api.APIID,
+			Versions: []string{"Default"},
+		},
+	}
+
+	sessionJSON, err := json.Marshal(session)
+	require.NoError(t, err)
+
+	apiStorageHandler.EXPECT().GetKey(gomock.Any()).Return(string(sessionJSON), nil).AnyTimes()
+	apiStorageHandler.EXPECT().GetMultiKey(gomock.Any()).Return([]string{string(sessionJSON)}, nil).AnyTimes()
+	apiStorageHandler.EXPECT().GetRawKey(gomock.Any()).Return(string(sessionJSON), nil).AnyTimes()
+	apiStorageHandler.EXPECT().GetKeyPrefix().Return("").AnyTimes()
+
+	globalStorageHandler.EXPECT().GetKey(gomock.Any()).Return("", storage.ErrKeyNotFound).AnyTimes()
+	globalStorageHandler.EXPECT().GetMultiKey(gomock.Any()).Return(nil, storage.ErrKeyNotFound).AnyTimes()
+	globalStorageHandler.EXPECT().GetRawKey(gomock.Any()).Return("", storage.ErrKeyNotFound).AnyTimes()
+	globalStorageHandler.EXPECT().GetKeyPrefix().Return("").AnyTimes()
+
+	// ensure that session was copied from remote repo into the local one
+	globalStorageHandler.EXPECT().SetKey(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+	// ensure that session was updated at the end of UpdateRequestSession
+	globalStorageHandler.EXPECT().SetKeyEx(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+	baseMid := NewBaseMiddleware(ts.Gw, api, nil, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+
+	// global handle simulates absence of session
+	got, ok := baseMid.CheckSessionAndIdentityForValidKey(key, req)
+
+	assert.True(t, ok, "session should be found in auth store")
+	assert.True(t, got.IsRestored(), "session retrieved from AuthManager should be marked as new (IsRestored == false)")
+
+	// simulate session write to context
+	ctxSetSession(req, &got, false, false)
+
+	// Check update session behavior
+	updated := baseMid.UpdateRequestSession(req)
+	assert.True(t, updated, "Should update session if session is touched")
 }

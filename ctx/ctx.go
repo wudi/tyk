@@ -2,22 +2,31 @@ package ctx
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/TykTechnologies/tyk/apidef"
-
+	"github.com/TykTechnologies/tyk/apidef/oas"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/reflect"
+	"github.com/TykTechnologies/tyk/internal/service/core"
 	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/user"
+
+	logger "github.com/TykTechnologies/tyk/log"
 )
 
 type Key uint
 
 const (
 	SessionData Key = iota
+	// Deprecated: UpdateSession was used to trigger a session update, use *SessionData.Touch instead.
 	UpdateSession
 	AuthToken
 	HashedAuthToken
 	VersionData
+	VersionName
 	VersionDefault
 	OrgSessionContext
 	ContextData
@@ -25,6 +34,7 @@ const (
 	TrackThisEndpoint
 	DoNotTrackThisEndpoint
 	UrlRewritePath
+	InternalRedirectTarget
 	RequestMethod
 	OrigRequestURL
 	LoopLevel
@@ -38,64 +48,206 @@ const (
 	Definition
 	RequestStatus
 	GraphQLRequest
+	GraphQLIsWebSocketUpgrade
+
+	// CacheOptions holds cache options required for cache writer middleware.
+	CacheOptions
+	OASDefinition
+	SelfLooping
+	// RequestStartTime holds the time when the request entered the middleware chain
+	RequestStartTime
+	// ErrorClassification holds structured error information for access logs
+	ErrorClassification
+	// JsonRPCRouting indicates the request came via JSON-RPC routing (MCP, A2A, etc.)
+	JsonRPCRouting
+	// JSONRPCRequest stores parsed JSON-RPC request data for protocol routing (MCP, A2A, etc.)
+	JSONRPCRequest
+	// JSONRPCRoutingState stores the routing state for sequential MCP VEM processing.
+	// Used by MCPJSONRPCMiddleware and MCPVEMContinuationMiddleware.
+	JSONRPCRoutingState
+	// MCPRouting indicates the request came via MCP JSON-RPC routing
+	MCPRouting
+	// OriginalRequestPath stores the original request path before any middleware modifications
+	OriginalRequestPath
+	// MCPMethod stores the JSON-RPC method name for MCP metrics dimensions.
+	MCPMethod
+	// MCPPrimitiveType stores the MCP primitive type (tool/resource/prompt) for metrics dimensions.
+	MCPPrimitiveType
+	// MCPPrimitiveName stores the MCP primitive name for metrics dimensions.
+	MCPPrimitiveName
+	// JSONRPCErrorCode stores the JSON-RPC error code for metrics dimensions.
+	JSONRPCErrorCode
+	// MCPProtocolContext stores the typed, single-parse MCP ingress context.
+	MCPProtocolContext
+	// MatchedIdPBinding holds the per-request client-IdP registry binding matched
+	// in the JWT middleware. The value (a *gateway.Binding) is type-asserted on
+	// the gateway side; only the key lives here to avoid an import cycle.
+	MatchedIdPBinding
 )
 
-func setContext(r *http.Request, ctx context.Context) {
-	r2 := r.WithContext(ctx)
-	*r = *r2
-}
-
-func ctxSetSession(r *http.Request, s *user.SessionState, token string, scheduleUpdate bool) {
+func ctxSetSession(r *http.Request, s *user.SessionState, scheduleUpdate bool, hashKey bool) {
 	if s == nil {
 		panic("setting a nil context SessionData")
 	}
 
-	if token == "" {
-		token = GetAuthToken(r)
+	if s.KeyID == "" {
+		s.KeyID = GetAuthToken(r)
 	}
 
 	if s.KeyHashEmpty() {
-		s.SetKeyHash(storage.HashKey(token))
+		s.SetKeyHash(storage.HashKey(s.KeyID, hashKey))
 	}
 
 	ctx := r.Context()
 	ctx = context.WithValue(ctx, SessionData, s)
-	ctx = context.WithValue(ctx, AuthToken, token)
+
+	ctx = context.WithValue(ctx, AuthToken, s.KeyID)
 
 	if scheduleUpdate {
-		ctx = context.WithValue(ctx, UpdateSession, true)
+		s.Touch()
 	}
 
-	setContext(r, ctx)
+	core.SetContext(r, ctx)
 }
 
 func GetAuthToken(r *http.Request) string {
 	if v := r.Context().Value(AuthToken); v != nil {
-		return v.(string)
+		value, ok := v.(string)
+		if ok {
+			return value
+		}
 	}
 	return ""
 }
 
 func GetSession(r *http.Request) *user.SessionState {
 	if v := r.Context().Value(SessionData); v != nil {
-		return v.(*user.SessionState)
+		if val, ok := v.(*user.SessionState); ok {
+			return val
+		} else {
+			logger.Get().Warning("SessionState struct differ from the gateway version, trying to unmarshal.")
+			sess := user.SessionState{}
+			b, _ := json.Marshal(v)
+			e := json.Unmarshal(b, &sess)
+			if e == nil {
+				return &sess
+			}
+		}
 	}
 	return nil
 }
 
-func SetSession(r *http.Request, s *user.SessionState, token string, scheduleUpdate bool) {
-	ctxSetSession(r, s, token, scheduleUpdate)
+func SetSession(r *http.Request, s *user.SessionState, scheduleUpdate bool, hashKey ...bool) {
+	if len(hashKey) > 1 {
+		ctxSetSession(r, s, scheduleUpdate, hashKey[0])
+	} else {
+		ctxSetSession(r, s, scheduleUpdate, config.Global().HashKeys)
+	}
 }
 
+// SetDefinition sets an API definition object to the request context.
 func SetDefinition(r *http.Request, s *apidef.APIDefinition) {
 	ctx := r.Context()
 	ctx = context.WithValue(ctx, Definition, s)
-	setContext(r, ctx)
+	core.SetContext(r, ctx)
 }
 
+// GetDefinition will return a deep copy of the API definition valid for the request.
 func GetDefinition(r *http.Request) *apidef.APIDefinition {
 	if v := r.Context().Value(Definition); v != nil {
-		return v.(*apidef.APIDefinition)
+		if val, ok := v.(*apidef.APIDefinition); ok {
+			return reflect.Clone(val)
+		}
+	}
+
+	return nil
+}
+
+// SetOASDefinition sets an OAS API definition object to the request context.
+func SetOASDefinition(r *http.Request, s *oas.OAS) {
+	ctx := r.Context()
+	ctx = context.WithValue(ctx, OASDefinition, s)
+	core.SetContext(r, ctx)
+}
+
+// GetOASDefinition will return a deep copy of the OAS API definition valid for the request.
+func GetOASDefinition(r *http.Request) *oas.OAS {
+	if v := r.Context().Value(OASDefinition); v != nil {
+		if val, ok := v.(*oas.OAS); ok {
+			return reflect.Clone(val)
+		}
+	}
+
+	return nil
+}
+
+// GetOASConfigData returns a deep copy of the config data of the OAS API definition valid for the request.
+// Only the config data is copied, not the whole API definition, making it faster than GetOASDefinition.
+// Modifying the returned map does not affect the loaded API definition.
+func GetOASConfigData(r *http.Request) (map[string]interface{}, error) {
+	oasDef, ok := r.Context().Value(OASDefinition).(*oas.OAS)
+	if !ok || oasDef == nil {
+		return nil, errors.New("OAS definition not found in request context")
+	}
+
+	mw := oasDef.GetTykMiddleware()
+	if mw == nil || mw.Global == nil || mw.Global.PluginConfig == nil || mw.Global.PluginConfig.Data == nil {
+		return nil, errors.New("config data is nil")
+	}
+
+	return reflect.Clone(mw.Global.PluginConfig.Data.Value), nil
+}
+
+// SetErrorClassification sets the error classification for the request context.
+// This is used to store structured error information for access logs.
+func SetErrorClassification(r *http.Request, ec *errors.ErrorClassification) {
+	ctx := r.Context()
+	ctx = context.WithValue(ctx, ErrorClassification, ec)
+	core.SetContext(r, ctx)
+}
+
+// GetErrorClassification retrieves the error classification from the request context.
+// Returns nil if no error classification has been set.
+func GetErrorClassification(r *http.Request) *errors.ErrorClassification {
+	if v := r.Context().Value(ErrorClassification); v != nil {
+		if val, ok := v.(*errors.ErrorClassification); ok {
+			return val
+		}
 	}
 	return nil
+}
+
+// GetMCPMethod returns the JSON-RPC method name stored in the request context.
+func GetMCPMethod(r *http.Request) string {
+	if v, ok := r.Context().Value(MCPMethod).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// GetMCPPrimitiveType returns the MCP primitive type (tool/resource/prompt) from the request context.
+func GetMCPPrimitiveType(r *http.Request) string {
+	if v, ok := r.Context().Value(MCPPrimitiveType).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// GetMCPPrimitiveName returns the MCP primitive name from the request context.
+func GetMCPPrimitiveName(r *http.Request) string {
+	if v, ok := r.Context().Value(MCPPrimitiveName).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// GetJSONRPCErrorCode returns the JSON-RPC error code from the request context.
+func GetJSONRPCErrorCode(r *http.Request) int64 {
+	switch v := r.Context().Value(JSONRPCErrorCode).(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	}
+	return 0
 }

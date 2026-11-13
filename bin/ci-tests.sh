@@ -1,57 +1,36 @@
 #!/bin/bash
 
-TEST_TIMEOUT=5m
-
-# print a command and execute it
-show() {
-	echo "$@" >&2
-	eval "$@"
-}
-
-fatal() {
-	echo "$@" >&2
-	exit 1
-}
-
-FMT_FILES=$(gofmt -l . | grep -v vendor)
-if [[ -n ${FMT_FILES} ]]; then
-    fatal "Run 'gofmt -w' on these files:\n$FMT_FILES"
-fi
-
-echo "gofmt check is ok!"
-
-IMP_FILES="$(goimports -l . | grep -v vendor)"
-if [[ -n ${IMP_FILES} ]]; then
-    fatal "Run 'goimports -w' on these files:\n$IMP_FILES"
-fi
-
-echo "goimports check is ok!"
+TEST_TIMEOUT=15m
 
 PKGS="$(go list ./...)"
 
+# Support passing custom flags (-json, etc.)
+OPTS="$@"
+if [[ -z "$OPTS" ]]; then
+	OPTS="-race -count=1 -failfast -v"
+fi
+
 export PKG_PATH=${GOPATH}/src/github.com/TykTechnologies/tyk
 
+# exit on non-zero exit from go test/vet
+set -e
+
+# set tags for the CI tests run / plugin builds
+
+tags="goplugin dev"
+
 # build Go-plugin used in tests
-go build -o ./test/goplugins/goplugins.so -buildmode=plugin ./test/goplugins || fatal "building Go-plugin failed"
+echo "Building go plugin"
+go build -tags "${tags}" -buildmode=plugin       -o ./test/goplugins/goplugins.so      ./test/goplugins
+go build -tags "${tags}" -buildmode=plugin -race -o ./test/goplugins/goplugins_race.so ./test/goplugins
 
 for pkg in ${PKGS}; do
-    tags=""
+    coveragefile=`echo "$pkg" | awk -F/ '{print $NF}'`
 
-    # TODO: Remove skipRace variable after solving race conditions in tests.
-    skipRace=false
-    if [[ ${pkg} == *"grpc" ]]; then
-        skipRace=true
-    elif [[ ${pkg} == *"goplugin" ]]; then
-        skipRace=true
-        tags="-tags 'goplugin'"
-    fi
-
-    race="-race"
-
-    if [[ ${skipRace} = true ]]; then
-        race=""
-    fi
-
-    show go test -v ${race} -timeout ${TEST_TIMEOUT} -coverprofile=test.cov ${pkg} ${tags} || fatal "Test Failed"
-    show go vet ${tags} ${pkg} || fatal "go vet errored"
+    echo go test ${OPTS} -timeout ${TEST_TIMEOUT} -coverprofile=${coveragefile}.cov ${pkg} -tags "${tags}"
+    go test ${OPTS} -timeout ${TEST_TIMEOUT} -coverprofile=${coveragefile}.cov ${pkg} -tags "${tags}"
 done
+
+# run rpc tests separately
+rpc_tests='SyncAPISpecsRPC|OrgSessionWithRPCDown'
+go test -count=1 -timeout ${TEST_TIMEOUT} -v -coverprofile=gateway-rpc.cov github.com/TykTechnologies/tyk/gateway -p 1 -run '"'${rpc_tests}'"'

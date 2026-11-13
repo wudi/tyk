@@ -1,0 +1,349 @@
+package apidef
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/TykTechnologies/tyk/internal/dnsdiscovery"
+)
+
+type ValidationResult struct {
+	IsValid bool
+	Errors  []error
+}
+
+func (v *ValidationResult) AppendError(err error) {
+	v.Errors = append(v.Errors, err)
+}
+
+func (v *ValidationResult) HasErrors() bool {
+	return v.ErrorCount() > 0
+}
+
+func (v *ValidationResult) FirstError() error {
+	if v.ErrorCount() == 0 {
+		return nil
+	}
+
+	return v.ErrorAt(0)
+}
+
+func (v *ValidationResult) ErrorAt(i int) error {
+	if v.ErrorCount() < i {
+		return nil
+	}
+
+	return v.Errors[i]
+}
+
+func (v *ValidationResult) ErrorCount() int {
+	return len(v.Errors)
+}
+
+func (v *ValidationResult) ErrorStrings() []string {
+	var errorStrings []string
+	for _, err := range v.Errors {
+		errorStrings = append(errorStrings, err.Error())
+	}
+
+	return errorStrings
+}
+
+type ValidationRuleSet []ValidationRule
+
+var DefaultValidationRuleSet = ValidationRuleSet{
+	&RuleUniqueDataSourceNames{},
+	&RuleAtLeastEnableOneAuthSource{},
+	&RuleValidateIPList{},
+	&RuleValidateGlobalEnforceTimeout{},
+	&RuleValidateEnforceTimeout{},
+	&RuleUpstreamAuth{},
+	&RuleLoadBalancingTargets{},
+	&RuleDNSDiscovery{},
+}
+
+func Validate(definition *APIDefinition, ruleSet ValidationRuleSet) ValidationResult {
+	result := ValidationResult{
+		IsValid: true,
+		Errors:  nil,
+	}
+
+	for _, rule := range ruleSet {
+		rule.Validate(definition, &result)
+	}
+
+	return result
+}
+
+type ValidationRule interface {
+	Validate(apiDef *APIDefinition, validationResult *ValidationResult)
+}
+
+var ErrDuplicateDataSourceName = errors.New("duplicate data source names are not allowed")
+
+type RuleUniqueDataSourceNames struct{}
+
+func (r *RuleUniqueDataSourceNames) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	if apiDef.GraphQL.Engine.DataSources == nil || len(apiDef.GraphQL.Engine.DataSources) <= 1 {
+		return
+	}
+
+	usedNames := map[string]bool{}
+	for _, ds := range apiDef.GraphQL.Engine.DataSources {
+		trimmedName := strings.TrimSpace(strings.ToLower(ds.Name))
+		if usedNames[trimmedName] {
+			validationResult.IsValid = false
+			validationResult.AppendError(ErrDuplicateDataSourceName)
+			return
+		}
+
+		usedNames[trimmedName] = true
+	}
+}
+
+var ErrAllAuthSourcesDisabled = "all auth sources are disabled for %s, at least one of header/cookie/query must be enabled"
+
+type RuleAtLeastEnableOneAuthSource struct{}
+
+func (r *RuleAtLeastEnableOneAuthSource) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	authConfigs := make([]string, len(apiDef.AuthConfigs))
+	i := 0
+	for name := range apiDef.AuthConfigs {
+		authConfigs[i] = name
+		i++
+	}
+
+	sort.Strings(authConfigs)
+
+	for _, name := range authConfigs {
+		if shouldValidateAuthSource(name, apiDef) &&
+			!(apiDef.AuthConfigs[name].UseParam || apiDef.AuthConfigs[name].UseCookie || !apiDef.AuthConfigs[name].DisableHeader) {
+			validationResult.IsValid = false
+			validationResult.AppendError(fmt.Errorf(ErrAllAuthSourcesDisabled, name))
+		}
+	}
+
+}
+
+func shouldValidateAuthSource(authType string, apiDef *APIDefinition) bool {
+	switch authType {
+	case "authToken":
+		return apiDef.UseStandardAuth
+	case "jwt":
+		return apiDef.EnableJWT
+	case "hmac":
+		return apiDef.EnableSignatureChecking
+	case "oauth":
+		return apiDef.UseOauth2
+	case "oidc":
+		return apiDef.UseOpenID
+	case "coprocess":
+		return apiDef.EnableCoProcessAuth
+	}
+
+	return false
+}
+
+var ErrInvalidIPCIDR = "invalid IP/CIDR %q"
+
+type RuleValidateIPList struct{}
+
+func (r *RuleValidateIPList) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	if apiDef.EnableIpWhiteListing {
+		if errs := r.validateIPAddr(apiDef.AllowedIPs); len(errs) > 0 {
+			validationResult.IsValid = false
+			validationResult.Errors = append(validationResult.Errors, errs...)
+		}
+	}
+
+	if apiDef.EnableIpBlacklisting {
+		if errs := r.validateIPAddr(apiDef.BlacklistedIPs); len(errs) > 0 {
+			validationResult.IsValid = false
+			validationResult.Errors = append(validationResult.Errors, errs...)
+		}
+	}
+}
+
+func (r *RuleValidateIPList) validateIPAddr(ips []string) []error {
+	var errs []error
+	for _, ip := range ips {
+		if strings.Count(ip, "/") == 1 {
+			_, _, err := net.ParseCIDR(ip)
+			if err != nil {
+				errs = append(errs, fmt.Errorf(ErrInvalidIPCIDR, ip))
+			}
+
+			continue
+		}
+
+		allowedIP := net.ParseIP(ip)
+		if allowedIP == nil {
+			errs = append(errs, fmt.Errorf(ErrInvalidIPCIDR, ip))
+		}
+	}
+
+	return errs
+}
+
+var ErrInvalidGlobalTimeoutValue = errors.New("invalid global timeout value")
+
+type RuleValidateGlobalEnforceTimeout struct{}
+
+func (r *RuleValidateGlobalEnforceTimeout) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	for _, vInfo := range apiDef.VersionData.Versions {
+		if vInfo.GlobalEnforceTimeout < 0 {
+			validationResult.IsValid = false
+			validationResult.AppendError(ErrInvalidGlobalTimeoutValue)
+			return
+		}
+	}
+}
+
+var ErrInvalidTimeoutValue = errors.New("invalid timeout value")
+
+type RuleValidateEnforceTimeout struct{}
+
+func (r *RuleValidateEnforceTimeout) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	if apiDef.VersionData.Versions != nil {
+		for _, vInfo := range apiDef.VersionData.Versions {
+			for _, hardTimeOutMeta := range vInfo.ExtendedPaths.HardTimeouts {
+				if hardTimeOutMeta.TimeOut < 0 || hardTimeOutMeta.TimeoutDuration < 0 {
+					validationResult.IsValid = false
+					validationResult.AppendError(ErrInvalidTimeoutValue)
+					return
+				}
+			}
+		}
+	}
+}
+
+// Validation errors returned by the rules in this package.
+var (
+	// ErrMultipleUpstreamAuthEnabled is the error to be returned when multiple upstream authentication modes are configured.
+	ErrMultipleUpstreamAuthEnabled = errors.New("multiple upstream authentication modes not allowed")
+	// ErrMultipleUpstreamOAuthAuthorizationType is the error to return when multiple OAuth authorization types are configured.
+	ErrMultipleUpstreamOAuthAuthorizationType = errors.New("multiple upstream OAuth authorization type not allowed")
+	// ErrUpstreamOAuthAuthorizationTypeRequired is the error to return when OAuth authorization type is not specified.
+	ErrUpstreamOAuthAuthorizationTypeRequired = errors.New("upstream OAuth authorization type is required")
+	// ErrInvalidUpstreamOAuthAuthorizationType is the error to return when configured OAuth authorization type is invalid.
+	ErrInvalidUpstreamOAuthAuthorizationType = errors.New("invalid OAuth authorization type")
+	// ErrInvalidUpstreamOAuthClientAuthMethod is the error to return when the configured upstream OAuth client authentication method is invalid.
+	ErrInvalidUpstreamOAuthClientAuthMethod = errors.New("invalid upstream OAuth client authentication method, valid values are: client_secret_basic, client_secret_post")
+	// ErrAllLoadBalancingTargetsZeroWeight is the error to return when all load balancing targets have weight 0.
+	ErrAllLoadBalancingTargetsZeroWeight  = errors.New("all load balancing targets have weight 0, at least one target must have weight > 0")
+	ErrDNSDiscoveryRequiresLoadBalancing  = errors.New("proxy.dns_discovery supplies the target list but does not distribute across it; proxy.enable_load_balancing must be enabled too")
+	ErrDNSDiscoveryWithServiceDiscovery   = errors.New("proxy.dns_discovery and proxy.service_discovery both supply the target list and cannot be enabled together")
+	ErrDNSDiscoveryInvalidRefreshInterval = errors.New("proxy.dns_discovery.refresh_interval must be empty for the 30s default, or at least 5s")
+	ErrDNSDiscoveryNegativeStaleTTL       = errors.New("proxy.dns_discovery.stale_ttl must not be negative; empty keeps the last known addresses until the resolver answers")
+	ErrDNSDiscoveryNegativeDrainTimeout   = errors.New("proxy.dns_discovery.connection_draining.timeout must not be negative; empty applies the 30s default")
+)
+
+// RuleUpstreamAuth implements validations for upstream authentication configurations.
+type RuleUpstreamAuth struct{}
+
+// Validate validates api definition upstream authentication configurations.
+func (r *RuleUpstreamAuth) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	upstreamAuth := apiDef.UpstreamAuth
+
+	if !upstreamAuth.IsEnabled() {
+		return
+	}
+
+	if upstreamAuth.BasicAuth.Enabled && upstreamAuth.OAuth.Enabled {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrMultipleUpstreamAuthEnabled)
+	}
+
+	upstreamOAuth := upstreamAuth.OAuth
+	// only OAuth checks moving forward
+	if !upstreamOAuth.IsEnabled() {
+		return
+	}
+
+	if len(upstreamOAuth.AllowedAuthorizeTypes) == 0 {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrUpstreamOAuthAuthorizationTypeRequired)
+		return
+	}
+
+	if len(upstreamAuth.OAuth.AllowedAuthorizeTypes) > 1 {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrMultipleUpstreamOAuthAuthorizationType)
+	}
+
+	if authType := upstreamAuth.OAuth.AllowedAuthorizeTypes[0]; authType != OAuthAuthorizationTypeClientCredentials && authType != OAuthAuthorizationTypePassword {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrInvalidUpstreamOAuthAuthorizationType)
+	}
+
+	for _, method := range []string{upstreamOAuth.ClientCredentials.Method, upstreamOAuth.PasswordAuthentication.Method} {
+		if method != "" && method != OAuth2ClientAuthBasic && method != OAuth2ClientAuthPost {
+			validationResult.IsValid = false
+			validationResult.AppendError(ErrInvalidUpstreamOAuthClientAuthMethod)
+			break
+		}
+	}
+}
+
+// RuleLoadBalancingTargets implements validations for load balancing target configurations.
+type RuleLoadBalancingTargets struct{}
+
+// Validate validates that when load balancing is enabled, at least one target has weight > 0.
+func (r *RuleLoadBalancingTargets) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	if !apiDef.Proxy.EnableLoadBalancing {
+		return
+	}
+
+	// The list is resolved at runtime, so an empty one is expected here.
+	if apiDef.Proxy.DNSDiscovery.Enabled {
+		return
+	}
+
+	// In Tyk's internal representation, targets with weight N are repeated N times in Proxy.Targets
+	// If all weights are 0, the targets list will be empty, which is invalid for load balancing
+	if len(apiDef.Proxy.Targets) == 0 {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrAllLoadBalancingTargetsZeroWeight)
+	}
+}
+
+// RuleDNSDiscovery validates how proxy.dns_discovery combines with the other sources of a target list.
+type RuleDNSDiscovery struct{}
+
+// Validate validates api definition DNS discovery configuration.
+func (r *RuleDNSDiscovery) Validate(apiDef *APIDefinition, validationResult *ValidationResult) {
+	if !apiDef.Proxy.DNSDiscovery.Enabled {
+		return
+	}
+
+	if !apiDef.Proxy.EnableLoadBalancing {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrDNSDiscoveryRequiresLoadBalancing)
+	}
+
+	if apiDef.Proxy.ServiceDiscovery.UseDiscoveryService {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrDNSDiscoveryWithServiceDiscovery)
+	}
+
+	conf := apiDef.Proxy.DNSDiscovery
+
+	if conf.RefreshInterval < 0 || (conf.RefreshInterval > 0 && time.Duration(conf.RefreshInterval) < dnsdiscovery.MinInterval) {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrDNSDiscoveryInvalidRefreshInterval)
+	}
+
+	if conf.StaleTTL < 0 {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrDNSDiscoveryNegativeStaleTTL)
+	}
+
+	if conf.ConnectionDraining != nil && conf.ConnectionDraining.Timeout < 0 {
+		validationResult.IsValid = false
+		validationResult.AppendError(ErrDNSDiscoveryNegativeDrainTimeout)
+	}
+}

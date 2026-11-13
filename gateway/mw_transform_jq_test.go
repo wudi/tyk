@@ -1,3 +1,4 @@
+//go:build jq
 // +build jq
 
 package gateway
@@ -10,7 +11,7 @@ import (
 )
 
 func testPrepareJQMiddleware() {
-	BuildAndLoadAPI(func(spec *APISpec) {
+	globalGateway.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 		spec.EnableContextVars = true
 		UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
@@ -25,7 +26,7 @@ func testPrepareJQMiddleware() {
 }
 
 func TestJQMiddleware(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	testPrepareJQMiddleware()
@@ -43,7 +44,7 @@ func TestJQMiddleware(t *testing.T) {
 func BenchmarkJQMiddleware(b *testing.B) {
 	b.ReportAllocs()
 
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	testPrepareJQMiddleware()

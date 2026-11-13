@@ -2,41 +2,46 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
-
-	"github.com/TykTechnologies/tyk/headers"
 
 	"github.com/gocraft/health"
 	"github.com/justinas/alice"
-	newrelic "github.com/newrelic/go-agent"
 	"github.com/paulbellamy/ratecounter"
-	cache "github.com/pmylund/go-cache"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/TykTechnologies/tyk-pump/analytics"
 	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/header"
+	"github.com/TykTechnologies/tyk/internal/cache"
+	"github.com/TykTechnologies/tyk/internal/event"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/httputil/accesslog"
+	"github.com/TykTechnologies/tyk/internal/middleware"
+	"github.com/TykTechnologies/tyk/internal/otel"
+	"github.com/TykTechnologies/tyk/internal/otel/apimetrics"
+	"github.com/TykTechnologies/tyk/internal/policy"
+	"github.com/TykTechnologies/tyk/internal/service/newrelic"
+	"github.com/TykTechnologies/tyk/pkg/errpack"
 	"github.com/TykTechnologies/tyk/request"
+	"github.com/TykTechnologies/tyk/rpc"
 	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/trace"
 	"github.com/TykTechnologies/tyk/user"
 )
 
-const mwStatusRespond = 666
-
-const authTokenType = "authToken"
-const jwtType = "jwt"
-const hmacType = "hmac"
-const basicType = "basic"
-const coprocessType = "coprocess"
-const oauthType = "oauth"
-const oidcType = "oidc"
+const (
+	DEFAULT_ORG_SESSION_EXPIRATION = int64(604800)
+)
 
 var (
 	GlobalRate            = ratecounter.NewRateCounter(1 * time.Second)
@@ -44,15 +49,17 @@ var (
 )
 
 type TykMiddleware interface {
-	Init()
 	Base() *BaseMiddleware
-	SetName(string)
-	SetRequestLogger(*http.Request)
+	GetSpec() *APISpec
+
+	Init()
 	Logger() *logrus.Entry
 	Config() (interface{}, error)
 	ProcessRequest(w http.ResponseWriter, r *http.Request, conf interface{}) (error, int) // Handles request
 	EnabledForSpec() bool
 	Name() string
+
+	Unload()
 }
 
 type TraceMiddleware struct {
@@ -68,29 +75,53 @@ func (tr TraceMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request,
 		setContext(r, ctx)
 		return tr.TykMiddleware.ProcessRequest(w, r, conf)
 	}
+
+	if baseMw := tr.Base(); baseMw != nil {
+		cfg := baseMw.Gw.GetConfig()
+		if cfg.OpenTelemetry.TracesEnabled() {
+			otel.AddTraceID(r.Context(), w)
+
+			span := otel.SpanFromContext(r.Context())
+			err, i := tr.TykMiddleware.ProcessRequest(w, r, conf)
+			if err != nil && span != nil {
+				span.SetStatus(otel.SPAN_STATUS_ERROR, err.Error())
+			}
+
+			attrs := ctxGetSpanAttributes(r, tr.TykMiddleware.Name())
+			if len(attrs) > 0 {
+				span.SetAttributes(attrs...)
+			}
+
+			return err, i
+		}
+	}
+
 	return tr.TykMiddleware.ProcessRequest(w, r, conf)
 }
 
-func createDynamicMiddleware(name string, isPre, useSession bool, baseMid BaseMiddleware) func(http.Handler) http.Handler {
+func (gw *Gateway) createDynamicMiddleware(name string, isPre, useSession bool, baseMid *BaseMiddleware) func(http.Handler) http.Handler {
 	dMiddleware := &DynamicMiddleware{
-		BaseMiddleware:      baseMid,
+		BaseMiddleware:      baseMid, // already a Copy from api_loader.
 		MiddlewareClassName: name,
 		Pre:                 isPre,
 		UseSession:          useSession,
 	}
 
-	return createMiddleware(dMiddleware)
+	return gw.createMiddleware(dMiddleware)
 }
 
 // Generic middleware caller to make extension easier
-func createMiddleware(actualMW TykMiddleware) func(http.Handler) http.Handler {
+func (gw *Gateway) createMiddleware(actualMW TykMiddleware) func(http.Handler) http.Handler {
 	mw := &TraceMiddleware{
 		TykMiddleware: actualMW,
 	}
 	// construct a new instance
 	mw.Init()
-	mw.SetName(mw.Name())
+	mw.Base().SetName(mw.Name())
 	mw.Logger().Debug("Init")
+
+	spec := mw.GetSpec()
+	spec.AddUnloadHook(actualMW.Unload)
 
 	// Pull the configuration
 	mwConf, err := mw.Config()
@@ -98,14 +129,28 @@ func createMiddleware(actualMW TykMiddleware) func(http.Handler) http.Handler {
 		mw.Logger().Fatal("[Middleware] Configuration load failed")
 	}
 
-	return func(h http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mw.SetRequestLogger(r)
-
-			if config.Global().NewRelic.AppName != "" {
-				if txn, ok := w.(newrelic.Transaction); ok {
-					defer newrelic.StartSegment(txn, mw.Name()).End()
+			// Create span early if OpenTelemetry is enabled
+			if baseMw := mw.Base(); baseMw != nil {
+				cfg := baseMw.Gw.GetConfig()
+				if cfg.OpenTelemetry.TracesEnabled() && baseMw.Spec.DetailedTracing {
+					ctx, span := baseMw.Gw.TracerProvider.Tracer().Start(r.Context(), mw.Name())
+					setContext(r, ctx)
+					defer func() {
+						attrs := ctxGetSpanAttributes(r, mw.Name())
+						if len(attrs) > 0 {
+							span.SetAttributes(attrs...)
+						}
+						span.End()
+					}()
 				}
+			}
+
+			logger := mw.Base().SetRequestLogger(r)
+
+			if txn := newrelic.FromContext(r.Context()); txn != nil {
+				defer txn.StartSegment(mw.Name()).End()
 			}
 
 			job := instrument.NewJob("MiddlewareCall")
@@ -126,20 +171,45 @@ func createMiddleware(actualMW TykMiddleware) func(http.Handler) http.Handler {
 			}
 
 			startTime := time.Now()
-			mw.Logger().WithField("ts", startTime.UnixNano()).Debug("Started")
+			logger.WithField("ts", startTime.UnixNano()).WithField("mw", mw.Name()).Debug("Started")
 
-			if mw.Base().Spec.CORS.OptionsPassthrough && r.Method == "OPTIONS" {
-				h.ServeHTTP(w, r)
+			// Browser preflights still require MCP Origin validation.
+			_, originGuard := actualMW.(*MCPOriginValidationMiddleware)
+			if !originGuard && mw.Base().Spec.CORS.OptionsPassthrough && r.Method == "OPTIONS" {
+				next.ServeHTTP(w, r)
 				return
 			}
-			err, errCode := mw.ProcessRequest(w, r, mwConf)
-			if err != nil {
-				// GoPluginMiddleware are expected to send response in case of error
-				// but we still want to record error
-				_, isGoPlugin := actualMW.(*GoPluginMiddleware)
 
-				handler := ErrorHandler{*mw.Base()}
-				handler.HandleError(w, r, err.Error(), errCode, !isGoPlugin)
+			err, errCode := mw.ProcessRequest(w, r, mwConf)
+
+			// Direct JSON-RPC rejections have already written their response. Record
+			// them through the normal error analytics path exactly once.
+			ingress := httpctx.GetMCPProtocolContext(r)
+			protocolRejected := ingress != nil && ingress.Validation.HTTPStatus >= 400
+			if err == nil && errCode == middleware.StatusRespond && mw.Base().Spec.IsMCP() && (ctxGetJSONRPCErrorCode(r) != 0 || protocolRejected) {
+				status, message := http.StatusForbidden, "MCP request rejected"
+				if ingress := httpctx.GetMCPProtocolContext(r); ingress != nil && ingress.Validation.HTTPStatus != 0 {
+					status, message = ingress.Validation.HTTPStatus, ingress.Validation.Message
+				}
+				handler := ErrorHandler{mw.Base()}
+				handler.HandleError(w, r, message, status, false)
+			}
+
+			// Workaround
+			// ProcessRequest signature is too narrow it has to be extended to handle cases like this
+			// Abstraction should not know anything about implementation
+			if errors.Is(err, ErrResponseSucceed) {
+				err = nil
+			}
+
+			if err != nil {
+				// Prevent double error write
+				writeResponse := true
+				if goPlugin, isGoPlugin := actualMW.(*GoPluginMiddleware); isGoPlugin && goPlugin.handler != nil || errors.Is(err, ErrResponseErrorSent) || errors.Is(err, middleware.ErrResponseRendered) {
+					writeResponse = false
+				}
+
+				(&ErrorHandler{mw.Base()}).handleErrorExtended(w, r, err, errCode, writeResponse)
 
 				meta["error"] = err.Error()
 
@@ -150,7 +220,15 @@ func createMiddleware(actualMW TykMiddleware) func(http.Handler) http.Handler {
 					job.TimingKv(eventName+".exec_time", finishTime.Nanoseconds(), meta)
 				}
 
-				mw.Logger().WithError(err).WithField("code", errCode).WithField("ns", finishTime.Nanoseconds()).Debug("Finished")
+				finishedLogger := logger.
+					WithError(err).
+					WithField("code", errCode).
+					WithField("ns", finishTime.Nanoseconds())
+				if rpcCode := ctxGetJSONRPCErrorCode(r); rpcCode != 0 {
+					finishedLogger = finishedLogger.WithField("jsonrpc_error_code", rpcCode)
+				}
+				finishedLogger.Log(errpack.LogLevel(err, logrus.DebugLevel), "Finished")
+
 				return
 			}
 
@@ -161,32 +239,82 @@ func createMiddleware(actualMW TykMiddleware) func(http.Handler) http.Handler {
 				job.TimingKv(eventName+".exec_time", finishTime.Nanoseconds(), meta)
 			}
 
-			mw.Logger().WithField("code", errCode).WithField("ns", finishTime.Nanoseconds()).Debug("Finished")
+			finishedLogger := logger.WithField("code", errCode).WithField("ns", finishTime.Nanoseconds())
+			if rpcCode := ctxGetJSONRPCErrorCode(r); rpcCode != 0 {
+				finishedLogger = finishedLogger.WithField("jsonrpc_error_code", rpcCode)
+			}
+			finishedLogger.Debug("Finished")
 
+			mw.Base().UpdateRequestSession(r)
 			// Special code, bypasses all other execution
-			if errCode != mwStatusRespond {
+			if errCode != middleware.StatusRespond {
 				// No error, carry on...
 				meta["bypass"] = "1"
-				h.ServeHTTP(w, r)
-			} else {
-				mw.Base().UpdateRequestSession(r)
+				next.ServeHTTP(w, r)
 			}
 		})
 	}
 }
 
-func mwAppendEnabled(chain *[]alice.Constructor, mw TykMiddleware) bool {
+// isDisabledForMCP returns true if the given middleware should be disabled for MCP APIs.
+// Centralizes all MCP middleware restrictions for easy maintenance.
+func (gw *Gateway) isDisabledForMCP(mw TykMiddleware) bool {
+	spec := mw.Base().Spec
+	if !spec.IsMCP() {
+		return false
+	}
+
+	return false
+}
+
+func (gw *Gateway) mwAppendEnabled(chain *[]alice.Constructor, mw TykMiddleware) bool {
+	if gw.isDisabledForMCP(mw) {
+		return false
+	}
+
 	if mw.EnabledForSpec() {
-		*chain = append(*chain, createMiddleware(mw))
+		*chain = append(*chain, gw.createMiddleware(mw))
 		return true
 	}
 	return false
 }
 
-func mwList(mws ...TykMiddleware) []alice.Constructor {
+// mwAppendEnabledForRequest evaluates the request predicate before entering the
+// traced middleware handler, so skipped requests emit no middleware telemetry.
+func (gw *Gateway) mwAppendEnabledForRequest(chain *[]alice.Constructor, mw TykMiddleware, enabled func(*http.Request) bool) bool {
+	if gw.isDisabledForMCP(mw) || !mw.EnabledForSpec() {
+		return false
+	}
+
+	tracedConstructor := gw.createMiddleware(mw)
+	*chain = append(*chain, func(next http.Handler) http.Handler {
+		tracedHandler := tracedConstructor(next)
+
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !enabled(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			tracedHandler.ServeHTTP(w, r)
+		})
+	})
+	return true
+}
+
+func (gw *Gateway) responseMWAppendEnabled(chain *[]TykResponseHandler, responseMW TykResponseHandler) bool {
+	if responseMW.Enabled() {
+		*chain = append(*chain, responseMW)
+		return true
+	}
+
+	return false
+}
+
+func (gw *Gateway) mwList(mws ...TykMiddleware) []alice.Constructor {
 	var list []alice.Constructor
 	for _, mw := range mws {
-		mwAppendEnabled(&list, mw)
+		gw.mwAppendEnabled(&list, mw)
 	}
 	return list
 }
@@ -194,77 +322,173 @@ func mwList(mws ...TykMiddleware) []alice.Constructor {
 // BaseMiddleware wraps up the ApiSpec and Proxy objects to be included in a
 // middleware handler, this can probably be handled better.
 type BaseMiddleware struct {
-	Spec   *APISpec
-	Proxy  ReturningHttpHandler
-	logger *logrus.Entry
+	Spec  *APISpec
+	Proxy ReturningHttpHandler
+	Gw    *Gateway `json:"-"`
+
+	loggerMu sync.Mutex
+	logger   *logrus.Entry
 }
 
-func (t BaseMiddleware) Base() *BaseMiddleware { return &t }
-
-func (t BaseMiddleware) Logger() (logger *logrus.Entry) {
-	if t.logger == nil {
-		t.logger = logrus.NewEntry(log)
+// NewBaseMiddleware creates a new *BaseMiddleware.
+// The passed logrus.Entry is duplicated.
+// BaseMiddleware keeps the pointer to *Gateway and *APISpec, as well as Proxy.
+// The logger duplication is used so that basemiddleware copies can be created for different middleware.
+func NewBaseMiddleware(gw *Gateway, spec *APISpec, proxy ReturningHttpHandler, logger *logrus.Entry) *BaseMiddleware {
+	if logger == nil {
+		logger = log.NewEntry()
+	}
+	baseMid := &BaseMiddleware{
+		Spec:   spec,
+		Proxy:  proxy,
+		logger: logger.Dup(),
+		Gw:     gw,
 	}
 
-	return t.logger
+	for _, v := range baseMid.Spec.VersionData.Versions {
+		if len(v.ExtendedPaths.CircuitBreaker) > 0 {
+			baseMid.Spec.CircuitBreakerEnabled = true
+		}
+		if len(v.ExtendedPaths.HardTimeouts) > 0 {
+			baseMid.Spec.EnforcedTimeoutEnabled = true
+		}
+		if !v.GlobalEnforceTimeoutDisabled && v.GlobalEnforceTimeout != 0 {
+			baseMid.Spec.EnforcedTimeoutEnabled = true
+		}
+	}
+
+	return baseMid
+}
+
+// Copy returns a BaseMiddleware with its own logger scope. Spec, Proxy and
+// Gw are shared. loggerMu guards t.logger against concurrent mutation by
+// SetName / Logger / SetRequestLogger.
+func (t *BaseMiddleware) Copy() *BaseMiddleware {
+	t.loggerMu.Lock()
+	logger := t.logger
+	t.loggerMu.Unlock()
+
+	var dupedLogger *logrus.Entry
+	if logger != nil {
+		dupedLogger = logger.Dup()
+	}
+	return &BaseMiddleware{logger: dupedLogger, Spec: t.Spec, Proxy: t.Proxy, Gw: t.Gw}
+}
+
+// Base serves to provide the full BaseMiddleware API. It's part of the TykMiddleware interface.
+// It escapes to a wider API surface than TykMiddleware, used by middlewares, etc.
+func (t *BaseMiddleware) Base() *BaseMiddleware {
+	return t
 }
 
 func (t *BaseMiddleware) SetName(name string) {
-	t.logger = t.Logger().WithField("mw", name)
+	t.loggerMu.Lock()
+	defer t.loggerMu.Unlock()
+
+	if t.logger == nil {
+		t.logger = log.NewEntry()
+	}
+	t.logger = t.logger.WithField("mw", name)
 }
 
-func (t *BaseMiddleware) SetRequestLogger(r *http.Request) {
-	t.logger = getLogEntryForRequest(t.Logger(), r, ctxGetAuthToken(r), nil)
+// Logger is used by middleware process functions.
+func (t *BaseMiddleware) Logger() *logrus.Entry {
+	t.loggerMu.Lock()
+	defer t.loggerMu.Unlock()
+
+	if t.logger == nil {
+		t.logger = log.NewEntry()
+	}
+	return t.logger
 }
 
-func (t BaseMiddleware) Init() {}
-func (t BaseMiddleware) EnabledForSpec() bool {
+func (t *BaseMiddleware) SetRequestLogger(r *http.Request) *logrus.Entry {
+	t.loggerMu.Lock()
+	defer t.loggerMu.Unlock()
+
+	if t.logger == nil {
+		t.logger = log.NewEntry()
+	}
+	t.logger = t.Gw.getLogEntryForRequest(t.logger, r, ctxGetAuthToken(r), nil)
+	return t.logger
+}
+
+func (t *BaseMiddleware) Init() {}
+func (t *BaseMiddleware) EnabledForSpec() bool {
 	return true
 }
-func (t BaseMiddleware) Config() (interface{}, error) {
+func (t *BaseMiddleware) Config() (interface{}, error) {
 	return nil, nil
 }
 
-func (t BaseMiddleware) OrgSession(orgID string) (user.SessionState, bool) {
+// Unload unloads the middleware and frees resources
+func (t *BaseMiddleware) Unload() {
+	// methos created to satisfy middleware contract
+}
+
+// GetSpec returns the spec of the middleware
+func (t *BaseMiddleware) GetSpec() *APISpec {
+	return t.Spec
+}
+
+func (t *BaseMiddleware) OrgSession(orgID string) (user.SessionState, bool) {
+
+	if rpc.IsEmergencyMode() {
+		return user.SessionState{}, false
+	}
+
 	// Try and get the session from the session store
 	session, found := t.Spec.OrgSessionManager.SessionDetail(orgID, orgID, false)
 	if found && t.Spec.GlobalConfig.EnforceOrgDataAge {
 		// If exists, assume it has been authorized and pass on
 		// We cache org expiry data
-		t.Logger().Debug("Setting data expiry: ", session.OrgID)
-		ExpiryCache.Set(session.OrgID, session.DataExpires, cache.DefaultExpiration)
+		t.Logger().Debug("Setting data expiry: ", orgID)
+
+		t.Gw.ExpiryCache.Set(session.OrgID, session.DataExpires, cache.DefaultExpiration)
 	}
 
-	session.SetKeyHash(storage.HashKey(orgID))
-	return session, found
+	session.SetKeyHash(storage.HashKey(orgID, t.Gw.GetConfig().HashKeys))
+
+	return session.Clone(), found
 }
 
-func (t BaseMiddleware) SetOrgExpiry(orgid string, expiry int64) {
-	ExpiryCache.Set(orgid, expiry, cache.DefaultExpiration)
+func (t *BaseMiddleware) SetOrgExpiry(orgid string, expiry int64) {
+	t.Gw.ExpiryCache.Set(orgid, expiry, cache.DefaultExpiration)
 }
 
-func (t BaseMiddleware) OrgSessionExpiry(orgid string) int64 {
+func (t *BaseMiddleware) OrgSessionExpiry(orgid string) int64 {
 	t.Logger().Debug("Checking: ", orgid)
-	// Cache failed attempt
-	id, err, _ := orgSessionExpiryCache.Do(orgid, func() (interface{}, error) {
-		cachedVal, found := ExpiryCache.Get(orgid)
-		if found {
-			return cachedVal, nil
-		}
+
+	if rpc.IsEmergencyMode() {
+		return DEFAULT_ORG_SESSION_EXPIRATION
+	}
+
+	// Try to get from cache first
+	cachedVal, found := t.Gw.ExpiryCache.Get(orgid)
+	if found {
+		return cachedVal.(int64)
+	}
+
+	// Start async refresh in background
+	go t.refreshOrgSessionExpiry(orgid)
+
+	return DEFAULT_ORG_SESSION_EXPIRATION
+}
+
+func (t *BaseMiddleware) refreshOrgSessionExpiry(orgid string) {
+	orgSessionExpiryCache.Do(orgid, func() (interface{}, error) {
 		s, found := t.OrgSession(orgid)
 		if found && t.Spec.GlobalConfig.EnforceOrgDataAge {
+			t.SetOrgExpiry(orgid, s.DataExpires)
 			return s.DataExpires, nil
 		}
-		return 0, errors.New("missing session")
+		// On failure or if not found, cache the default value
+		t.SetOrgExpiry(orgid, DEFAULT_ORG_SESSION_EXPIRATION)
+		return DEFAULT_ORG_SESSION_EXPIRATION, nil
 	})
-	if err != nil {
-		t.Logger().Debug("no cached entry found, returning 7 days")
-		return int64(604800)
-	}
-	return id.(int64)
 }
 
-func (t BaseMiddleware) UpdateRequestSession(r *http.Request) bool {
+func (t *BaseMiddleware) UpdateRequestSession(r *http.Request) bool {
 	session := ctxGetSession(r)
 	token := ctxGetAuthToken(r)
 
@@ -272,22 +496,23 @@ func (t BaseMiddleware) UpdateRequestSession(r *http.Request) bool {
 		return false
 	}
 
-	if !ctxSessionUpdateScheduled(r) {
+	if !session.IsModified() {
 		return false
 	}
 
-	lifetime := session.Lifetime(t.Spec.SessionLifetime)
-	if err := GlobalSessionManager.UpdateSession(token, session, lifetime, false); err != nil {
+	lifetime := session.Lifetime(t.Spec.GetSessionLifetimeRespectsKeyExpiration(), t.Spec.SessionLifetime, t.Gw.GetConfig().ForceGlobalSessionLifetime, t.Gw.GetConfig().GlobalSessionLifetime)
+	if err := t.Gw.GlobalSessionManager.UpdateSession(token, session, lifetime, false); err != nil {
 		t.Logger().WithError(err).Error("Can't update session")
 		return false
 	}
 
-	// Set context state back
-	// Useful for benchmarks when request object stays same
-	ctxDisableSessionUpdate(r)
+	// Reset session state, useful for benchmarks when request object stays the same.
+	session.Reset()
+	// Mark session as restored; (makes invoke `SET key val XX` in further calls)
+	session.MarkAsRestored()
 
 	if !t.Spec.GlobalConfig.LocalSessionCache.DisableCacheSessionState {
-		SessionCache.Set(session.KeyHash(), *session, cache.DefaultExpiration)
+		t.Gw.SessionCache.Set(session.KeyHash(), session.Clone(), cache.DefaultExpiration)
 	}
 
 	return true
@@ -295,367 +520,210 @@ func (t BaseMiddleware) UpdateRequestSession(r *http.Request) bool {
 
 // ApplyPolicies will check if any policies are loaded. If any are, it
 // will overwrite the session state to use the policy values.
-func (t BaseMiddleware) ApplyPolicies(session *user.SessionState) error {
-	rights := make(map[string]user.AccessDefinition)
-	tags := make(map[string]bool)
-	if session.MetaData == nil {
-		session.MetaData = make(map[string]interface{})
+func (t *BaseMiddleware) ApplyPolicies(session *user.SessionState) error {
+	var orgID *string
+	if t.Spec != nil {
+		orgID = &t.Spec.OrgID
+	}
+	store := policy.New(orgID, t.Gw.policies, log)
+	return store.Apply(session)
+}
+
+// RecordAccessLog is used for Success/Error handler logging.
+// It emits a log entry with populated access log fields.
+func (t *BaseMiddleware) RecordAccessLog(req *http.Request, resp *http.Response, latency analytics.Latency) {
+	if !t.Spec.GlobalConfig.AccessLogs.Enabled {
+		return
 	}
 
-	didQuota, didRateLimit, didACL, didComplexity := make(map[string]bool), make(map[string]bool), make(map[string]bool), make(map[string]bool)
-	policies := session.PolicyIDs()
+	gw := t.Gw
+	gwConfig := gw.GetConfig()
 
-	for _, polID := range policies {
-		policiesMu.RLock()
-		policy, ok := policiesByID[polID]
-		policiesMu.RUnlock()
-		if !ok {
-			err := fmt.Errorf("policy not found: %q", polID)
-			t.Logger().Error(err)
-			return err
-		}
-		// Check ownership, policy org owner must be the same as API,
-		// otherwise youcould overwrite a session key with a policy from a different org!
-		if t.Spec != nil && policy.OrgID != t.Spec.OrgID {
-			err := fmt.Errorf("attempting to apply policy from different organisation to key, skipping")
-			t.Logger().Error(err)
-			return err
-		}
+	hashKeys := gwConfig.HashKeys
+	allowedFields := gwConfig.AccessLogs.Template
 
-		if policy.Partitions.PerAPI &&
-			(policy.Partitions.Quota || policy.Partitions.RateLimit || policy.Partitions.Acl || policy.Partitions.Complexity) {
-			err := fmt.Errorf("cannot apply policy %s which has per_api and any of partitions set", policy.ID)
-			log.Error(err)
-			return err
-		}
+	// Set the access log fields
+	accessLog := accesslog.NewRecord()
+	accessLog.WithAPIID(t.Spec.APIID, t.Spec.Name, t.Spec.OrgID)
+	accessLog.WithApiKey(req, hashKeys, gw.obfuscateKey)
+	accessLog.WithRequest(req, latency)
+	accessLog.WithOriginalPath(req)
+	accessLog.WithResponse(resp)
 
-		if policy.Partitions.PerAPI {
-			for apiID, accessRights := range policy.AccessRights {
-				// new logic when you can specify quota or rate in more than one policy but for different APIs
-				if didQuota[apiID] || didRateLimit[apiID] || didACL[apiID] || didComplexity[apiID] { // no other partitions allowed
-					err := fmt.Errorf("cannot apply multiple policies when some have per_api set and some are partitioned")
-					log.Error(err)
-					return err
-				}
-
-				idForScope := apiID
-				// check if we already have limit on API level specified when policy was created
-				if accessRights.Limit == nil || *accessRights.Limit == (user.APILimit{}) {
-					// limit was not specified on API level so we will populate it from policy
-					idForScope = policy.ID
-					accessRights.Limit = &user.APILimit{
-						QuotaMax:           policy.QuotaMax,
-						QuotaRenewalRate:   policy.QuotaRenewalRate,
-						Rate:               policy.Rate,
-						Per:                policy.Per,
-						ThrottleInterval:   policy.ThrottleInterval,
-						ThrottleRetryLimit: policy.ThrottleRetryLimit,
-						MaxQueryDepth:      policy.MaxQueryDepth,
-					}
-				}
-				accessRights.AllowanceScope = idForScope
-				accessRights.Limit.SetBy = idForScope
-
-				// respect current quota renews (on API limit level)
-				if r, ok := session.AccessRights[apiID]; ok && r.Limit != nil {
-					accessRights.Limit.QuotaRenews = r.Limit.QuotaRenews
-				}
-
-				// overwrite session access right for this API
-				rights[apiID] = accessRights
-
-				// identify that limit for that API is set (to allow set it only once)
-				didACL[apiID] = true
-				didQuota[apiID] = true
-				didRateLimit[apiID] = true
-				didComplexity[apiID] = true
-			}
-		} else {
-			usePartitions := policy.Partitions.Quota || policy.Partitions.RateLimit || policy.Partitions.Acl || policy.Partitions.Complexity
-
-			for k, v := range policy.AccessRights {
-				ar := &v
-
-				if v.Limit == nil {
-					v.Limit = &user.APILimit{}
-				}
-
-				if !usePartitions || policy.Partitions.Acl {
-					didACL[k] = true
-
-					// Merge ACLs for the same API
-					if r, ok := rights[k]; ok {
-						r.Versions = appendIfMissing(rights[k].Versions, v.Versions...)
-
-						for _, u := range v.AllowedURLs {
-							found := false
-							for ai, au := range r.AllowedURLs {
-								if u.URL == au.URL {
-									found = true
-									r.AllowedURLs[ai].Methods = append(au.Methods, u.Methods...)
-								}
-							}
-
-							if !found {
-								r.AllowedURLs = append(r.AllowedURLs, v.AllowedURLs...)
-							}
-						}
-
-						for _, t := range v.RestrictedTypes {
-							found := false
-							for ri, rt := range r.RestrictedTypes {
-								if t.Name == rt.Name {
-									found = true
-									r.RestrictedTypes[ri].Fields = append(rt.Fields, t.Fields...)
-								}
-							}
-
-							if !found {
-								r.RestrictedTypes = append(r.RestrictedTypes, v.RestrictedTypes...)
-							}
-						}
-
-						ar = &r
-					}
-
-					ar.Limit.SetBy = policy.ID
-				}
-
-				if !usePartitions || policy.Partitions.Quota {
-					didQuota[k] = true
-					if greaterThanInt64(policy.QuotaMax, ar.Limit.QuotaMax) {
-
-						ar.Limit.QuotaMax = policy.QuotaMax
-						//if partition for quota is set the we must use this value in the global information of the key
-						if greaterThanInt64(policy.QuotaMax, session.QuotaMax) || policy.Partitions.Quota {
-							session.QuotaMax = policy.QuotaMax
-						}
-					}
-
-					if policy.QuotaRenewalRate > ar.Limit.QuotaRenewalRate {
-						ar.Limit.QuotaRenewalRate = policy.QuotaRenewalRate
-						if policy.QuotaRenewalRate > session.QuotaRenewalRate {
-							session.QuotaRenewalRate = policy.QuotaRenewalRate
-						}
-					}
-				}
-
-				if !usePartitions || policy.Partitions.RateLimit {
-					didRateLimit[k] = true
-
-					if greaterThanFloat64(policy.Rate, ar.Limit.Rate) {
-						ar.Limit.Rate = policy.Rate
-						//if policy.Partitions.RateLimit then we must set this value in the global data of the key
-						if greaterThanFloat64(policy.Rate, session.Rate) || policy.Partitions.RateLimit {
-							session.Rate = policy.Rate
-						}
-					}
-
-					if policy.Per > ar.Limit.Per {
-						ar.Limit.Per = policy.Per
-						if policy.Per > session.Per {
-							session.Per = policy.Per
-						}
-					}
-
-					if policy.ThrottleRetryLimit > ar.Limit.ThrottleRetryLimit {
-						ar.Limit.ThrottleRetryLimit = policy.ThrottleRetryLimit
-						if policy.ThrottleRetryLimit > session.ThrottleRetryLimit {
-							session.ThrottleRetryLimit = policy.ThrottleRetryLimit
-						}
-					}
-
-					if policy.ThrottleInterval > ar.Limit.ThrottleInterval {
-						ar.Limit.ThrottleInterval = policy.ThrottleInterval
-						if policy.ThrottleInterval > session.ThrottleInterval {
-							session.ThrottleInterval = policy.ThrottleInterval
-						}
-					}
-				}
-
-				if !usePartitions || policy.Partitions.Complexity {
-					didComplexity[k] = true
-
-					if greaterThanInt(policy.MaxQueryDepth, ar.Limit.MaxQueryDepth) {
-						ar.Limit.MaxQueryDepth = policy.MaxQueryDepth
-						if greaterThanInt(policy.MaxQueryDepth, session.MaxQueryDepth) {
-							session.MaxQueryDepth = policy.MaxQueryDepth
-						}
-					}
-				}
-
-				// Respect existing QuotaRenews
-				if r, ok := session.AccessRights[k]; ok && r.Limit != nil {
-					ar.Limit.QuotaRenews = r.Limit.QuotaRenews
-				}
-
-				if !usePartitions || policy.Partitions.Acl {
-					rights[k] = *ar
-				}
-			}
-
-			// Master policy case
-			if len(policy.AccessRights) == 0 {
-				if !usePartitions || policy.Partitions.RateLimit {
-					session.Rate = policy.Rate
-					session.Per = policy.Per
-					session.ThrottleInterval = policy.ThrottleInterval
-					session.ThrottleRetryLimit = policy.ThrottleRetryLimit
-				}
-
-				if !usePartitions || policy.Partitions.Complexity {
-					session.MaxQueryDepth = policy.MaxQueryDepth
-				}
-
-				if !usePartitions || policy.Partitions.Quota {
-					session.QuotaMax = policy.QuotaMax
-					session.QuotaRenewalRate = policy.QuotaRenewalRate
-				}
-			}
-
-			if !session.HMACEnabled {
-				session.HMACEnabled = policy.HMACEnabled
-			}
-
-			if !session.EnableHTTPSignatureValidation {
-				session.EnableHTTPSignatureValidation = policy.EnableHTTPSignatureValidation
-			}
-		}
-
-		session.IsInactive = session.IsInactive || policy.IsInactive
-
-		for _, tag := range policy.Tags {
-			tags[tag] = true
-		}
-
-		for k, v := range policy.MetaData {
-			session.MetaData[k] = v
-		}
-
-		if policy.LastUpdated > session.LastUpdated {
-			session.LastUpdated = policy.LastUpdated
-		}
+	// Add error classification if present (only on error requests)
+	if errClass := ctx.GetErrorClassification(req); errClass != nil {
+		accessLog.WithErrorClassification(errClass)
 	}
 
-	for _, tag := range session.Tags {
-		tags[tag] = true
+	// Only include trace_id when OpenTelemetry is enabled
+	if gwConfig.OpenTelemetry.TracesEnabled() {
+		accessLog.WithTraceID(req)
 	}
 
-	// set tags
-	session.Tags = []string{}
-	for tag := range tags {
-		session.Tags = append(session.Tags, tag)
+	accessLog.WithAPIType(t.Spec.APIType())
+
+	if t.Spec.IsMCP() {
+		accessLog.WithMCP(req)
 	}
 
-	distinctACL := map[string]bool{}
-	for _, v := range rights {
-		if v.Limit.SetBy != "" {
-			distinctACL[v.Limit.SetBy] = true
-		}
+	logFields := accessLog.Fields(allowedFields)
+
+	t.Logger().WithFields(logFields).Info()
+}
+
+// RecordMetrics builds a RequestContext from the current request state and
+// records all configured OTEL metric instruments. Pass the upstream response
+// when available (success path); nil is safe (error path). The ResponseWriter
+// is used as a fallback source for response headers when the proxy response
+// object does not carry them (e.g. when enable_detailed_recording is false).
+func (t *BaseMiddleware) RecordMetrics(w http.ResponseWriter, r *http.Request, statusCode int, latency analytics.Latency, response *http.Response) {
+	if t.Spec.DoNotTrack || ctxGetDoNotTrack(r) {
+		return
 	}
 
-	// If some APIs had only ACL partitions, inherit rest from session level
-	for k, v := range rights {
-		if !didRateLimit[k] {
-			v.Limit.Rate = session.Rate
-			v.Limit.Per = session.Per
-			v.Limit.ThrottleInterval = session.ThrottleInterval
-			v.Limit.ThrottleRetryLimit = session.ThrottleRetryLimit
-		}
-
-		if !didComplexity[k] {
-			v.Limit.MaxQueryDepth = session.MaxQueryDepth
-		}
-
-		if !didQuota[k] {
-			v.Limit.QuotaMax = session.QuotaMax
-			v.Limit.QuotaRenewalRate = session.QuotaRenewalRate
-			v.Limit.QuotaRenews = session.QuotaRenews
-		}
-
-		// If multime ACL
-		if len(distinctACL) > 1 {
-			if v.AllowanceScope == "" && v.Limit.SetBy != "" {
-				v.AllowanceScope = v.Limit.SetBy
-			}
-		}
-
-		v.Limit.SetBy = ""
-
-		rights[k] = v
+	rc := &apimetrics.RequestContext{
+		Request:         r,
+		StatusCode:      statusCode,
+		APIID:           t.Spec.APIID,
+		APIName:         t.Spec.Name,
+		OrgID:           t.Spec.OrgID,
+		ListenPath:      t.Spec.Proxy.ListenPath,
+		Endpoint:        ctxGetTrackedPath(r),
+		IPAddress:       request.RealIP(r),
+		LatencyTotal:    latency.Total,
+		LatencyUpstream: latency.Upstream,
+		LatencyGateway:  latency.Gateway,
 	}
-
-	// If we have policies defining rules for one single API, update session root vars (legacy)
-	if len(didQuota) == 1 && len(didRateLimit) == 1 && len(didComplexity) == 1 {
-		for _, v := range rights {
-			if len(didRateLimit) == 1 {
-				session.Rate = v.Limit.Rate
-				session.Per = v.Limit.Per
-			}
-
-			if len(didQuota) == 1 {
-				session.QuotaMax = v.Limit.QuotaMax
-				session.QuotaRenews = v.Limit.QuotaRenews
-				session.QuotaRenewalRate = v.Limit.QuotaRenewalRate
-			}
-
-			if len(didComplexity) == 1 {
-				session.MaxQueryDepth = v.Limit.MaxQueryDepth
+	if v := t.Spec.getVersionFromRequest(r); v != "" {
+		rc.APIVersion = v
+	}
+	if t.Gw.MetricInstruments.NeedsSession() {
+		rc.Session = ctxGetSession(r)
+		rc.Token = ctxGetAuthToken(r)
+	}
+	if t.Gw.MetricInstruments.NeedsContext() {
+		rc.ContextVariables = ctxGetData(r)
+	}
+	if t.Gw.MetricInstruments.NeedsResponse() {
+		if response != nil && response.Header != nil {
+			rc.Response = response
+		} else if w != nil {
+			// The proxy response may not carry headers when
+			// enable_detailed_recording is false. Fall back to
+			// the ResponseWriter which HandleResponse already
+			// populated with upstream headers.
+			rc.Response = &http.Response{
+				StatusCode: statusCode,
+				Header:     w.Header(),
 			}
 		}
 	}
+	if errClass := ctx.GetErrorClassification(r); errClass != nil {
+		rc.ErrorClassification = string(errClass.Flag)
+	}
+	if t.Gw.MetricInstruments.NeedsMCP() {
+		rc.MCPMethod = ctxGetMCPMethod(r)
+		rc.MCPPrimitiveType = ctxGetMCPPrimitiveType(r)
+		rc.MCPPrimitiveName = ctxGetMCPPrimitiveName(r)
+		rc.MCPErrorCode = ctxGetJSONRPCErrorCode(r)
+	}
+	if t.Gw.MetricInstruments.NeedsConfigData() && !t.Spec.ConfigDataDisabled && len(t.Spec.ConfigData) > 0 {
+		rc.ConfigData = t.Spec.ConfigData
+	}
+	t.Gw.MetricInstruments.RecordRequest(r.Context())
+	t.Gw.MetricInstruments.RecordAPIMetrics(r.Context(), rc)
+}
 
-	// Override session ACL if at least one policy define it
-	if len(didACL) > 0 {
-		session.AccessRights = rights
+func copyAllowedURLs(input []user.AccessSpec) []user.AccessSpec {
+	if input == nil {
+		return nil
 	}
 
-	return nil
+	copied := make([]user.AccessSpec, len(input))
+
+	for i, as := range input {
+		copied[i] = user.AccessSpec{
+			URL: as.URL,
+		}
+		if as.Methods != nil {
+			copied[i].Methods = make([]string, len(as.Methods))
+			copy(copied[i].Methods, as.Methods)
+		}
+		// Conditions decide access, so a copy that dropped them would widen
+		// it. They are copied by value: AccessCondition holds maps, which are
+		// shared with the input, but nothing mutates them after load.
+		if as.Conditions != nil {
+			copied[i].Conditions = make([]user.AccessCondition, len(as.Conditions))
+			copy(copied[i].Conditions, as.Conditions)
+		}
+	}
+
+	return copied
+}
+
+// defaultMinTokenLength is the floor applied to key length when min_token_length
+// is unset. It is enforced at both create time (handleAddOrUpdate) and auth time
+// so the two cannot drift (see TT-17585).
+// See https://github.com/TykTechnologies/tyk/issues/1681.
+const defaultMinTokenLength = 3
+
+// effectiveMinTokenLength returns the configured min_token_length, or the
+// default floor when it is unset (0).
+func effectiveMinTokenLength(configured int) int {
+	if configured == 0 {
+		return defaultMinTokenLength
+	}
+	return configured
 }
 
 // CheckSessionAndIdentityForValidKey will check first the Session store for a valid key, if not found, it will try
 // the Auth Handler, if not found it will fail
-func (t BaseMiddleware) CheckSessionAndIdentityForValidKey(key string, r *http.Request) (user.SessionState, bool) {
-	minLength := t.Spec.GlobalConfig.MinTokenLength
-	if minLength == 0 {
-		// See https://github.com/TykTechnologies/tyk/issues/1681
-		minLength = 3
-	}
+func (t *BaseMiddleware) CheckSessionAndIdentityForValidKey(originalKey string, r *http.Request) (user.SessionState, bool) {
+	key := originalKey
+	minLength := effectiveMinTokenLength(t.Spec.GlobalConfig.MinTokenLength)
 
-	if len(key) <= minLength {
+	if len(key) < minLength {
 		return user.SessionState{IsInactive: true}, false
 	}
 
 	// Try and get the session from the session store
 	t.Logger().Debug("Querying local cache")
+	keyHash := key
 	cacheKey := key
 	if t.Spec.GlobalConfig.HashKeys {
-		cacheKey = storage.HashStr(key)
+		cacheKey = storage.HashStr(key, storage.HashMurmur64) // always hash cache keys with murmur64 to prevent collisions
 	}
 
 	// Check in-memory cache
 	if !t.Spec.GlobalConfig.LocalSessionCache.DisableCacheSessionState {
-		cachedVal, found := SessionCache.Get(cacheKey)
+		cachedVal, found := t.Gw.SessionCache.Get(cacheKey)
 		if found {
 			t.Logger().Debug("--> Key found in local cache")
-			session := cachedVal.(user.SessionState)
+			session := cachedVal.(user.SessionState).Clone()
+			session.MarkAsRestored()
 			if err := t.ApplyPolicies(&session); err != nil {
 				t.Logger().Error(err)
 				return session, false
 			}
+			NormalizeMCPEndpoints(&session)
 			return session, true
 		}
 	}
 
 	// Check session store
 	t.Logger().Debug("Querying keystore")
-	session, found := GlobalSessionManager.SessionDetail(t.Spec.OrgID, key, false)
+	session, found := t.Gw.GlobalSessionManager.SessionDetail(t.Spec.OrgID, key, false)
+
 	if found {
-		session.SetKeyHash(cacheKey)
+		if t.Spec.GlobalConfig.HashKeys {
+			keyHash = storage.HashStr(session.KeyID)
+		}
+		session := session.Clone()
+		session.SetKeyHash(keyHash)
 		// If exists, assume it has been authorized and pass on
 		// cache it
 		if !t.Spec.GlobalConfig.LocalSessionCache.DisableCacheSessionState {
-			go SessionCache.Set(cacheKey, session, cache.DefaultExpiration)
+			t.Gw.SessionCache.Set(cacheKey, session.Clone(), cache.DefaultExpiration)
 		}
 
 		// Check for a policy, if there is a policy, pull it and overwrite the session values
@@ -663,21 +731,42 @@ func (t BaseMiddleware) CheckSessionAndIdentityForValidKey(key string, r *http.R
 			t.Logger().Error(err)
 			return session, false
 		}
+		NormalizeMCPEndpoints(&session)
 		t.Logger().Debug("Got key")
 		return session, true
 	}
 
+	if _, ok := t.Spec.AuthManager.Store().(*RPCStorageHandler); ok && rpc.IsEmergencyMode() {
+		session.KeyID = key
+		return session.Clone(), false
+	}
+
+	// Only search in RPC if it's not in emergency mode
 	t.Logger().Debug("Querying authstore")
 	// 2. If not there, get it from the AuthorizationHandler
-	session, found = t.Spec.AuthManager.KeyAuthorised(key)
+	session, found = t.Spec.AuthManager.SessionDetail(t.Spec.OrgID, key, false)
 	if found {
-		session.SetKeyHash(cacheKey)
+		key = session.KeyID
+		session := session.Clone()
+		session.SetKeyHash(keyHash)
 		// If not in Session, and got it from AuthHandler, create a session with a new TTL
-		t.Logger().Info("Recreating session for key: ", obfuscateKey(key))
+		t.Logger().Info("Recreating session for key: ", t.Gw.obfuscateKey(key))
+
+		// insert new session
+		if t.Gw.GlobalSessionManager.Store() != t.Spec.AuthManager.Store() {
+			clonedSession := session.Clone()
+			clonedSession.MarkAsNew()
+
+			lifetime := clonedSession.Lifetime(t.Spec.GetSessionLifetimeRespectsKeyExpiration(), t.Spec.SessionLifetime, t.Gw.GetConfig().ForceGlobalSessionLifetime, t.Gw.GetConfig().GlobalSessionLifetime)
+			if err := t.Gw.GlobalSessionManager.UpdateSession(key, &clonedSession, lifetime, false); err != nil {
+				t.Logger().WithError(err).Error("Cant copy session from AuthManager into GlobalSessionManager")
+				return user.SessionState{}, false
+			}
+		}
 
 		// cache it
 		if !t.Spec.GlobalConfig.LocalSessionCache.DisableCacheSessionState {
-			go SessionCache.Set(cacheKey, session, cache.DefaultExpiration)
+			go t.Gw.SessionCache.Set(cacheKey, session.Clone(), cache.DefaultExpiration)
 		}
 
 		// Check for a policy, if there is a policy, pull it and overwrite the session values
@@ -685,40 +774,100 @@ func (t BaseMiddleware) CheckSessionAndIdentityForValidKey(key string, r *http.R
 			t.Logger().Error(err)
 			return session, false
 		}
+		NormalizeMCPEndpoints(&session)
 
-		t.Logger().Debug("Lifetime is: ", session.Lifetime(t.Spec.SessionLifetime))
-		ctxScheduleSessionUpdate(r)
+		t.Logger().Debug("Lifetime is: ", session.Lifetime(t.Spec.GetSessionLifetimeRespectsKeyExpiration(), t.Spec.SessionLifetime, t.Gw.GetConfig().ForceGlobalSessionLifetime, t.Gw.GetConfig().GlobalSessionLifetime))
+
+		session.Touch()
+
+		return session, found
 	}
 
-	return session, found
+	// session not found
+	session.KeyID = key
+
+	return session, false
 }
 
 // FireEvent is added to the BaseMiddleware object so it is available across the entire stack
-func (t BaseMiddleware) FireEvent(name apidef.TykEvent, meta interface{}) {
+func (t *BaseMiddleware) FireEvent(name apidef.TykEvent, meta interface{}) {
 	fireEvent(name, meta, t.Spec.EventPaths)
 }
 
-func (b BaseMiddleware) getAuthType() string {
+// emitRateLimitEvents emits rate limit related events based on the request context.
+func (t *BaseMiddleware) emitRateLimitEvents(r *http.Request, rateLimitKey string) {
+	// Emit events triggered from request context.
+	if events := event.Get(r.Context()); len(events) > 0 {
+		for _, e := range events {
+			switch e {
+			case event.RateLimitSmoothingUp, event.RateLimitSmoothingDown:
+				t.emitRateLimitEvent(r, e, "", rateLimitKey)
+			}
+		}
+	}
+}
+
+// emitRateLimitEvent emits a specific rate limit event with an optional custom message.
+func (t *BaseMiddleware) emitRateLimitEvent(r *http.Request, e event.Event, message string, rateLimitKey string) {
+	if message == "" {
+		message = event.String(e)
+	}
+
+	t.Logger().WithField("key", t.Gw.obfuscateKey(rateLimitKey)).Info(message)
+
+	t.FireEvent(e, EventKeyFailureMeta{
+		EventMetaDefault: EventMetaDefault{
+			Message:            message,
+			OriginatingRequest: EncodeRequestToEvent(r),
+		},
+		Path:   r.URL.Path,
+		Origin: request.RealIP(r),
+		Key:    rateLimitKey,
+	})
+}
+
+// handleRateLimitFailure handles the actions to be taken when a rate limit failure occurs.
+func (t *BaseMiddleware) handleRateLimitFailure(r *http.Request, e event.Event, message string, rateLimitKey string) (error, int) {
+	t.emitRateLimitEvent(r, e, message, rateLimitKey)
+
+	// Report in health check
+	reportHealthValue(t.Spec, Throttle, "-1")
+
+	return errors.New(message), http.StatusTooManyRequests
+}
+
+func (t *BaseMiddleware) getAuthType() string {
 	return ""
 }
 
-func (b BaseMiddleware) getAuthToken(authType string, r *http.Request) (string, apidef.AuthConfig) {
-	config, ok := b.Base().Spec.AuthConfigs[authType]
+func (t *BaseMiddleware) getAuthToken(authType string, r *http.Request) (string, apidef.AuthConfig) {
+	spec := t.Base().Spec
+	config, ok := spec.AuthConfigs[authType]
 	// Auth is deprecated. To maintain backward compatibility authToken and jwt cases are added.
-	if !ok && (authType == authTokenType || authType == jwtType) {
-		config = b.Base().Spec.Auth
+	if !ok && (authType == apidef.AuthTokenType || authType == apidef.JWTType) {
+		config = spec.Auth
 	}
 
-	if config.AuthHeaderName == "" {
-		config.AuthHeaderName = headers.Authorization
-	}
+	var (
+		key         string
+		defaultName = header.Authorization
+	)
 
-	key := r.Header.Get(config.AuthHeaderName)
+	headerName := config.AuthHeaderName
+	if !config.DisableHeader {
+		if headerName == "" {
+			headerName = defaultName
+		} else {
+			defaultName = headerName
+		}
+
+		key = r.Header.Get(headerName)
+	}
 
 	paramName := config.ParamName
-	if config.UseParam || paramName != "" {
+	if config.UseParam {
 		if paramName == "" {
-			paramName = config.AuthHeaderName
+			paramName = defaultName
 		}
 
 		paramValue := r.URL.Query().Get(paramName)
@@ -730,9 +879,9 @@ func (b BaseMiddleware) getAuthToken(authType string, r *http.Request) (string, 
 	}
 
 	cookieName := config.CookieName
-	if config.UseCookie || cookieName != "" {
+	if config.UseCookie {
 		if cookieName == "" {
-			cookieName = config.AuthHeaderName
+			cookieName = defaultName
 		}
 
 		authCookie, err := r.Cookie(cookieName)
@@ -749,41 +898,69 @@ func (b BaseMiddleware) getAuthToken(authType string, r *http.Request) (string, 
 	return key, config
 }
 
+func (t *BaseMiddleware) generateSessionID(id string) string {
+	// generate a virtual token
+	data := []byte(id)
+	keyID := fmt.Sprintf("%x", md5.Sum(data))
+	return t.Gw.generateToken(t.Spec.OrgID, keyID)
+}
+
+type ResponseMwLogger interface {
+	setLogger(entry *logrus.Entry)
+	logger() *logrus.Entry
+}
+
 type TykResponseHandler interface {
+	ResponseMwLogger
+	Enabled() bool
 	Init(interface{}, *APISpec) error
 	Name() string
 	HandleResponse(http.ResponseWriter, *http.Response, *http.Request, *user.SessionState) error
 	HandleError(http.ResponseWriter, *http.Request)
+	Base() *BaseTykResponseHandler
 }
 
-func responseProcessorByName(name string) TykResponseHandler {
+type TykGoPluginResponseHandler interface {
+	TykResponseHandler
+	HandleGoPluginResponse(http.ResponseWriter, *http.Response, *http.Request) error
+}
+
+func (gw *Gateway) responseProcessorByName(name string, baseHandler BaseTykResponseHandler) TykResponseHandler {
 	switch name {
-	case "header_injector":
-		return &HeaderInjector{}
-	case "response_body_transform":
-		return &ResponseTransformMiddleware{}
 	case "response_body_transform_jq":
-		return &ResponseTransformJQMiddleware{}
+		return &ResponseTransformJQMiddleware{BaseTykResponseHandler: baseHandler}
 	case "header_transform":
-		return &HeaderTransform{}
+		return &HeaderTransform{BaseTykResponseHandler: baseHandler}
 	case "custom_mw_res_hook":
-		return &CustomMiddlewareResponseHook{}
+		return &CustomMiddlewareResponseHook{BaseTykResponseHandler: baseHandler}
+	case "custom_mw_js_res_hook":
+		return &JSResponseMiddleware{BaseTykResponseHandler: baseHandler}
+	case "goplugin_res_hook":
+		return &ResponseGoPluginMiddleware{BaseTykResponseHandler: baseHandler}
 	}
+
 	return nil
 }
 
 func handleResponseChain(chain []TykResponseHandler, rw http.ResponseWriter, res *http.Response, req *http.Request, ses *user.SessionState) (abortRequest bool, err error) {
+
+	if res.Request != nil {
+		// res.Request context contains otel information from the otel roundtripper
+		setContext(req, res.Request.Context())
+	}
+
 	traceIsEnabled := trace.IsEnabled()
 	for _, rh := range chain {
 		if err := handleResponse(rh, rw, res, req, ses, traceIsEnabled); err != nil {
 			// Abort the request if this handler is a response middleware hook:
-			if rh.Name() == "CustomMiddlewareResponseHook" {
+			if rh.Name() == "CustomMiddlewareResponseHook" || rh.Name() == "JSResponseMiddleware" {
 				rh.HandleError(rw, req)
 				return true, err
 			}
 			return false, err
 		}
 	}
+
 	return false, nil
 }
 
@@ -792,8 +969,57 @@ func handleResponse(rh TykResponseHandler, rw http.ResponseWriter, res *http.Res
 		span, ctx := trace.Span(req.Context(), rh.Name())
 		defer span.Finish()
 		req = req.WithContext(ctx)
+	} else {
+		cfg := rh.Base().Gw.GetConfig()
+		if cfg.OpenTelemetry.TracesEnabled() {
+			return handleOtelTracedResponse(rh, rw, res, req, ses)
+		}
 	}
 	return rh.HandleResponse(rw, res, req, ses)
+}
+
+// handleOtelTracedResponse handles the tracing for the response middlewares when
+// otel is enabled in the gateway
+func handleOtelTracedResponse(rh TykResponseHandler, rw http.ResponseWriter, res *http.Response, req *http.Request, ses *user.SessionState) error {
+	var span otel.Span
+	var err error
+
+	baseMw := rh.Base()
+	if baseMw == nil {
+		return errors.New("unsupported base middleware")
+	}
+
+	// ResponseCacheMiddleware always executes but not always caches,so check if we must create the span
+	shouldTrace := shouldPerformTracing(rh, baseMw)
+	ctx := req.Context()
+	if shouldTrace {
+		if baseMw.Spec.DetailedTracing {
+			ctx, span = baseMw.Gw.TracerProvider.Tracer().Start(ctx, rh.Name())
+			defer span.End()
+			setContext(req, ctx)
+		} else {
+			span = otel.SpanFromContext(ctx)
+		}
+
+		err = rh.HandleResponse(rw, res, req, ses)
+
+		if err != nil {
+			span.SetStatus(otel.SPAN_STATUS_ERROR, err.Error())
+		}
+
+		attrs := ctxGetSpanAttributes(req, rh.Name())
+		if len(attrs) > 0 {
+			span.SetAttributes(attrs...)
+		}
+	} else {
+		err = rh.HandleResponse(rw, res, req, ses)
+	}
+
+	return err
+}
+
+func shouldPerformTracing(rh TykResponseHandler, baseMw *BaseTykResponseHandler) bool {
+	return rh.Name() != "ResponseCacheMiddleware" || baseMw.Spec.CacheOptions.EnableCache
 }
 
 func parseForm(r *http.Request) {
@@ -811,4 +1037,39 @@ func parseForm(r *http.Request) {
 	}
 
 	r.ParseForm()
+}
+
+type BaseTykResponseHandler struct {
+	Spec *APISpec `json:"-"`
+	Gw   *Gateway `json:"-"`
+	log  *logrus.Entry
+}
+
+func (b *BaseTykResponseHandler) Enabled() bool {
+	return true
+}
+
+func (b *BaseTykResponseHandler) Init(i interface{}, spec *APISpec) error {
+	return nil
+}
+
+func (b *BaseTykResponseHandler) Name() string {
+	return "BaseTykResponseHandler"
+}
+
+func (b *BaseTykResponseHandler) HandleResponse(rw http.ResponseWriter, res *http.Response, req *http.Request, ses *user.SessionState) error {
+	return nil
+}
+
+func (b *BaseTykResponseHandler) HandleError(writer http.ResponseWriter, h *http.Request) {}
+
+func (b *BaseTykResponseHandler) setLogger(logger *logrus.Entry) {
+	b.log = logger
+}
+
+func (b *BaseTykResponseHandler) logger() *logrus.Entry {
+	if b.log == nil {
+		return log.NewEntry()
+	}
+	return b.log
 }

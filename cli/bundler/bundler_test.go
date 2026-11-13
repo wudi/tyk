@@ -4,14 +4,16 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/stretchr/testify/assert"
 
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"github.com/TykTechnologies/tyk/apidef"
 )
 
 var (
@@ -30,7 +32,7 @@ var (
 	}
 )
 
-func init() {
+func TestMain(m *testing.M) {
 	testApp = kingpin.New("tyk-cli", "")
 	AddTo(testApp)
 
@@ -39,9 +41,12 @@ func init() {
 	bundler.bundlePath = &bundlePath
 	manifestPath := defaultManifestPath
 	bundler.manifestPath = &manifestPath
+
+	os.Exit(m.Run())
 }
 
 func writeManifestFile(t testing.TB, manifest interface{}, filename string) *string {
+	t.Helper()
 	var data []byte
 	var err error
 	switch manifest.(type) {
@@ -69,6 +74,7 @@ func TestCommands(t *testing.T) {
 		t.Fatalf("Command not found")
 	}
 }
+
 func TestBuild(t *testing.T) {
 	defer os.Remove(defaultManifestPath)
 
@@ -76,7 +82,7 @@ func TestBuild(t *testing.T) {
 	t.Run("Bundle errors", func(t *testing.T) {
 		ctx := &kingpin.ParseContext{}
 		err := bundler.Build(ctx)
-		if err != errManifestLoad {
+		if !errors.Is(err, errManifestLoad) {
 			t.Fatalf("Expected manifest load error, got: %s", err.Error())
 		}
 		filename := writeManifestFile(t, "{", defaultManifestPath)
@@ -97,7 +103,7 @@ func TestBuild(t *testing.T) {
 		}, defaultManifestPath)
 		bundler.manifestPath = filename
 		err = bundler.Build(ctx)
-		if err != errNoDriver {
+		if !errors.Is(err, errNoDriver) {
 			t.Fatal("Expected no driver error")
 		}
 		filename = writeManifestFile(t, &apidef.BundleManifest{
@@ -106,7 +112,7 @@ func TestBuild(t *testing.T) {
 		}, defaultManifestPath)
 		bundler.manifestPath = filename
 		err = bundler.Build(ctx)
-		if err != errNoHooks {
+		if !errors.Is(err, errNoHooks) {
 			t.Fatal("Expected no hooks error")
 		}
 		filename = writeManifestFile(t, &apidef.BundleManifest{
@@ -208,5 +214,24 @@ func TestBuild(t *testing.T) {
 		if manifest.CustomMiddleware.Driver != apidef.PythonDriver {
 			t.Fatalf("Bundle driver doesn't match, got %s, expected %s", manifest.CustomMiddleware.Driver, apidef.PythonDriver)
 		}
+	})
+}
+
+func TestValidateBundle(t *testing.T) {
+	b := Bundler{}
+	manifest := &apidef.BundleManifest{
+		FileList: []string{},
+		CustomMiddleware: apidef.MiddlewareSection{
+			TrafficLogs: apidef.MiddlewareDefinition{
+				Name: "analyticsBundle",
+			},
+			Driver: apidef.GoPluginDriver,
+		},
+	}
+
+	t.Run("manifest validation should pass with only analytics section as custom middleware", func(t *testing.T) {
+		err := b.validateManifest(manifest)
+
+		assert.NoError(t, err)
 	})
 }

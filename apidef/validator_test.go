@@ -1,0 +1,933 @@
+package apidef
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	tyktime "github.com/TykTechnologies/tyk/internal/time"
+)
+
+func TestValidationResult_HasErrors(t *testing.T) {
+	result := ValidationResult{}
+	assert.False(t, result.HasErrors())
+	result.AppendError(errors.New("error"))
+	assert.True(t, result.HasErrors())
+}
+
+func TestValidationResult_FirstError(t *testing.T) {
+	firstErr := errors.New("first")
+	secondErr := errors.New("second")
+
+	result := ValidationResult{}
+	result.AppendError(firstErr)
+	result.AppendError(secondErr)
+
+	assert.Equal(t, firstErr, result.FirstError())
+}
+
+func TestValidationResult_ErrorStrings(t *testing.T) {
+	result := ValidationResult{
+		Errors: []error{
+			ErrDuplicateDataSourceName,
+		},
+	}
+
+	expectedErrorStrings := []string{
+		ErrDuplicateDataSourceName.Error(),
+	}
+
+	assert.Equal(t, expectedErrorStrings, result.ErrorStrings())
+}
+
+func runValidationTest(apiDef *APIDefinition, ruleSet ValidationRuleSet, expectedValidationResult ValidationResult) func(t *testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+		result := Validate(apiDef, ruleSet)
+		assert.Equal(t, expectedValidationResult.IsValid, result.IsValid)
+		assert.ElementsMatch(t, expectedValidationResult.Errors, result.Errors)
+	}
+}
+
+func TestRuleUniqueDataSourceNames_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleUniqueDataSourceNames{},
+	}
+
+	t.Run("should return invalid when data source name is duplicated", runValidationTest(
+		&APIDefinition{
+			GraphQL: GraphQLConfig{
+				Enabled: true,
+				Version: GraphQLConfigVersion2,
+				Engine: GraphQLEngineConfig{
+					DataSources: []GraphQLEngineDataSource{
+						{
+							Name: "     DataSource",
+						},
+						{
+							Name: "datasource     ",
+						},
+					},
+				},
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: false,
+			Errors: []error{
+				ErrDuplicateDataSourceName,
+			},
+		},
+	))
+
+	t.Run("return valid when data source names are not duplicated", runValidationTest(
+		&APIDefinition{
+			GraphQL: GraphQLConfig{
+				Enabled: true,
+				Version: GraphQLConfigVersion2,
+				Engine: GraphQLEngineConfig{
+					DataSources: []GraphQLEngineDataSource{
+						{
+							Name: "datasource 1",
+						},
+						{
+							Name: "datasource 2",
+						},
+					},
+				},
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: true,
+			Errors:  nil,
+		},
+	))
+
+	t.Run("return valid when there are no data sources", runValidationTest(
+		&APIDefinition{
+			GraphQL: GraphQLConfig{
+				Enabled: true,
+				Version: GraphQLConfigVersion2,
+				Engine: GraphQLEngineConfig{
+					DataSources: []GraphQLEngineDataSource{},
+				},
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: true,
+			Errors:  nil,
+		},
+	))
+
+}
+
+func TestRuleAtLeastEnableOneAuthConfig_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleAtLeastEnableOneAuthSource{},
+	}
+	t.Run("should return invalid when all sources are disabled for enabled auth mechanisms", runValidationTest(
+		&APIDefinition{
+			UseStandardAuth: true,
+			UseOauth2:       true,
+			AuthConfigs: map[string]AuthConfig{
+				"authToken": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"oauth": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"jwt": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"oidc": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"hmac": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"coprocess": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: false,
+			Errors: []error{
+				fmt.Errorf(ErrAllAuthSourcesDisabled, "authToken"),
+				fmt.Errorf(ErrAllAuthSourcesDisabled, "oauth"),
+			},
+		},
+	))
+
+	t.Run("should return valid when at least one source is enabled for enabled auth mechanisms", runValidationTest(
+		&APIDefinition{
+			UseStandardAuth: true,
+			UseOauth2:       true,
+			AuthConfigs: map[string]AuthConfig{
+				"authToken": {
+					UseParam:      true,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"oauth": {
+					UseParam:      false,
+					DisableHeader: false,
+					UseCookie:     false,
+				},
+				"jwt": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"oidc": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"hmac": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+				"coprocess": {
+					UseParam:      false,
+					DisableHeader: true,
+					UseCookie:     false,
+				},
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: true,
+			Errors:  nil,
+		},
+	))
+}
+
+func TestRuleValidateIPList_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleValidateIPList{},
+	}
+
+	t.Run("valid IP and CIDR", runValidationTest(
+		&APIDefinition{
+			EnableIpWhiteListing: true,
+			AllowedIPs: []string{
+				"192.168.0.10",
+				"192.168.2.1/24",
+			},
+			EnableIpBlacklisting: true,
+			BlacklistedIPs: []string{
+				"192.168.0.20",
+				"192.168.3.1/24",
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: true,
+			Errors:  nil,
+		},
+	))
+
+	t.Run("invalid CIDR", runValidationTest(
+		&APIDefinition{
+			EnableIpWhiteListing: true,
+			AllowedIPs: []string{
+				"192.168.2.1/bob",
+			},
+			EnableIpBlacklisting: true,
+			BlacklistedIPs: []string{
+				"192.168.3.1/blah",
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: false,
+			Errors: []error{
+				fmt.Errorf(ErrInvalidIPCIDR, "192.168.2.1/bob"),
+				fmt.Errorf(ErrInvalidIPCIDR, "192.168.3.1/blah"),
+			},
+		},
+	))
+
+	t.Run("invalid IP and CIDR", runValidationTest(
+		&APIDefinition{
+			EnableIpWhiteListing: true,
+			AllowedIPs: []string{
+				"bob",
+				"192.168.2.1/24",
+			},
+			EnableIpBlacklisting: true,
+			BlacklistedIPs: []string{
+				"blah",
+				"192.168.3.1/24",
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: false,
+			Errors: []error{
+				fmt.Errorf(ErrInvalidIPCIDR, "bob"),
+				fmt.Errorf(ErrInvalidIPCIDR, "blah"),
+			},
+		},
+	))
+
+	t.Run("do not validate allowed IPs when whitelisting not enabled", runValidationTest(
+		&APIDefinition{
+			EnableIpWhiteListing: false,
+			AllowedIPs: []string{
+				"bob",
+				"192.168.2.1/24",
+			},
+			EnableIpBlacklisting: true,
+			BlacklistedIPs: []string{
+				"blah",
+				"192.168.3.1/24",
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: false,
+			Errors: []error{
+				fmt.Errorf(ErrInvalidIPCIDR, "blah"),
+			},
+		},
+	))
+
+	t.Run("do not validate blacklist when not enabled", runValidationTest(
+		&APIDefinition{
+			EnableIpWhiteListing: true,
+			AllowedIPs: []string{
+				"bob",
+				"192.168.2.1/24",
+			},
+			EnableIpBlacklisting: false,
+			BlacklistedIPs: []string{
+				"blah",
+				"192.168.3.1/24",
+			},
+		},
+		ruleSet,
+		ValidationResult{
+			IsValid: false,
+			Errors: []error{
+				fmt.Errorf(ErrInvalidIPCIDR, "bob"),
+			},
+		},
+	))
+}
+
+func TestRuleValidateEnforceTimeout_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleValidateEnforceTimeout{},
+	}
+
+	getAPIDef := func(hardTimeouts []HardTimeoutMeta) *APIDefinition {
+		return &APIDefinition{
+			VersionData: VersionData{
+				Versions: map[string]VersionInfo{
+					"Default": {
+						Name: "Default",
+						ExtendedPaths: ExtendedPathsSet{
+							HardTimeouts: hardTimeouts,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name   string
+		apiDef *APIDefinition
+		result ValidationResult
+	}{
+		{
+			name: "negative timeout",
+			apiDef: getAPIDef([]HardTimeoutMeta{
+				{
+					Disabled: false,
+					Path:     "/get",
+					Method:   http.MethodGet,
+					TimeOut:  -1,
+				},
+			}),
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidTimeoutValue},
+			},
+		},
+		{
+			name: "negative timeout for one among multiple paths",
+			apiDef: getAPIDef([]HardTimeoutMeta{
+				{
+					Disabled: false,
+					Path:     "/post",
+					Method:   http.MethodGet,
+					TimeOut:  -1,
+				},
+				{
+					Disabled: false,
+					Path:     "/get",
+					Method:   http.MethodGet,
+					TimeOut:  10,
+				},
+			}),
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidTimeoutValue},
+			},
+		},
+		{
+			name: "positive timeout",
+			apiDef: getAPIDef([]HardTimeoutMeta{
+				{
+					Disabled: true,
+					Path:     "/post",
+					Method:   http.MethodGet,
+					TimeOut:  10,
+				},
+			}),
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, runValidationTest(tc.apiDef, ruleSet, tc.result))
+	}
+}
+
+func TestRuleValidateGlobalEnforceTimeout_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleValidateGlobalEnforceTimeout{},
+	}
+
+	testCases := []struct {
+		name   string
+		apiDef *APIDefinition
+		result ValidationResult
+	}{
+		{
+			name:   "zero (not configured) is valid",
+			apiDef: &APIDefinition{},
+			result: ValidationResult{IsValid: true},
+		},
+		{
+			name: "positive duration is valid",
+			apiDef: &APIDefinition{
+				VersionData: VersionData{Versions: map[string]VersionInfo{
+					"Default": {GlobalEnforceTimeout: tyktime.ReadableDuration(5 * time.Second)},
+				}},
+			},
+			result: ValidationResult{IsValid: true},
+		},
+		{
+			name: "sub-second (1ms) is valid",
+			apiDef: &APIDefinition{
+				VersionData: VersionData{Versions: map[string]VersionInfo{
+					"Default": {GlobalEnforceTimeout: tyktime.ReadableDuration(time.Millisecond)},
+				}},
+			},
+			result: ValidationResult{IsValid: true},
+		},
+		{
+			name: "negative duration is invalid",
+			apiDef: &APIDefinition{
+				VersionData: VersionData{Versions: map[string]VersionInfo{
+					"Default": {GlobalEnforceTimeout: tyktime.ReadableDuration(-1 * time.Second)},
+				}},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidGlobalTimeoutValue},
+			},
+		},
+		{
+			name: "negative sub-second is invalid",
+			apiDef: &APIDefinition{
+				VersionData: VersionData{Versions: map[string]VersionInfo{
+					"Default": {GlobalEnforceTimeout: tyktime.ReadableDuration(-500 * time.Millisecond)},
+				}},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidGlobalTimeoutValue},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, runValidationTest(tc.apiDef, ruleSet, tc.result))
+	}
+}
+
+func TestRuleUpstreamAuth_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleUpstreamAuth{},
+	}
+
+	testCases := []struct {
+		name         string
+		upstreamAuth UpstreamAuth
+		result       ValidationResult
+	}{
+		{
+			name: "not enabled",
+			upstreamAuth: UpstreamAuth{
+				Enabled: false,
+			},
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+		{
+			name: "basic auth and OAuth enabled",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				BasicAuth: UpstreamBasicAuth{
+					Enabled: true,
+				},
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{OAuthAuthorizationTypeClientCredentials},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors: []error{
+					ErrMultipleUpstreamAuthEnabled,
+				},
+			},
+		},
+		{
+			name: "no upstream OAuth authorization type specified",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrUpstreamOAuthAuthorizationTypeRequired},
+			},
+		},
+		{
+			name: "multiple upstream OAuth authorization type specified",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{OAuthAuthorizationTypeClientCredentials, OAuthAuthorizationTypePassword},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrMultipleUpstreamOAuthAuthorizationType},
+			},
+		},
+		{
+			name: "invalid upstream OAuth authorization type specified",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{"auth-type1"},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidUpstreamOAuthAuthorizationType},
+			},
+		},
+		{
+			name: "invalid client authentication method",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{OAuthAuthorizationTypeClientCredentials},
+					ClientCredentials: ClientCredentials{
+						ClientAuthData: ClientAuthData{Method: "client_secret_jwt"},
+					},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidUpstreamOAuthClientAuthMethod},
+			},
+		},
+		{
+			name: "invalid client authentication method on password grant",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{OAuthAuthorizationTypePassword},
+					PasswordAuthentication: PasswordAuthentication{
+						ClientAuthData: ClientAuthData{Method: "bogus"},
+					},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrInvalidUpstreamOAuthClientAuthMethod},
+			},
+		},
+		{
+			name: "valid client authentication methods",
+			upstreamAuth: UpstreamAuth{
+				Enabled: true,
+				OAuth: UpstreamOAuth{
+					Enabled:               true,
+					AllowedAuthorizeTypes: []string{OAuthAuthorizationTypeClientCredentials},
+					ClientCredentials: ClientCredentials{
+						ClientAuthData: ClientAuthData{Method: OAuth2ClientAuthPost},
+					},
+					PasswordAuthentication: PasswordAuthentication{
+						ClientAuthData: ClientAuthData{Method: OAuth2ClientAuthBasic},
+					},
+				},
+			},
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		apiDef := &APIDefinition{
+			UpstreamAuth: tc.upstreamAuth,
+		}
+
+		t.Run(tc.name, runValidationTest(apiDef, ruleSet, tc.result))
+	}
+}
+
+func TestRuleLoadBalancingTargets_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleLoadBalancingTargets{},
+	}
+
+	testCases := []struct {
+		name   string
+		apiDef *APIDefinition
+		result ValidationResult
+	}{
+		{
+			name: "load balancing disabled",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					EnableLoadBalancing: false,
+					Targets:             []string{},
+				},
+			},
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+		{
+			name: "load balancing enabled with valid targets",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					EnableLoadBalancing: true,
+					Targets: []string{
+						"http://target-1",
+						"http://target-1",
+						"http://target-2",
+					},
+				},
+			},
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+		{
+			name: "load balancing enabled with all targets weight 0",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					EnableLoadBalancing: true,
+					Targets:             []string{},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors: []error{
+					ErrAllLoadBalancingTargetsZeroWeight,
+				},
+			},
+		},
+		{
+			name: "load balancing disabled with empty targets",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					EnableLoadBalancing: false,
+					Targets:             []string{},
+				},
+			},
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, runValidationTest(tc.apiDef, ruleSet, tc.result))
+	}
+}
+
+// TestRuleLoadBalancingTargets_DNSDiscoveryExemption covers the shape a valid
+// DNS discovery API has: load balancing on and no static targets, with the
+// list resolved from the upstream hostname at runtime. Without the exemption
+// the create and update endpoints refuse the one configuration the feature
+// exists to support.
+func TestRuleLoadBalancingTargets_DNSDiscoveryExemption(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleLoadBalancingTargets{},
+	}
+
+	testCases := []struct {
+		name   string
+		apiDef *APIDefinition
+		result ValidationResult
+	}{
+		{
+			name: "dns discovery supplies the targets",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					TargetURL:           "h2c://my-grpc-svc:9002",
+					EnableLoadBalancing: true,
+					DNSDiscovery:        DNSDiscoveryConfig{Enabled: true, RefreshInterval: tyktime.ReadableDuration(10 * time.Second)},
+				},
+			},
+			result: ValidationResult{
+				IsValid: true,
+				Errors:  nil,
+			},
+		},
+		{
+			// The exemption is keyed on the block being on, so an API that
+			// carries it switched off is still held to the original rule.
+			name: "dns discovery configured but disabled",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					TargetURL:           "h2c://my-grpc-svc:9002",
+					EnableLoadBalancing: true,
+					DNSDiscovery:        DNSDiscoveryConfig{RefreshInterval: tyktime.ReadableDuration(10 * time.Second)},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors: []error{
+					ErrAllLoadBalancingTargetsZeroWeight,
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, runValidationTest(tc.apiDef, ruleSet, tc.result))
+	}
+}
+
+// TestRuleDNSDiscovery_Validate covers the two combinations refused on create
+// and update. DNS discovery supplies a target list without distributing across
+// it, and two sources for one list have no tie-break.
+func TestRuleDNSDiscovery_Validate(t *testing.T) {
+	ruleSet := ValidationRuleSet{
+		&RuleDNSDiscovery{},
+	}
+
+	testCases := []struct {
+		name   string
+		apiDef *APIDefinition
+		result ValidationResult
+	}{
+		{
+			name: "dns discovery disabled",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{TargetURL: "h2c://my-grpc-svc:9002"},
+			},
+			result: ValidationResult{IsValid: true, Errors: nil},
+		},
+		{
+			name: "dns discovery with load balancing",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					TargetURL:           "h2c://my-grpc-svc:9002",
+					EnableLoadBalancing: true,
+					DNSDiscovery:        DNSDiscoveryConfig{Enabled: true},
+				},
+			},
+			result: ValidationResult{IsValid: true, Errors: nil},
+		},
+		{
+			name: "dns discovery without load balancing",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					TargetURL:    "h2c://my-grpc-svc:9002",
+					DNSDiscovery: DNSDiscoveryConfig{Enabled: true},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrDNSDiscoveryRequiresLoadBalancing},
+			},
+		},
+		{
+			name: "dns discovery alongside service discovery",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					TargetURL:           "h2c://my-grpc-svc:9002",
+					EnableLoadBalancing: true,
+					DNSDiscovery:        DNSDiscoveryConfig{Enabled: true},
+					ServiceDiscovery:    ServiceDiscoveryConfiguration{UseDiscoveryService: true},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors:  []error{ErrDNSDiscoveryWithServiceDiscovery},
+			},
+		},
+		{
+			name: "both rules broken at once",
+			apiDef: &APIDefinition{
+				Proxy: ProxyConfig{
+					TargetURL:        "h2c://my-grpc-svc:9002",
+					DNSDiscovery:     DNSDiscoveryConfig{Enabled: true},
+					ServiceDiscovery: ServiceDiscoveryConfiguration{UseDiscoveryService: true},
+				},
+			},
+			result: ValidationResult{
+				IsValid: false,
+				Errors: []error{
+					ErrDNSDiscoveryRequiresLoadBalancing,
+					ErrDNSDiscoveryWithServiceDiscovery,
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, runValidationTest(tc.apiDef, ruleSet, tc.result))
+	}
+}
+
+// TestDefaultValidationRuleSet_AcceptsDNSDiscovery checks the whole rule set
+// the create and update endpoints run, since the valid shape has to survive
+// every rule in it rather than the one written for it.
+func TestDefaultValidationRuleSet_AcceptsDNSDiscovery(t *testing.T) {
+	apiDef := &APIDefinition{
+		Proxy: ProxyConfig{
+			TargetURL:           "h2c://my-grpc-svc:9002",
+			EnableLoadBalancing: true,
+			DNSDiscovery: DNSDiscoveryConfig{
+				Enabled:            true,
+				RefreshInterval:    tyktime.ReadableDuration(10 * time.Second),
+				StaleTTL:           tyktime.ReadableDuration(5 * time.Minute),
+				ConnectionDraining: &ConnectionDrainingConfig{Enabled: true, Timeout: tyktime.ReadableDuration(30 * time.Second)},
+			},
+		},
+	}
+
+	if result := Validate(apiDef, DefaultValidationRuleSet); !result.IsValid {
+		t.Fatalf("the documented DNS discovery configuration was refused: %v", result.ErrorStrings())
+	}
+}
+
+func TestRuleDNSDiscovery_NumericBounds(t *testing.T) {
+	base := func() *APIDefinition {
+		def := &APIDefinition{}
+		def.Proxy.EnableLoadBalancing = true
+		def.Proxy.DNSDiscovery.Enabled = true
+		return def
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*APIDefinition)
+		wantErr error
+	}{
+		{"defaults are valid", func(*APIDefinition) {}, nil},
+		{"positive values are valid", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.RefreshInterval = tyktime.ReadableDuration(10 * time.Second)
+			d.Proxy.DNSDiscovery.StaleTTL = tyktime.ReadableDuration(time.Minute)
+			d.Proxy.DNSDiscovery.ConnectionDraining = &ConnectionDrainingConfig{Enabled: true, Timeout: tyktime.ReadableDuration(15 * time.Second)}
+		}, nil},
+		{"refresh_interval at the floor", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.RefreshInterval = tyktime.ReadableDuration(5 * time.Second)
+		}, nil},
+		{"draining turned off", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.ConnectionDraining = &ConnectionDrainingConfig{Enabled: false}
+		}, nil},
+
+		{"negative refresh_interval", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.RefreshInterval = tyktime.ReadableDuration(-time.Second)
+		}, ErrDNSDiscoveryInvalidRefreshInterval},
+		{"refresh_interval under the floor", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.RefreshInterval = tyktime.ReadableDuration(time.Second)
+		}, ErrDNSDiscoveryInvalidRefreshInterval},
+		{"negative stale_ttl", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.StaleTTL = tyktime.ReadableDuration(-time.Second)
+		}, ErrDNSDiscoveryNegativeStaleTTL},
+		{"negative drain timeout", func(d *APIDefinition) {
+			d.Proxy.DNSDiscovery.ConnectionDraining = &ConnectionDrainingConfig{Enabled: true, Timeout: tyktime.ReadableDuration(-time.Second)}
+		}, ErrDNSDiscoveryNegativeDrainTimeout},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			def := base()
+			tc.mutate(def)
+
+			result := Validate(def, ValidationRuleSet{&RuleDNSDiscovery{}})
+
+			if tc.wantErr == nil {
+				assert.True(t, result.IsValid, "expected valid, got %v", result.Errors)
+				return
+			}
+
+			assert.False(t, result.IsValid)
+			assert.ErrorIs(t, result.FirstError(), tc.wantErr)
+		})
+	}
+
+	t.Run("nothing is checked while disabled", func(t *testing.T) {
+		def := &APIDefinition{}
+		def.Proxy.DNSDiscovery.RefreshInterval = tyktime.ReadableDuration(-time.Second)
+		def.Proxy.DNSDiscovery.StaleTTL = tyktime.ReadableDuration(-time.Second)
+		def.Proxy.DNSDiscovery.ConnectionDraining = &ConnectionDrainingConfig{Timeout: tyktime.ReadableDuration(-time.Second)}
+
+		result := Validate(def, ValidationRuleSet{&RuleDNSDiscovery{}})
+		assert.True(t, result.IsValid)
+	})
+}

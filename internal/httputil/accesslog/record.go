@@ -1,0 +1,178 @@
+package accesslog
+
+import (
+	"net/http"
+	"net/url"
+
+	"github.com/sirupsen/logrus"
+
+	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/internal/crypto"
+	"github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/otel"
+	"github.com/TykTechnologies/tyk/request"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+)
+
+// Record is a representation of a transaction log in the Gateway.
+type Record struct {
+	fields logrus.Fields
+}
+
+// NewRecord returns a Record object.
+func NewRecord() *Record {
+	fields := logrus.Fields{
+		"prefix": "access-log",
+	}
+	return &Record{
+		fields: fields,
+	}
+}
+
+// WithApiKey sets the access token from the request under APIKey.
+// The access token is obfuscated, or hashed depending on passed arguments.
+func (a *Record) WithApiKey(req *http.Request, hashKeys bool, obfuscate func(string) string) *Record {
+	token := ctx.GetAuthToken(req)
+	if !hashKeys {
+		a.fields["api_key"] = obfuscate(token)
+	} else {
+		a.fields["api_key"] = crypto.HashKey(token, hashKeys)
+	}
+	return a
+}
+
+// WithRequest fills fields from the http request.
+func (a *Record) WithRequest(req *http.Request, latency analytics.Latency) *Record {
+	upstreamAddress := &url.URL{
+		Scheme: req.URL.Scheme,
+		Host:   req.URL.Host,
+		Path:   req.URL.Path,
+	}
+
+	// Keep the sort in sync with config.AccessLog.Template godoc.
+	a.fields["client_ip"] = request.RealIP(req)
+	a.fields["host"] = req.Host
+	a.fields["latency_total"] = latency.Total
+	a.fields["latency_gateway"] = latency.Gateway
+	a.fields["method"] = req.Method
+	a.fields["path"] = req.URL.Path
+	a.fields["protocol"] = req.Proto
+	a.fields["remote_addr"] = req.RemoteAddr
+	a.fields["upstream_addr"] = upstreamAddress.String()
+	a.fields["upstream_latency"] = latency.Upstream
+	a.fields["user_agent"] = req.UserAgent()
+	return a
+}
+
+// WithResponse fills response details into the log fields.
+func (a *Record) WithResponse(resp *http.Response) *Record {
+	a.fields["status"] = resp.StatusCode
+	return a
+}
+
+// WithTraceID adds the OpenTelemetry trace ID to the access log record.
+// The trace ID is only added if a trace context exists in the request.
+func (a *Record) WithTraceID(req *http.Request) *Record {
+	traceID := otel.ExtractTraceID(req.Context())
+	if traceID != "" {
+		a.fields["trace_id"] = traceID
+	}
+	return a
+}
+
+// WithOriginalPath adds the original client request path to the access log record.
+// The original path is only added if a non-empty value exists in the request context.
+func (a *Record) WithOriginalPath(req *http.Request) *Record {
+	if v := req.Context().Value(ctx.OriginalRequestPath); v != nil {
+		if path, ok := v.(string); ok && path != "" {
+			a.fields["original_path"] = path
+		}
+	}
+	return a
+}
+
+// WithAPIID adds API identification fields to the access log record.
+func (a *Record) WithAPIID(apiID, apiName, orgID string) *Record {
+	if apiID != "" {
+		a.fields["api_id"] = apiID
+	}
+	if apiName != "" {
+		a.fields["api_name"] = apiName
+	}
+	if orgID != "" {
+		a.fields["org_id"] = orgID
+	}
+	return a
+}
+
+// WithErrorClassification adds structured error classification fields to the access log record.
+// Fields are only added when the classification is non-nil and individual fields are non-empty/non-zero.
+// This enables operators to distinguish between error types (TLS expired, connection refused, timeout, etc.)
+// directly in access logs.
+func (a *Record) WithErrorClassification(ec *errors.ErrorClassification) *Record {
+	if ec == nil {
+		return a
+	}
+
+	// Always add the core classification fields
+	a.fields["response_flag"] = ec.Flag.String()
+	a.fields["response_code_details"] = ec.Details
+
+	// Add optional fields only when non-empty
+	if ec.Source != "" {
+		a.fields["error_source"] = ec.Source
+	}
+	if ec.Target != "" {
+		a.fields["error_target"] = ec.Target
+	}
+
+	// Add upstream status only for non-zero values
+	if ec.UpstreamStatus != 0 {
+		a.fields["upstream_status"] = ec.UpstreamStatus
+	}
+
+	// Add TLS cert info only when present
+	if !ec.TLSCertExpiry.IsZero() {
+		a.fields["tls_cert_expiry"] = ec.TLSCertExpiry.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if ec.TLSCertSubject != "" {
+		a.fields["tls_cert_subject"] = ec.TLSCertSubject
+	}
+
+	// Add circuit breaker state only when present
+	if ec.CircuitBreakerState != "" {
+		a.fields["circuit_breaker_state"] = ec.CircuitBreakerState
+	}
+
+	return a
+}
+
+// WithAPIType adds the api_type field based on the API definition characteristics.
+func (a *Record) WithAPIType(apiType string) *Record {
+	a.fields["api_type"] = apiType
+	return a
+}
+
+// WithMCP adds MCP-specific fields from the request context.
+// Fields are only added when non-empty/non-zero to avoid log noise.
+func (a *Record) WithMCP(req *http.Request) *Record {
+	if method := ctx.GetMCPMethod(req); method != "" {
+		a.fields["mcp_method"] = method
+	}
+	if pt := ctx.GetMCPPrimitiveType(req); pt != "" {
+		a.fields["mcp_primitive_type"] = pt
+	}
+	if pn := ctx.GetMCPPrimitiveName(req); pn != "" {
+		a.fields["mcp_primitive_name"] = pn
+	}
+	if code := ctx.GetJSONRPCErrorCode(req); code != 0 {
+		a.fields["mcp_error_code"] = code
+	}
+	return a
+}
+
+// Fields returns a logrus.Fields intended for logging.
+func (a *Record) Fields(allowedKeys []string) logrus.Fields {
+	return Filter(a.fields, allowedKeys)
+}

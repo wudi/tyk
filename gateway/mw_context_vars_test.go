@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,12 +10,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/test"
 )
 
-func testPrepareContextVarsMiddleware() {
-	BuildAndLoadAPI(func(spec *APISpec) {
+func (ts *Test) testPrepareContextVarsMiddleware() {
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 		spec.EnableContextVars = true
 		spec.VersionData.Versions = map[string]apidef.VersionInfo{
@@ -32,10 +37,10 @@ func testPrepareContextVarsMiddleware() {
 }
 
 func TestContextVarsMiddleware(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	testPrepareContextVarsMiddleware()
+	ts.testPrepareContextVarsMiddleware()
 
 	ts.Run(t, []test.TestCase{
 		{Path: "/test/path", Code: 200, BodyMatch: `"X-Remote-Addr":"127.0.0.1"`},
@@ -48,10 +53,10 @@ func TestContextVarsMiddleware(t *testing.T) {
 func BenchmarkContextVarsMiddleware(b *testing.B) {
 	b.ReportAllocs()
 
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	testPrepareContextVarsMiddleware()
+	ts.testPrepareContextVarsMiddleware()
 
 	for i := 0; i < b.N; i++ {
 		ts.Run(b, []test.TestCase{
@@ -87,6 +92,8 @@ func testPrepareTestContextVarsMiddleware() map[string]testContextVarsData {
 					"x": {"123"},
 					"y": {"test"},
 				},
+				"request_data_x": "123",
+				"request_data_y": "test",
 				"headers": map[string][]string{
 					"x-header-a": {"A"},
 					"x-header-b": {"B"},
@@ -119,6 +126,11 @@ func testPrepareTestContextVarsMiddleware() map[string]testContextVarsData {
 					"j":   {"2"},
 					"str": {"abc"},
 				},
+				"request_data_x":   "123",
+				"request_data_y":   "test",
+				"request_data_i":   "1",
+				"request_data_j":   "2",
+				"request_data_str": "abc",
 				"headers": map[string][]string{
 					"x-header-a":   {"A"},
 					"x-header-b":   {"B"},
@@ -154,6 +166,11 @@ func testPrepareTestContextVarsMiddleware() map[string]testContextVarsData {
 					"j":   {"2"},
 					"str": {"abc"},
 				},
+				"request_data_x":   "123",
+				"request_data_y":   "test",
+				"request_data_i":   "1",
+				"request_data_j":   "2",
+				"request_data_str": "abc",
 				"headers": map[string][]string{
 					"x-header-a":   {"A"},
 					"x-header-b":   {"B"},
@@ -177,7 +194,12 @@ func testPrepareTestContextVarsMiddleware() map[string]testContextVarsData {
 }
 
 func TestContextVarsMiddlewareProcessRequest(t *testing.T) {
-	mw := &MiddlewareContextVars{}
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	mw := &MiddlewareContextVars{
+		BaseMiddleware: &BaseMiddleware{Gw: ts.Gw},
+	}
 
 	tests := testPrepareTestContextVarsMiddleware()
 
@@ -208,14 +230,20 @@ func TestContextVarsMiddlewareProcessRequest(t *testing.T) {
 			delete(ctxDataObject, "request_id")
 
 			if !reflect.DeepEqual(ctxDataObject, test.ExpectedCtxDataObject) {
-				t.Errorf("Expected: %v\n Got: %v\n", test.ExpectedCtxDataObject, ctxDataObject)
+				//t.Errorf("Expected: %v\n Got: %v\n", test.ExpectedCtxDataObject, ctxDataObject)
+				t.Errorf("diff: %s", cmp.Diff(ctxDataObject, test.ExpectedCtxDataObject))
 			}
 		})
 	}
 }
 
 func BenchmarkContextVarsMiddlewareProcessRequest(b *testing.B) {
-	mw := &MiddlewareContextVars{}
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	mw := &MiddlewareContextVars{
+		BaseMiddleware: &BaseMiddleware{Gw: ts.Gw},
+	}
 	tests := testPrepareTestContextVarsMiddleware()
 	var err error
 	var code int
@@ -236,6 +264,65 @@ func BenchmarkContextVarsMiddlewareProcessRequest(b *testing.B) {
 				if code != http.StatusOK {
 					b.Errorf("Wrong response code: %d Eexpected 200.", code)
 				}
+			}
+		})
+	}
+}
+
+func TestAddTraceIDToContextVars(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	mw := &MiddlewareContextVars{
+		BaseMiddleware: &BaseMiddleware{Gw: ts.Gw},
+	}
+
+	makeCtxWithTrace := func(tidHex string) context.Context {
+		tid, err := trace.TraceIDFromHex(tidHex)
+		if err != nil {
+			t.Fatalf("invalid trace id hex: %v", err)
+		}
+		sc := trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID:    tid,
+			TraceFlags: trace.FlagsSampled,
+			Remote:     false,
+		})
+		return trace.ContextWithSpanContext(context.Background(), sc)
+	}
+
+	tests := map[string]struct {
+		enabled bool
+		ctx     context.Context
+		want    map[string]interface{}
+	}{
+		"enabled_with_trace": {
+			enabled: true,
+			ctx:     makeCtxWithTrace("0123456789abcdef0123456789abcdef"),
+			want:    map[string]interface{}{"tyk_trace_id": "0123456789abcdef0123456789abcdef"},
+		},
+		"enabled_without_trace": {
+			enabled: true,
+			ctx:     context.Background(),
+			want:    map[string]interface{}{},
+		},
+		"disabled_with_trace": {
+			enabled: false,
+			ctx:     makeCtxWithTrace("ffffffffffffffffffffffffffffffff"),
+			want:    map[string]interface{}{},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := ts.Gw.GetConfig()
+			cfg.OpenTelemetry.Enabled = tc.enabled
+			ts.Gw.SetConfig(cfg)
+
+			vars := map[string]interface{}{}
+			vars = mw.addTraceIDToContextVars(tc.ctx, vars)
+
+			if diff := cmp.Diff(vars, tc.want); diff != "" {
+				t.Fatalf("vars mismatch (-got +want):\n%s", diff)
 			}
 		})
 	}

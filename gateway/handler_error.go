@@ -4,23 +4,39 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"html/template"
+	"fmt"
+	htmltemplate "html/template"
+	"io"
+	"io/ioutil"
 	"net/http"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/config"
-
-	"github.com/TykTechnologies/tyk/headers"
+	tykctx "github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/header"
+	internalerrors "github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	jsonrpcerrors "github.com/TykTechnologies/tyk/internal/jsonrpc/errors"
 	"github.com/TykTechnologies/tyk/request"
 )
 
 const (
 	defaultTemplateName   = "error"
 	defaultTemplateFormat = "json"
-	defaultContentType    = headers.ApplicationJSON
+	defaultContentType    = header.ApplicationJSON
+
+	MsgAuthFieldMissing                        = "Authorization field missing"
+	MsgApiAccessDisallowed                     = "Access to this API has been disallowed"
+	MsgAuthCertRequired                        = "Client certificate required"
+	MsgBearerMailformed                        = "Bearer token malformed"
+	MsgKeyNotAuthorized                        = "Key not authorised"
+	MsgOauthClientRevoked                      = "Key not authorised. OAuth client access was revoked"
+	MsgKeyNotAuthorizedUnexpectedSigningMethod = "Key not authorized: Unexpected signing method"
+	MsgCertificateExpired                      = "Certificate has expired"
 )
 
 var errCustomBodyResponse = errors.New("errCustomBodyResponse")
@@ -34,39 +50,15 @@ func errorAndStatusCode(errType string) (error, int) {
 
 func defaultTykErrors() {
 	TykErrors = make(map[string]config.TykError)
-	TykErrors[ErrAuthAuthorizationFieldMissing] = config.TykError{
-		Message: "Authorization field missing",
-		Code:    http.StatusUnauthorized,
-	}
 
-	TykErrors[ErrAuthKeyNotFound] = config.TykError{
-		Message: "Access to this API has been disallowed",
-		Code:    http.StatusForbidden,
-	}
-
-	TykErrors[ErrOAuthAuthorizationFieldMissing] = config.TykError{
-		Message: "Authorization field missing",
-		Code:    http.StatusBadRequest,
-	}
-
-	TykErrors[ErrOAuthAuthorizationFieldMalformed] = config.TykError{
-		Message: "Bearer token malformed",
-		Code:    http.StatusBadRequest,
-	}
-
-	TykErrors[ErrOAuthKeyNotFound] = config.TykError{
-		Message: "Key not authorised",
-		Code:    http.StatusForbidden,
-	}
-
-	TykErrors[ErrOAuthClientDeleted] = config.TykError{
-		Message: "Key not authorised. OAuth client access was revoked",
-		Code:    http.StatusForbidden,
-	}
+	initAuthKeyErrors()
+	initOauth2KeyExistsErrors()
 }
 
-func overrideTykErrors() {
-	for id, err := range config.Global().OverrideMessages {
+func overrideTykErrors(gw *Gateway) {
+	gwConfig := gw.GetConfig()
+
+	for id, err := range gwConfig.OverrideMessages {
 
 		overridenErr := TykErrors[id]
 
@@ -84,75 +76,73 @@ func overrideTykErrors() {
 
 // APIError is generic error object returned if there is something wrong with the request
 type APIError struct {
-	Message template.HTML
+	Message htmltemplate.HTML
+}
+
+// APIErrorWithContext provides context for error override templates.
+type APIErrorWithContext struct {
+	Message    htmltemplate.HTML
+	StatusCode int
 }
 
 // ErrorHandler is invoked whenever there is an issue with a proxied request, most middleware will invoke
 // the ErrorHandler if something is wrong with the request and halt the request processing through the chain
 type ErrorHandler struct {
-	BaseMiddleware
+	*BaseMiddleware
+}
+
+// TemplateExecutor is an interface used to switch between text/templates and html/template.
+// It only switch to text/template (templatesRaw) when contentType is XML related
+type TemplateExecutor interface {
+	Execute(wr io.Writer, data interface{}) error
 }
 
 // HandleError is the actual error handler and will store the error details in analytics if analytics processing is enabled.
 func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMsg string, errCode int, writeResponse bool) {
+	e.handleErrorExtended(w, r, fmt.Errorf("%s", errMsg), errCode, writeResponse)
+}
+
+func (e *ErrorHandler) handleErrorExtended(w http.ResponseWriter, r *http.Request, err error, errCode int, writeResponse bool) {
 	defer e.Base().UpdateRequestSession(r)
+	response := &http.Response{}
+	errMsg := err.Error()
 
 	if writeResponse {
-		var templateExtension string
-		var contentType string
+		var toResp internalerrors.ToResponseWriter
 
-		switch r.Header.Get(headers.ContentType) {
-		case headers.ApplicationXML:
-			templateExtension = "xml"
-			contentType = headers.ApplicationXML
-		default:
-			templateExtension = "json"
-			contentType = headers.ApplicationJSON
+		if e.Spec.IsMCP() && e.shouldWriteJSONRPCError(r) {
+			response = e.writeJSONRPCErrorResponse(w, r, errMsg, errCode)
+		} else if resp := e.tryWriteOverride(w, r, errMsg, errCode); resp != nil {
+			response = resp
+		} else if errors.As(err, &toResp) {
+			if resp, err := writeToResponse(toResp, w, errCode); err != nil {
+				log.WithError(err).Error("Failed to write response to self write object")
+			} else {
+				response = resp
+			}
+		} else {
+			response = e.writeTemplateErrorResponse(w, r, errMsg, errCode)
 		}
+	}
+	if rpcCode := ctxGetJSONRPCErrorCode(r); e.Spec.IsMCP() && rpcCode != 0 {
+		e.Logger().WithField("jsonrpc_error_code", rpcCode).
+			WithField("api_id", e.Spec.APIID).
+			WithField("path", r.URL.Path).
+			Debug("MCP request rejected")
+	}
 
-		w.Header().Set(headers.ContentType, contentType)
-
-		templateName := "error_" + strconv.Itoa(errCode) + "." + templateExtension
-
-		// Try to use an error template that matches the HTTP error code and the content type: 500.json, 400.xml, etc.
-		tmpl := templates.Lookup(templateName)
-
-		// Fallback to a generic error template, but match the content type: error.json, error.xml, etc.
-		if tmpl == nil {
-			templateName = defaultTemplateName + "." + templateExtension
-			tmpl = templates.Lookup(templateName)
-		}
-
-		// If no template is available for this content type, fallback to "error.json".
-		if tmpl == nil {
-			templateName = defaultTemplateName + "." + defaultTemplateFormat
-			tmpl = templates.Lookup(templateName)
-			w.Header().Set(headers.ContentType, defaultContentType)
-		}
-
-		//If the config option is not set or is false, add the header
-		if !e.Spec.GlobalConfig.HideGeneratorHeader {
-			w.Header().Add(headers.XGenerator, "tyk.io")
-		}
-
-		// Close connections
-		if e.Spec.GlobalConfig.CloseConnections {
-			w.Header().Add(headers.Connection, "close")
-		}
-
-		// If error is not customized write error in default way
-		if errMsg != errCustomBodyResponse.Error() {
-			w.WriteHeader(errCode)
-			apiError := APIError{template.HTML(template.JSEscapeString(errMsg))}
-			tmpl.Execute(w, &apiError)
+	// Calculate latency for error responses (needed for both API metrics and analytics).
+	var latency analytics.Latency
+	if requestStartTime := ctxGetRequestStartTime(r); !requestStartTime.IsZero() {
+		totalMs := int64(DurationToMillisecond(time.Since(requestStartTime)))
+		latency = analytics.Latency{
+			Total:    totalMs,
+			Upstream: 0,       // No successful upstream response for errors
+			Gateway:  totalMs, // All time is gateway time for errors
 		}
 	}
 
-	if memProfFile != nil {
-		pprof.WriteHeapProfile(memProfFile)
-	}
-
-	if e.Spec.DoNotTrack {
+	if e.Spec.DoNotTrack || ctxGetDoNotTrack(r) {
 		return
 	}
 
@@ -161,29 +151,31 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 	var alias string
 
 	ip := request.RealIP(r)
+
 	if e.Spec.GlobalConfig.StoreAnalytics(ip) {
+
 		t := time.Now()
 
 		addVersionHeader(w, r, e.Spec.GlobalConfig)
 
 		version := e.Spec.getVersionFromRequest(r)
+
 		if version == "" {
 			version = "Non Versioned"
 		}
 
-		if e.Spec.Proxy.StripListenPath {
-			r.URL.Path = e.Spec.StripListenPath(r, r.URL.Path)
-		}
-
-		// This is an odd bugfix, will need further testing
-		r.URL.Path = "/" + r.URL.Path
-		if strings.HasPrefix(r.URL.Path, "//") {
-			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/")
+		// A paired MCP proxy owns the public completion record. Keep routed
+		// JSON-RPC errors on that same client-facing path, matching successful
+		// paired completions instead of exposing the stripped proxy path.
+		pairedMCPCompletion := e.Spec.IsPairedMCPAdapterProxy() && httpctx.GetJSONRPCRoutingState(r) != nil
+		if e.Spec.Proxy.StripListenPath && !pairedMCPCompletion {
+			r.URL.Path = e.Spec.StripListenPath(r.URL.Path)
 		}
 
 		oauthClientID := ""
 		session := ctxGetSession(r)
 		tags := make([]string, 0, estimateTagsCapacity(session, e.Spec))
+
 		if session != nil {
 			oauthClientID = session.OauthClientID
 			alias = session.Alias
@@ -194,84 +186,349 @@ func (e *ErrorHandler) HandleError(w http.ResponseWriter, r *http.Request, errMs
 			tags = tagHeaders(r, e.Spec.TagHeaders, tags)
 		}
 
-		rawRequest := ""
-		rawResponse := ""
-		if recordDetail(r, e.Spec) {
-			// Get the wire format representation
-			var wireFormatReq bytes.Buffer
-			r.Write(&wireFormatReq)
-			rawRequest = base64.StdEncoding.EncodeToString(wireFormatReq.Bytes())
+		if len(e.Spec.Tags) > 0 {
+			tags = append(tags, e.Spec.Tags...)
 		}
-
 		trackEP := false
 		trackedPath := r.URL.Path
-		if p := ctxGetTrackedPath(r); p != "" && !ctxGetDoNotTrack(r) {
+
+		if p := ctxGetTrackedPath(r); p != "" {
 			trackEP = true
 			trackedPath = p
 		}
 
 		host := r.URL.Host
+
 		if host == "" && e.Spec.target != nil {
 			host = e.Spec.target.Host
 		}
 
-		record := AnalyticsRecord{
-			r.Method,
-			host,
-			trackedPath,
-			r.URL.Path,
-			r.ContentLength,
-			r.Header.Get(headers.UserAgent),
-			t.Day(),
-			t.Month(),
-			t.Year(),
-			t.Hour(),
-			errCode,
-			token,
-			t,
-			version,
-			e.Spec.Name,
-			e.Spec.APIID,
-			e.Spec.OrgID,
-			oauthClientID,
-			0,
-			Latency{},
-			rawRequest,
-			rawResponse,
-			ip,
-			GeoData{},
-			NetworkStats{},
-			tags,
-			alias,
-			trackEP,
-			t,
+		// Use the actual response status code (which may be overridden) for analytics.
+		// If no response was written or StatusCode is not set, fall back to the original errCode.
+		responseCode := errCode
+		if response.StatusCode != 0 {
+			responseCode = response.StatusCode
 		}
 
+		record := analytics.AnalyticsRecord{
+			Method:        r.Method,
+			Host:          host,
+			Path:          trackedPath,
+			RawPath:       r.URL.Path,
+			OriginalPath:  ctxGetOriginalRequestPath(r),
+			ListenPath:    e.Spec.Proxy.ListenPath,
+			ContentLength: r.ContentLength,
+			UserAgent:     r.Header.Get(header.UserAgent),
+			Day:           t.Day(),
+			Month:         t.Month(),
+			Year:          t.Year(),
+			Hour:          t.Hour(),
+			ResponseCode:  responseCode,
+			APIKey:        token,
+			TimeStamp:     t,
+			APIVersion:    version,
+			APIName:       e.Spec.Name,
+			APIID:         e.Spec.APIID,
+			OrgID:         e.Spec.OrgID,
+			OauthID:       oauthClientID,
+			RequestTime:   latency.Total,
+			Latency:       latency,
+			IPAddress:     ip,
+			Geo:           analytics.GeoData{},
+			Network:       analytics.NetworkStats{},
+			Tags:          tags,
+			Alias:         alias,
+			TrackPath:     trackEP,
+			ExpireAt:      t,
+		}
+		recordGraphDetails(&record, r, response, e.Spec)
+		if e.Spec.IsMCP() {
+			recordMCPDetails(&record, r)
+		}
+
+		rawRequest := ""
+		rawResponse := ""
+		if recordDetail(r, e.Spec) {
+
+			rawRequest = getRawRequest(r, e.Spec)
+
+			var wireFormatRes bytes.Buffer
+			response.Write(&wireFormatRes)
+			rawResponse = base64.StdEncoding.EncodeToString(wireFormatRes.Bytes())
+
+		}
+
+		record.RawRequest = rawRequest
+		record.RawResponse = rawResponse
+
 		if e.Spec.GlobalConfig.AnalyticsConfig.EnableGeoIP {
-			record.GetGeo(ip)
+			record.GetGeo(ip, e.Gw.Analytics.GeoIPDB)
+		}
+		if e.Spec.GraphQL.Enabled && e.Spec.GraphQL.ExecutionMode != apidef.GraphQLExecutionModeSubgraph {
+			record.Tags = append(record.Tags, "tyk-graph-analytics")
+			record.ApiSchema = base64.StdEncoding.EncodeToString([]byte(e.Spec.GraphQL.Schema))
 		}
 
 		expiresAfter := e.Spec.ExpireAnalyticsAfter
+
 		if e.Spec.GlobalConfig.EnforceOrgDataAge {
 			orgExpireDataTime := e.OrgSessionExpiry(e.Spec.OrgID)
 
 			if orgExpireDataTime > 0 {
 				expiresAfter = orgExpireDataTime
 			}
-
 		}
 
 		record.SetExpiry(expiresAfter)
+
 		if e.Spec.GlobalConfig.AnalyticsConfig.NormaliseUrls.Enabled {
-			record.NormalisePath(&e.Spec.GlobalConfig)
+			NormalisePath(&record, &e.Spec.GlobalConfig)
 		}
 
-		analytics.RecordHit(&record)
+		if e.Spec.AnalyticsPlugin.Enabled {
+			_ = e.Spec.AnalyticsPluginConfig.processRecord(&record)
+		}
+
+		err := e.Gw.Analytics.RecordHit(&record)
+
+		if err != nil {
+			log.WithError(err).Error("could not store analytic record")
+		}
 	}
+
+	e.RecordAccessLog(r, response, latency)
+	e.Base().RecordMetrics(w, r, errCode, latency, nil)
+
 	// Report in health check
 	reportHealthValue(e.Spec, BlockedRequestLog, "-1")
+}
 
-	if memProfFile != nil {
-		pprof.WriteHeapProfile(memProfFile)
+// writeTemplateErrorResponse writes an error response using the configured error templates
+// and returns the corresponding http.Response for analytics recording.
+func (e *ErrorHandler) writeTemplateErrorResponse(w http.ResponseWriter, r *http.Request, errMsg string, errCode int) *http.Response {
+	response := &http.Response{}
+
+	var templateExtension string
+	contentType := r.Header.Get(header.ContentType)
+	contentType = strings.Split(contentType, ";")[0]
+
+	switch contentType {
+	case header.ApplicationSoapXML:
+		templateExtension = "xml"
+		contentType = header.ApplicationSoapXML
+	case header.ApplicationXML:
+		templateExtension = "xml"
+		contentType = header.ApplicationXML
+	case header.TextXML:
+		templateExtension = "xml"
+		contentType = header.TextXML
+	default:
+		templateExtension = "json"
+		contentType = header.ApplicationJSON
 	}
+
+	w.Header().Set(header.ContentType, contentType)
+	response.Header = http.Header{}
+	response.Header.Set(header.ContentType, contentType)
+	templateName := "error_" + strconv.Itoa(errCode) + "." + templateExtension
+
+	// Try to use an error template that matches the HTTP error code and the content type: 500.json, 400.xml, etc.
+	tmpl := e.Gw.templates.Lookup(templateName)
+
+	// Fallback to a generic error template, but match the content type: error.json, error.xml, etc.
+	if tmpl == nil {
+		templateName = defaultTemplateName + "." + templateExtension
+		tmpl = e.Gw.templates.Lookup(templateName)
+	}
+
+	// If no template is available for this content type, fallback to "error.json".
+	if tmpl == nil {
+		templateName = defaultTemplateName + "." + defaultTemplateFormat
+		tmpl = e.Gw.templates.Lookup(templateName)
+		w.Header().Set(header.ContentType, defaultContentType)
+		response.Header.Set(header.ContentType, defaultContentType)
+
+	}
+
+	//If the config option is not set or is false, add the header
+	if !e.Spec.GlobalConfig.HideGeneratorHeader {
+		w.Header().Add(header.XGenerator, "tyk.io")
+		response.Header.Add(header.XGenerator, "tyk.io")
+	}
+
+	// Close connections
+	if e.Spec.GlobalConfig.CloseConnections {
+		w.Header().Add(header.Connection, "close")
+		response.Header.Add(header.Connection, "close")
+
+	}
+
+	response.StatusCode = errCode
+
+	// If error is not customized write error in default way
+	if errMsg != errCustomBodyResponse.Error() {
+		w.WriteHeader(errCode)
+		var tmplExecutor TemplateExecutor
+		tmplExecutor = tmpl
+
+		apiError := APIError{}
+
+		if contentType == header.ApplicationXML || contentType == header.TextXML || contentType == header.ApplicationSoapXML {
+			apiError.Message = htmltemplate.HTML(htmltemplate.HTMLEscapeString(errMsg))
+
+			//we look up in the last defined templateName to obtain the template.
+			rawTmpl := e.Gw.templatesRaw.Lookup(templateName)
+			tmplExecutor = rawTmpl
+		} else {
+			apiError.Message = htmltemplate.HTML(jsonEscapeString(errMsg))
+		}
+
+		var log bytes.Buffer
+
+		rsp := io.MultiWriter(w, &log)
+		tmplExecutor.Execute(rsp, &apiError)
+		response.Body = ioutil.NopCloser(&log)
+	}
+
+	return response
+}
+
+// shouldWriteJSONRPCError returns true if this error should be formatted as JSON-RPC.
+// This checks if the API is an MCP with JSON-RPC 2.0 enabled and if the request has JSON-RPC routing state.
+func (e *ErrorHandler) shouldWriteJSONRPCError(r *http.Request) bool {
+	if e.Spec.JsonRpcVersion != apidef.JsonRPC20 {
+		return false
+	}
+
+	routingState := httpctx.GetJSONRPCRoutingState(r)
+	return routingState != nil
+}
+
+// writeJSONRPCErrorResponse writes an error in JSON-RPC 2.0 format and returns the corresponding http.Response.
+// It extracts the request ID from the routing state and delegates to the jsonrpc errors package.
+func (e *ErrorHandler) writeJSONRPCErrorResponse(w http.ResponseWriter, r *http.Request, errMsg string, httpCode int) *http.Response {
+	var requestID interface{}
+	if state := httpctx.GetJSONRPCRoutingState(r); state != nil {
+		requestID = state.ID
+	}
+
+	rpcCode := selectAndStoreMCPJSONRPCCode(r, httpCode)
+
+	responseBody := jsonrpcerrors.WriteJSONRPCErrorWithCode(w, requestID, httpCode, rpcCode, errMsg)
+
+	return &http.Response{
+		StatusCode: httpCode,
+		Header:     http.Header{header.ContentType: []string{header.ApplicationJSON}},
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}
+}
+
+// tryWriteOverride attempts to apply an error override and write the response.
+// Returns nil if no override applies, allowing fallback to the default template.
+func (e *ErrorHandler) tryWriteOverride(w http.ResponseWriter, r *http.Request, errMsg string, errCode int) *http.Response {
+	// Fast path: check config map length before atomic load
+	if len(e.Spec.GlobalConfig.ErrorOverrides) == 0 &&
+		(e.Spec.ErrorOverridesDisabled || len(e.Spec.ErrorOverrides) == 0) {
+
+		return nil
+	}
+
+	overrides := NewErrorOverrides(e.Spec, e.Gw)
+	result := overrides.ApplyOverride(r, errCode, []byte(errMsg))
+	if result == nil {
+		return nil
+	}
+
+	return e.writeOverrideResponse(w, r, result, errMsg)
+}
+
+// writeOverrideResponse writes the error override result.
+func (e *ErrorHandler) writeOverrideResponse(w http.ResponseWriter, r *http.Request, result *OverrideResult, originalMsg string) *http.Response {
+	ctx := DetectErrorResponseContext(r)
+	respHeader := e.SetErrorResponseHeaders(w, ctx.ContentType)
+
+	for k, v := range result.Headers {
+		w.Header().Set(k, v)
+		respHeader.Set(k, v)
+	}
+
+	// Body without template variables - write directly
+	if result.ShouldWriteDirectly() {
+		return e.writeDirectOverrideResponse(w, result, respHeader)
+	}
+
+	// Body with template variables, or file template
+	tmpl := result.GetTemplateExecutor(e.Gw, ctx)
+	if tmpl != nil {
+		data := map[string]any{
+			"Message":    escapeTemplateString(result.GetMessageForTemplate(), ctx.IsXML),
+			"StatusCode": result.StatusCode,
+		}
+
+		if ec := tykctx.GetErrorClassification(r); ec != nil && ec.TemplateData != nil {
+			for k, v := range ec.TemplateData {
+				if s, ok := v.(string); ok {
+					v = escapeTemplateString(s, ctx.IsXML)
+				}
+
+				data[k] = v
+			}
+		}
+
+		response := e.ExecuteErrorTemplate(w, tmpl, data, result.StatusCode)
+		response.Header = respHeader
+
+		return response
+	}
+
+	// Message only - use default template with override message
+	if result.ShouldUseDefaultTemplate() {
+		return e.writeTemplateErrorResponse(w, r, result.GetMessageForTemplate(), result.StatusCode)
+	}
+
+	// Fallback - use default template with original message
+	return e.writeTemplateErrorResponse(w, r, originalMsg, result.StatusCode)
+}
+
+// writeDirectOverrideResponse writes the body directly without templating.
+func (e *ErrorHandler) writeDirectOverrideResponse(w http.ResponseWriter, result *OverrideResult, respHeader http.Header) *http.Response {
+	w.WriteHeader(result.StatusCode)
+	bodyBytes := []byte(result.GetBody())
+	//nolint:errcheck // Error can't be handled after headers written, consistent with writeTemplateErrorResponse
+	w.Write(bodyBytes)
+
+	return &http.Response{
+		StatusCode: result.StatusCode,
+		Header:     respHeader,
+		Body:       io.NopCloser(bytes.NewReader(bodyBytes)),
+	}
+}
+
+type responseWriterProxy struct {
+	http.ResponseWriter
+	writer io.Writer
+}
+
+func (r responseWriterProxy) Write(data []byte) (int, error) {
+	return r.writer.Write(data)
+}
+
+func writeToResponse(
+	selfWroteError internalerrors.ToResponseWriter,
+	w http.ResponseWriter,
+	statusCode int,
+) (*http.Response, error) {
+
+	var buf bytes.Buffer
+	rec := &responseWriterProxy{ResponseWriter: w, writer: io.MultiWriter(w, &buf)}
+
+	if err := selfWroteError.WriteToResponse(rec, statusCode); err != nil {
+		return nil, err
+	}
+
+	return &http.Response{
+		StatusCode: statusCode,
+		Header:     w.Header(),
+		Body:       io.NopCloser(&buf),
+	}, nil
 }

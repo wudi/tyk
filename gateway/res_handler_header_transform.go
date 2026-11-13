@@ -20,11 +20,15 @@ type HeaderTransformOptions struct {
 }
 
 type HeaderTransform struct {
-	Spec   *APISpec
+	BaseTykResponseHandler
 	config HeaderTransformOptions
 }
 
-func (HeaderTransform) Name() string {
+func (h *HeaderTransform) Base() *BaseTykResponseHandler {
+	return &h.BaseTykResponseHandler
+}
+
+func (h *HeaderTransform) Name() string {
 	return "HeaderTransform"
 }
 
@@ -47,7 +51,7 @@ func (h *HeaderTransform) HandleResponse(rw http.ResponseWriter,
 	if err != nil {
 		return err
 	}
-
+	ignoreCanonical := h.Gw.GetConfig().IgnoreCanonicalMIMEHeaderKey
 	for _, name := range h.config.RevProxyTransform.Headers {
 		// check if header is present and its value is not empty
 		val := res.Header.Get(name)
@@ -72,7 +76,7 @@ func (h *HeaderTransform) HandleResponse(rw http.ResponseWriter,
 				val = strings.Replace(val, h.Spec.target.Path, "/", -1)
 			}
 		}
-		res.Header.Set(name, val)
+		setCustomHeader(res.Header, name, val, ignoreCanonical)
 	}
 	return nil
 }

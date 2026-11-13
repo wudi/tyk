@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -9,8 +10,26 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/goplugin"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/middleware"
+	"github.com/TykTechnologies/tyk/pkg/errpack"
+	"github.com/TykTechnologies/tyk/request"
+)
+
+var (
+	ErrResponseSucceed = errpack.New(
+		"response succeed",
+		errpack.WithType(errpack.TypeDomain),
+		errpack.WithLogLevel(logrus.TraceLevel),
+	)
+	ErrResponseErrorSent = errpack.New(
+		"plugin error",
+		errpack.WithType(errpack.TypeDomain),
+		errpack.WithLogLevel(logrus.DebugLevel),
+	)
 )
 
 // customResponseWriter is a wrapper around standard http.ResponseWriter
@@ -55,6 +74,12 @@ func (w *customResponseWriter) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+func (w *customResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func (w *customResponseWriter) getHttpResponse(r *http.Request) *http.Response {
 	// craft response on the fly for analytics
 	httpResponse := &http.Response{
@@ -76,12 +101,15 @@ func (w *customResponseWriter) getHttpResponse(r *http.Request) *http.Response {
 
 // GoPluginMiddleware is a generic middleware that will execute Go-plugin code before continuing
 type GoPluginMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	Path           string // path to .so file
 	SymbolName     string // function symbol to look up
 	handler        http.HandlerFunc
 	logger         *logrus.Entry
 	successHandler *SuccessHandler // to record analytics
+	Meta           apidef.GoPluginMeta
+	APILevel       bool
 }
 
 func (m *GoPluginMiddleware) Name() string {
@@ -89,6 +117,29 @@ func (m *GoPluginMiddleware) Name() string {
 }
 
 func (m *GoPluginMiddleware) EnabledForSpec() bool {
+	// global go plugins
+	if m.Path != "" && m.SymbolName != "" {
+		m.loadPlugin()
+		return true
+	}
+
+	// per path go plugins
+	for _, version := range m.Spec.VersionData.Versions {
+		for _, p := range version.ExtendedPaths.GoPlugin {
+			if !p.Disabled {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// loadPlugin loads the plugin file from m.Path, it will try
+// converting it to the tyk version aware format: {plugin_name}_{tyk_version}_{os}_{arch}.so
+// if the file doesn't exist then it will again but with a gw version that is not prefixed by 'v'
+// later, it will try with m.path which can be {plugin_name}.so
+func (m *GoPluginMiddleware) loadPlugin() bool {
 	m.logger = log.WithFields(logrus.Fields{
 		"mwPath":       m.Path,
 		"mwSymbolName": m.SymbolName,
@@ -101,28 +152,105 @@ func (m *GoPluginMiddleware) EnabledForSpec() bool {
 
 	// try to load plugin
 	var err error
+
+	newPath, err := goplugin.GetPluginFileNameToLoad(goplugin.FileSystemStorage{}, m.Path)
+	if err != nil {
+		m.logger.WithError(err).Error("plugin file not found")
+		return false
+	}
+	if m.Path != newPath {
+		m.Path = newPath
+	}
+
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("%v", e)
+			m.logger.WithError(err).Error("Recovered from panic while loading Go-plugin")
+		}
+	}()
+
 	if m.handler, err = goplugin.GetHandler(m.Path, m.SymbolName); err != nil {
 		m.logger.WithError(err).Error("Could not load Go-plugin")
 		return false
 	}
 
 	// to record 2XX hits in analytics
-	m.successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware}
-
+	m.successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware.Copy()}
 	return true
 }
 
+func (m *GoPluginMiddleware) goPluginFromRequest(r *http.Request) (*GoPluginMiddleware, bool) {
+	version, _ := m.Spec.Version(r)
+	versionPaths := m.Spec.RxPaths[version.Name]
+
+	found, perPathPerMethodGoPlugin := m.Spec.CheckSpecMatchesStatus(r, versionPaths, GoPlugin)
+	if !found {
+		return nil, false
+	}
+	return perPathPerMethodGoPlugin.(*GoPluginMiddleware), found
+}
 func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, conf interface{}) (err error, respCode int) {
+	handler, logger, successHandler, shouldSkip := m.resolvePluginHandler(r)
+	if shouldSkip {
+		return nil, http.StatusOK
+	}
+
+	if handler == nil {
+		return errors.New(http.StatusText(http.StatusInternalServerError)), http.StatusInternalServerError
+	}
+
+	rw, ms, err := m.executePluginHandler(w, r, handler, logger)
+	if err != nil {
+		return err, http.StatusInternalServerError
+	}
+
+	return m.handlePluginResponse(r, rw, ms, logger, successHandler)
+}
+
+func (m *GoPluginMiddleware) resolvePluginHandler(r *http.Request) (
+	handler func(http.ResponseWriter, *http.Request),
+	logger *logrus.Entry,
+	successHandler *SuccessHandler,
+	shouldSkip bool,
+) {
+	logger = m.logger
+	handler = m.handler
+	successHandler = m.successHandler
+
+	if !m.APILevel {
+		if pluginMw, found := m.goPluginFromRequest(r); found {
+			logger = pluginMw.logger
+			handler = pluginMw.handler
+			successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware.Copy()}
+			return handler, logger, successHandler, false
+		}
+		return nil, nil, nil, true
+	}
+
+	// Skip on self-looped requests for MCP proxies to prevent multiple executions
+	// during VEM chain traversal (see mw_auth_key.go:124 for similar pattern)
+	if m.Spec.IsMCP() && httpctx.IsSelfLooping(r) {
+		return nil, nil, nil, true
+	}
+
+	return handler, logger, successHandler, false
+}
+
+func (m *GoPluginMiddleware) executePluginHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+	handler func(http.ResponseWriter, *http.Request),
+	logger *logrus.Entry,
+) (*customResponseWriter, float64, error) {
+	var err error
+
 	// make sure tyk recover in case Go-plugin function panics
 	defer func() {
 		if e := recover(); e != nil {
 			err = fmt.Errorf("%v", e)
-			respCode = http.StatusInternalServerError
-			m.logger.WithError(err).Error("Recovered from panic while running Go-plugin middleware func")
+			logger.WithError(err).Error("Recovered from panic while running Go-plugin middleware func")
 		}
 	}()
-
-	// prepare data to call Go-plugin function
 
 	// make sure request's body can be re-read again
 	nopCloseRequestBody(r)
@@ -135,34 +263,97 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 
 	// call Go-plugin function
 	t1 := time.Now()
+	m.Spec.injectIntoReqContext(r)
+	handler(rw, r)
 
-	// Inject definition into request context:
-	ctx.SetDefinition(r, m.Spec.APIDefinition)
-
-	m.handler(rw, r)
+	if err := m.applySessionPolicies(r); err != nil {
+		return nil, 0, err
+	}
 
 	// calculate latency
 	ms := DurationToMillisecond(time.Since(t1))
-	m.logger.WithField("ms", ms).Debug("Go-plugin request processing took")
+	logger.WithField("ms", ms).Debug("Go-plugin request processing took")
 
-	// check if response was sent
-	if rw.responseSent {
-		// check if response code was an error one
-		if rw.statusCodeSent >= http.StatusBadRequest {
-			// base middleware will report this error to analytics if needed
-			respCode = rw.statusCodeSent
-			err = fmt.Errorf("plugin function sent error response code: %d", rw.statusCodeSent)
-			m.logger.WithError(err).Error("Failed to process request with Go-plugin middleware func")
-		} else {
-			// record 2XX to analytics
-			m.successHandler.RecordHit(r, Latency{Total: int64(ms)}, rw.statusCodeSent, rw.getHttpResponse(r))
+	return rw, ms, err
+}
 
-			// no need to continue passing this request down to reverse proxy
-			respCode = mwStatusRespond
-		}
-	} else {
-		respCode = http.StatusOK
+func (m *GoPluginMiddleware) applySessionPolicies(r *http.Request) error {
+	session := ctxGetSession(r)
+	if session == nil {
+		return nil
 	}
 
-	return
+	if err := m.ApplyPolicies(session); err != nil {
+		m.Logger().WithError(err).Error("Could not apply policy to session")
+		return errors.New(http.StatusText(http.StatusInternalServerError))
+	}
+
+	return nil
+}
+
+func (m *GoPluginMiddleware) handlePluginResponse(
+	r *http.Request,
+	rw *customResponseWriter,
+	ms float64,
+	logger *logrus.Entry,
+	successHandler *SuccessHandler,
+) (error, int) {
+	// check if response was sent
+	if !rw.responseSent {
+		return nil, http.StatusOK
+	}
+
+	// check if response code was an error one
+	if rw.statusCodeSent >= http.StatusBadRequest {
+		return m.handleErrorResponse(r, rw, logger)
+	}
+
+	// record 2XX to analytics
+	successHandler.RecordHit(r, analytics.Latency{
+		Total:    int64(ms),
+		Upstream: 0,
+		Gateway:  int64(ms),
+	}, rw.statusCodeSent, rw.getHttpResponse(r), false)
+
+	// no need to continue passing this request down to reverse proxy
+	return ErrResponseSucceed, middleware.StatusRespond
+}
+
+func (m *GoPluginMiddleware) handleErrorResponse(
+	r *http.Request,
+	rw *customResponseWriter,
+	logger *logrus.Entry,
+) (error, int) {
+	err := fmt.Errorf("plugin function sent error response code: %d", rw.statusCodeSent)
+	logger = logger.WithField("status_code", rw.statusCodeSent)
+
+	fireAuthFailure := func() {
+		m.Base().FireEvent(EventAuthFailure, EventKeyFailureMeta{
+			EventMetaDefault: EventMetaDefault{
+				Message:            "Auth Failure",
+				OriginatingRequest: EncodeRequestToEvent(r),
+			},
+			Path:   r.URL.Path,
+			Origin: request.RealIP(r),
+			Key:    "n/a",
+		})
+	}
+
+	switch rw.statusCodeSent {
+	case http.StatusUnauthorized:
+		logger.Error("Authentication error in Go-plugin middleware func")
+		fireAuthFailure()
+	case http.StatusForbidden:
+		logger.Error("Authorization error in Go-plugin middleware func")
+		fireAuthFailure()
+	default:
+		// Non-auth errors (other 4xx/5xx): base middleware will report this error to analytics if needed
+		logger.WithError(err).Error("Failed to process request with Go-plugin middleware func")
+	}
+
+	if rw.responseSent {
+		err = fmt.Errorf("%w: %w", ErrResponseErrorSent, err)
+	}
+
+	return err, rw.statusCodeSent
 }

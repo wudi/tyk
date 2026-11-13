@@ -2,10 +2,9 @@ package gateway
 
 import (
 	"bytes"
-	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -16,12 +15,14 @@ import (
 	"time"
 
 	"github.com/robertkrimen/otto"
-	_ "github.com/robertkrimen/otto/underscore"
+	"github.com/sirupsen/logrus"
 
-	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/middleware"
 	"github.com/TykTechnologies/tyk/user"
 
-	"github.com/sirupsen/logrus"
+	_ "github.com/robertkrimen/otto/underscore"
 )
 
 // Lets the user override and return a response from middleware
@@ -51,6 +52,28 @@ type MiniRequestObject struct {
 	Scheme          string
 }
 
+func (mr *MiniRequestObject) ReconstructParams(r *http.Request) {
+	updatedValues := r.URL.Query()
+
+	for _, k := range mr.DeleteParams {
+		updatedValues.Del(k)
+	}
+
+	for p, v := range mr.AddParams {
+		updatedValues.Set(p, v)
+	}
+
+	for p, v := range mr.ExtendedParams {
+		for _, val := range v {
+			updatedValues.Add(p, val)
+		}
+	}
+
+	if !reflect.DeepEqual(r.URL.Query(), updatedValues) {
+		r.URL.RawQuery = updatedValues.Encode()
+	}
+}
+
 type VMReturnObject struct {
 	Request     MiniRequestObject
 	SessionMeta map[string]string
@@ -60,7 +83,8 @@ type VMReturnObject struct {
 
 // DynamicMiddleware is a generic middleware that will execute JS code before continuing
 type DynamicMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	MiddlewareClassName string
 	Pre                 bool
 	UseSession          bool
@@ -75,10 +99,12 @@ func specToJson(spec *APISpec) string {
 	m := map[string]interface{}{
 		"OrgID": spec.OrgID,
 		"APIID": spec.APIID,
-		// For backwards compatibility within 2.x.
-		// TODO: simplify or refactor in 3.x or later.
-		"config_data": spec.ConfigData,
 	}
+
+	if !spec.ConfigDataDisabled {
+		m["config_data"] = spec.ConfigData
+	}
+
 	bs, err := json.Marshal(m)
 	if err != nil {
 		log.Error("Failed to encode configuration data: ", err)
@@ -89,6 +115,16 @@ func specToJson(spec *APISpec) string {
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (d *DynamicMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
+	// Skip post-phase JS plugins on self-looped requests (internal redirects).
+	// This prevents the plugin from executing multiple times during internal routing
+	// (e.g., VEM chain traversal, URL rewrites with tyk://self).
+	// Pre-phase plugins run before auth and should execute on every request.
+	// Similar to auth middleware behavior (see mw_auth_key.go:124).
+	// Only applies to MCP proxies.
+	if d.Spec.IsMCP() && !d.Pre && httpctx.IsSelfLooping(r) {
+		return nil, http.StatusOK
+	}
+
 	t1 := time.Now().UnixNano()
 	logger := d.Logger()
 
@@ -140,7 +176,7 @@ func (d *DynamicMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reques
 
 	specAsJson := specToJson(d.Spec)
 
-	session := new(user.SessionState)
+	session := &user.SessionState{}
 
 	// Encode the session object (if not a pre-process)
 	if !d.Pre && d.UseSession {
@@ -155,50 +191,25 @@ func (d *DynamicMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reques
 
 	// Run the middleware
 	middlewareClassname := d.MiddlewareClassName
-	vm := d.Spec.JSVM.VM.Copy()
-	vm.Interrupt = make(chan func(), 1)
+	expr := middlewareClassname + `.DoProcessRequest(` + string(requestAsJson) + `, ` + string(sessionAsJson) + `, ` + specAsJson + `);`
 	logger.Debug("Running: ", middlewareClassname)
-	// buffered, leaving no chance of a goroutine leak since the
-	// spawned goroutine will send 0 or 1 values.
-	ret := make(chan otto.Value, 1)
-	errRet := make(chan error, 1)
-	go func() {
-		defer func() {
-			// the VM executes the panic func that gets it
-			// to stop, so we must recover here to not crash
-			// the whole Go program.
-			recover()
-		}()
-		returnRaw, err := vm.Run(middlewareClassname + `.DoProcessRequest(` + string(requestAsJson) + `, ` + string(sessionAsJson) + `, ` + specAsJson + `);`)
-		ret <- returnRaw
-		errRet <- err
-	}()
-	var returnRaw otto.Value
-	t := time.NewTimer(d.Spec.JSVM.Timeout)
-	select {
-	case returnRaw = <-ret:
-		if err := <-errRet; err != nil {
-			logger.WithError(err).Error("Failed to run JS middleware")
-			return nil, http.StatusOK
-		}
-		t.Stop()
-	case <-t.C:
-		t.Stop()
-		logger.Error("JS middleware timed out after ", d.Spec.JSVM.Timeout)
-		vm.Interrupt <- func() {
-			// only way to stop the VM is to send it a func
-			// that panics.
-			panic("stop")
-		}
-		return nil, http.StatusOK
+
+	runner := d.Spec.GetJSRunner()
+	if runner == nil {
+		logger.Error("JSVM isn't initialized, check your gateway settings")
+		return errors.New("middleware error"), http.StatusInternalServerError
 	}
-	returnDataStr, _ := returnRaw.ToString()
+	returnDataStr, err := runner.Run(expr)
+	if err != nil {
+		logger.WithError(err).Error("Failed to run JS middleware")
+		return errors.New(http.StatusText(http.StatusInternalServerError)), http.StatusInternalServerError
+	}
 
 	// Decode the return object
 	newRequestData := VMReturnObject{}
 	if err := json.Unmarshal([]byte(returnDataStr), &newRequestData); err != nil {
 		logger.WithError(err).Error("Failed to decode middleware request data on return from VM. Returned data: ", returnDataStr)
-		return nil, http.StatusOK
+		return errors.New(http.StatusText(http.StatusInternalServerError)), http.StatusInternalServerError
 	}
 
 	// Reconstruct the request parts
@@ -210,44 +221,36 @@ func (d *DynamicMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reques
 		r.Body = ioutil.NopCloser(bytes.NewReader(newRequestData.Request.Body))
 	}
 
-	r.URL, err = url.ParseRequestURI(newRequestData.Request.URL)
+	// make sure request's body can be re-read again
+	nopCloseRequestBody(r)
+
+	r.URL, err = url.Parse(newRequestData.Request.URL)
 	if err != nil {
 		return nil, http.StatusOK
 	}
 
+	ignoreCanonical := d.Gw.GetConfig().IgnoreCanonicalMIMEHeaderKey
 	// Delete and set headers
 	for _, dh := range newRequestData.Request.DeleteHeaders {
 		r.Header.Del(dh)
+		if ignoreCanonical {
+			// Make sure we delete the header in case the header key was not canonical.
+			delete(r.Header, dh)
+		}
 	}
-
 	for h, v := range newRequestData.Request.SetHeaders {
-		r.Header.Set(h, v)
+		setCustomHeader(r.Header, h, v, ignoreCanonical)
 	}
 
 	// Delete and set request parameters
-	values := r.URL.Query()
-	for _, k := range newRequestData.Request.DeleteParams {
-		values.Del(k)
-	}
-
-	for p, v := range newRequestData.Request.AddParams {
-		values.Set(p, v)
-	}
-
-	for p, v := range newRequestData.Request.ExtendedParams {
-		for _, val := range v {
-			values.Add(p, val)
-		}
-	}
-
-	r.URL.RawQuery = values.Encode()
+	newRequestData.Request.ReconstructParams(r)
 
 	// Save the session data (if modified)
 	if !d.Pre && d.UseSession {
 		newMeta := mapStrsToIfaces(newRequestData.SessionMeta)
-		if !reflect.DeepEqual(session.MetaData, newMeta) {
+		if session != nil && !reflect.DeepEqual(session.MetaData, newMeta) {
 			session.MetaData = newMeta
-			ctxScheduleSessionUpdate(r)
+			session.Touch()
 		}
 	}
 
@@ -275,12 +278,17 @@ func (d *DynamicMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reques
 			},
 		}
 
-		forceResponse(w, r, &responseObject, d.Spec, session, d.Pre, logger)
-		return nil, mwStatusRespond
+		d.Gw.forceResponse(w, r, &responseObject, d.Spec, session, d.Pre, logger)
+		return nil, middleware.StatusRespond
 	}
 
 	if d.Auth {
-		ctxSetSession(r, &newRequestData.Session, newRequestData.AuthValue, true)
+		newRequestData.Session.KeyID = newRequestData.AuthValue
+
+		switch d.Spec.BaseIdentityProvidedBy {
+		case apidef.CustomAuth, apidef.UnsetAuth:
+			ctxSetSession(r, &newRequestData.Session, true, d.Gw.GetConfig().HashKeys)
+		}
 	}
 
 	return nil, http.StatusOK
@@ -300,18 +308,19 @@ func mapStrsToIfaces(m map[string]string) map[string]interface{} {
 
 type JSVM struct {
 	Spec    *APISpec
-	VM      *otto.Otto
+	VM      *otto.Otto `json:"-"`
 	Timeout time.Duration
-	Log     *logrus.Entry  // logger used by the JS code
-	RawLog  *logrus.Logger // logger used by `rawlog` func to avoid formatting
+	Log     *logrus.Entry `json:"-"` // logger used by the JS code
+	Gw      *Gateway      `json:"-"`
 }
 
 const defaultJSVMTimeout = 5
 
 // Init creates the JSVM with the core library and sets up a default
 // timeout.
-func (j *JSVM) Init(spec *APISpec, logger *logrus.Entry) {
+func (j *JSVM) Init(spec *APISpec, logger *logrus.Entry, gw *Gateway) {
 	vm := otto.New()
+	j.Gw = gw
 	logger = logger.WithField("prefix", "jsvm")
 
 	// Init TykJS namespace, constructors etc.
@@ -321,7 +330,7 @@ func (j *JSVM) Init(spec *APISpec, logger *logrus.Entry) {
 	}
 
 	// Load user's TykJS on top, if any
-	if path := config.Global().TykJSPath; path != "" {
+	if path := gw.GetConfig().TykJSPath; path != "" {
 		f, err := os.Open(path)
 		if err == nil {
 			_, err = vm.Run(f)
@@ -335,20 +344,69 @@ func (j *JSVM) Init(spec *APISpec, logger *logrus.Entry) {
 
 	j.VM = vm
 	j.Spec = spec
+	j.Log = logger // use the global logger by default
 
 	// Add environment API
 	j.LoadTykJSApi()
 
-	if jsvmTimeout := config.Global().JSVMTimeout; jsvmTimeout <= 0 {
+	if jsvmTimeout := gw.GetConfig().JSVMTimeout; jsvmTimeout <= 0 {
 		j.Timeout = time.Duration(defaultJSVMTimeout) * time.Second
 		logger.Debugf("Default JSVM timeout used: %v", j.Timeout)
 	} else {
 		j.Timeout = time.Duration(jsvmTimeout) * time.Second
 		logger.Debugf("Custom JSVM timeout: %v", j.Timeout)
 	}
+}
 
-	j.Log = logger // use the global logger by default
-	j.RawLog = rawLog
+func (j *JSVM) DeInit() {
+	j.Spec = nil
+	j.Log = nil
+	j.Gw = nil
+}
+
+// Ready implements JSRunner.
+func (j *JSVM) Ready() bool {
+	return j.VM != nil
+}
+
+// Run implements JSRunner. It copies the otto VM, executes the expression
+// in a goroutine with timeout handling and panic recovery, and returns the
+// stringified result.
+func (j *JSVM) Run(expr string) (string, error) {
+	if j.VM == nil {
+		return "", errors.New("JSVM isn't enabled, check your gateway settings")
+	}
+	vm := j.VM.Copy()
+	vm.Interrupt = make(chan func(), 1)
+	ret := make(chan otto.Value, 1)
+	errRet := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				j.Log.WithField("panic", r).Debug("Recovered from JS goroutine panic")
+			}
+		}()
+		returnRaw, err := vm.Run(expr)
+		ret <- returnRaw
+		errRet <- err
+	}()
+	t := time.NewTimer(j.Timeout)
+	select {
+	case returnRaw := <-ret:
+		t.Stop()
+		if err := <-errRet; err != nil {
+			return "", err
+		}
+		s, err := returnRaw.ToString()
+		if err != nil {
+			return "", err
+		}
+		return s, nil
+	case <-t.C:
+		t.Stop()
+		vm.Interrupt <- func() { panic("stop") }
+		return "", fmt.Errorf("JS middleware timed out after %v", j.Timeout)
+	}
 }
 
 // LoadJSPaths will load JS classes and functionality in to the VM by file
@@ -356,6 +414,11 @@ func (j *JSVM) LoadJSPaths(paths []string, prefix string) {
 	for _, mwPath := range paths {
 		if prefix != "" {
 			mwPath = filepath.Join(prefix, mwPath)
+		}
+		extension := filepath.Ext(mwPath)
+		if !strings.Contains(extension, ".js") {
+			j.Log.Errorf("Unsupported extension '%s' (%s)", extension, mwPath)
+			continue
 		}
 		j.Log.Info("Loading JS File: ", mwPath)
 		f, err := os.Open(mwPath)
@@ -391,216 +454,67 @@ type TykJSHttpResponse struct {
 }
 
 func (j *JSVM) LoadTykJSApi() {
-	// Enable a log
+	h := &JSVMAPIHelper{Spec: j.Spec, Gw: j.Gw, Log: j.Log}
+
+	toValue := func(v interface{}) otto.Value {
+		val, err := j.VM.ToValue(v)
+		if err != nil {
+			h.Log.WithError(err).Error("Failed to convert value for JS")
+			return otto.Value{}
+		}
+		return val
+	}
+
 	j.VM.Set("log", func(call otto.FunctionCall) otto.Value {
-		j.Log.WithFields(logrus.Fields{
-			"type": "log-msg",
-		}).Info(call.Argument(0).String())
+		h.LogMessage(call.Argument(0).String())
 		return otto.Value{}
 	})
 	j.VM.Set("rawlog", func(call otto.FunctionCall) otto.Value {
-		j.RawLog.Print(call.Argument(0).String() + "\n")
+		h.RawLogMessage(call.Argument(0).String())
 		return otto.Value{}
 	})
-
-	// these two needed for non-utf8 bodies
 	j.VM.Set("b64dec", func(call otto.FunctionCall) otto.Value {
-		in := call.Argument(0).String()
-		out, err := base64.StdEncoding.DecodeString(in)
-
-		// Fallback to RawStdEncoding:
+		out, err := h.B64Decode(call.Argument(0).String())
 		if err != nil {
-			out, err = base64.RawStdEncoding.DecodeString(in)
-			if err != nil {
-				j.Log.WithError(err).Error("Failed to base64 decode")
-				return otto.Value{}
-			}
-		}
-		returnVal, err := j.VM.ToValue(string(out))
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to base64 decode")
 			return otto.Value{}
 		}
-		return returnVal
+		return toValue(out)
 	})
 	j.VM.Set("b64enc", func(call otto.FunctionCall) otto.Value {
-		in := []byte(call.Argument(0).String())
-		out := base64.StdEncoding.EncodeToString(in)
-		returnVal, err := j.VM.ToValue(out)
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to base64 encode")
-			return otto.Value{}
-		}
-		return returnVal
+		return toValue(h.B64Encode(call.Argument(0).String()))
 	})
-
 	j.VM.Set("rawb64dec", func(call otto.FunctionCall) otto.Value {
-		in := call.Argument(0).String()
-		out, err := base64.RawStdEncoding.DecodeString(in)
+		out, err := h.RawB64Decode(call.Argument(0).String())
 		if err != nil {
-			if err != nil {
-				j.Log.WithError(err).Error("Failed to base64 decode")
-				return otto.Value{}
-			}
-		}
-		returnVal, err := j.VM.ToValue(string(out))
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to base64 decode")
 			return otto.Value{}
 		}
-		return returnVal
+		return toValue(out)
 	})
 	j.VM.Set("rawb64enc", func(call otto.FunctionCall) otto.Value {
-		in := []byte(call.Argument(0).String())
-		out := base64.RawStdEncoding.EncodeToString(in)
-		returnVal, err := j.VM.ToValue(out)
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to base64 encode")
-			return otto.Value{}
-		}
-		return returnVal
+		return toValue(h.RawB64Encode(call.Argument(0).String()))
 	})
-
-	// Enable the creation of HTTP Requsts
 	j.VM.Set("TykMakeHttpRequest", func(call otto.FunctionCall) otto.Value {
-		jsonHRO := call.Argument(0).String()
-		if jsonHRO == "undefined" {
-			// Nope, return nothing
+		result, err := h.MakeHTTPRequest(call.Argument(0).String())
+		if err != nil || result == "" {
 			return otto.Value{}
 		}
-		hro := TykJSHttpRequest{}
-		if err := json.Unmarshal([]byte(jsonHRO), &hro); err != nil {
-			j.Log.WithError(err).Error("JSVM: Failed to deserialise HTTP Request object")
-			return otto.Value{}
-		}
-
-		// Make the request
-		domain := hro.Domain
-		data := url.Values{}
-		for k, v := range hro.FormData {
-			data.Set(k, v)
-		}
-
-		u, _ := url.ParseRequestURI(domain + hro.Resource)
-		urlStr := u.String() // "https://api.com/user/"
-
-		var d string
-		if hro.Body != "" {
-			d = hro.Body
-		} else if len(hro.FormData) > 0 {
-			d = data.Encode()
-		}
-
-		r, _ := http.NewRequest(hro.Method, urlStr, nil)
-
-		if d != "" {
-			r, _ = http.NewRequest(hro.Method, urlStr, strings.NewReader(d))
-		}
-
-		for k, v := range hro.Headers {
-			r.Header.Set(k, v)
-		}
-		r.Close = true
-
-		tr := &http.Transport{TLSClientConfig: &tls.Config{}}
-		if cert := getUpstreamCertificate(r.Host, j.Spec); cert != nil {
-			tr.TLSClientConfig.Certificates = []tls.Certificate{*cert}
-		}
-
-		if config.Global().ProxySSLInsecureSkipVerify {
-			tr.TLSClientConfig.InsecureSkipVerify = true
-		}
-
-		if j.Spec.Proxy.Transport.SSLInsecureSkipVerify {
-			tr.TLSClientConfig.InsecureSkipVerify = true
-		}
-
-		tr.DialTLS = customDialTLSCheck(j.Spec, tr.TLSClientConfig)
-
-		tr.Proxy = proxyFromAPI(j.Spec)
-
-		// using new Client each time should be ok, since we closing connection every time
-		client := &http.Client{Transport: tr}
-		resp, err := client.Do(r)
-		if err != nil {
-			j.Log.WithError(err).Error("Request failed")
-			return otto.Value{}
-		}
-
-		body, _ := ioutil.ReadAll(resp.Body)
-		bodyStr := string(body)
-		tykResp := TykJSHttpResponse{
-			Code:        resp.StatusCode,
-			Body:        bodyStr,
-			Headers:     resp.Header,
-			CodeComp:    resp.StatusCode,
-			BodyComp:    bodyStr,
-			HeadersComp: resp.Header,
-		}
-
-		retAsStr, _ := json.Marshal(tykResp)
-		returnVal, err := j.VM.ToValue(string(retAsStr))
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to encode return value")
-			return otto.Value{}
-		}
-
-		return returnVal
+		return toValue(result)
 	})
-
-	// Expose Setters and Getters in the REST API for a key:
 	j.VM.Set("TykGetKeyData", func(call otto.FunctionCall) otto.Value {
-		apiKey := call.Argument(0).String()
-		apiId := call.Argument(1).String()
-
-		obj, _ := handleGetDetail(apiKey, apiId, false)
-		bs, _ := json.Marshal(obj)
-
-		returnVal, err := j.VM.ToValue(string(bs))
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to encode return value")
-			return otto.Value{}
-		}
-
-		return returnVal
+		return toValue(h.GetKeyData(call.Argument(0).String(), call.Argument(1).String()))
 	})
-
 	j.VM.Set("TykSetKeyData", func(call otto.FunctionCall) otto.Value {
-		apiKey := call.Argument(0).String()
-		encoddedSession := call.Argument(1).String()
-		suppressReset := call.Argument(2).String()
-
-		newSession := user.SessionState{}
-		err := json.Unmarshal([]byte(encoddedSession), &newSession)
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to decode the sesison data")
-			return otto.Value{}
+		if err := h.SetKeyData(call.Argument(0).String(), call.Argument(1).String(), call.Argument(2).String()); err != nil {
+			h.Log.WithError(err).Error("Failed to set key data from JS")
 		}
-
-		doAddOrUpdate(apiKey, &newSession, suppressReset == "1", false)
-
 		return otto.Value{}
 	})
-
-	// Batch request method
-	unsafeBatchHandler := BatchRequestHandler{}
 	j.VM.Set("TykBatchRequest", func(call otto.FunctionCall) otto.Value {
-		requestSet := call.Argument(0).String()
-		j.Log.Debug("Batch input is: ", requestSet)
-
-		bs, err := unsafeBatchHandler.ManualBatchRequest([]byte(requestSet))
+		result, err := h.BatchRequest(call.Argument(0).String())
 		if err != nil {
-			j.Log.WithError(err).Error("Batch request error")
 			return otto.Value{}
 		}
-
-		returnVal, err := j.VM.ToValue(string(bs))
-		if err != nil {
-			j.Log.WithError(err).Error("Failed to encode return value")
-			return otto.Value{}
-		}
-
-		return returnVal
+		return toValue(result)
 	})
 
 	j.VM.Run(`function TykJsResponse(response, session_meta) {
@@ -641,6 +555,22 @@ TykJS.TykMiddleware.MiddlewareComponentMeta.prototype.DoProcessRequest = functio
 	return JSON.stringify(processed_request)
 }
 
+TykJS.TykMiddleware.MiddlewareComponentMeta.prototype.ProcessResponse = function(response, request, session, config) {
+	log("Process Response Not Implemented")
+	return response
+}
+
+TykJS.TykMiddleware.MiddlewareComponentMeta.prototype.DoProcessResponse = function(response, request, session, config) {
+	var processed_response = this.ProcessResponse(response, request, session, config)
+
+	if (!processed_response) {
+		log("Middleware didn't return response object!")
+		return
+	}
+
+	return JSON.stringify(processed_response)
+}
+
 // The user-level middleware component
 TykJS.TykMiddleware.NewMiddleware = function(configuration) {
 	TykJS.TykMiddleware.MiddlewareComponentMeta.call(this, configuration)
@@ -654,8 +584,16 @@ TykJS.TykMiddleware.NewMiddleware.prototype.NewProcessRequest = function(callbac
 	this.ProcessRequest = callback
 }
 
+TykJS.TykMiddleware.NewMiddleware.prototype.NewProcessResponse = function(callback) {
+	this.ProcessResponse = callback
+}
+
 TykJS.TykMiddleware.NewMiddleware.prototype.ReturnData = function(request, session) {
 	return {Request: request, SessionMeta: session}
+}
+
+TykJS.TykMiddleware.NewMiddleware.prototype.ReturnResponseData = function(response, session) {
+	return {Response: response, SessionMeta: session}
 }
 
 TykJS.TykMiddleware.NewMiddleware.prototype.ReturnAuthData = function(request, session) {

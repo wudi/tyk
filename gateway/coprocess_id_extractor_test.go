@@ -8,7 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/model"
 	"github.com/TykTechnologies/tyk/storage"
 )
 
@@ -26,32 +29,51 @@ const (
 	extractorParamName  = "testparam"
 )
 
-func createSpecTestFrom(t testing.TB, def *apidef.APIDefinition) *APISpec {
-	loader := APIDefinitionLoader{}
-	spec := loader.MakeSpec(def, nil)
-	tname := t.Name()
-	redisStore := &storage.RedisCluster{KeyPrefix: tname + "-apikey."}
-	healthStore := &storage.RedisCluster{KeyPrefix: tname + "-apihealth."}
-	orgStore := &storage.RedisCluster{KeyPrefix: tname + "-orgKey."}
-	spec.Init(redisStore, redisStore, healthStore, orgStore)
+func (ts *Test) createSpecTestFrom(tb testing.TB, def *apidef.APIDefinition) *APISpec {
+	tb.Helper()
+
+	loader := APIDefinitionLoader{Gw: ts.Gw}
+	spec, _ := loader.MakeSpec(&model.MergedAPI{APIDefinition: def}, nil)
+	tname := tb.Name()
+
+	redisStore := &storage.RedisCluster{KeyPrefix: tname + "-apikey.", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	redisStore.Connect()
+
+	healthStore := &storage.RedisCluster{KeyPrefix: tname + "-apihealth.", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	healthStore.Connect()
+
+	orgStore := &storage.RedisCluster{KeyPrefix: tname + "-orgKey.", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	orgStore.Connect()
+
+	spec.Init(redisStore, healthStore, orgStore)
 	return spec
 }
 
-func prepareExtractor(t testing.TB, extractorSource apidef.IdExtractorSource, extractorType apidef.IdExtractorType, config map[string]interface{}) (IdExtractor, *APISpec) {
+func (ts *Test) prepareExtractor(tb testing.TB, extractorSource apidef.IdExtractorSource, extractorType apidef.IdExtractorType, config map[string]interface{}, disabled bool) (IdExtractor, *APISpec) {
+	tb.Helper()
+
 	def := &apidef.APIDefinition{
 		OrgID: MockOrgID,
 		CustomMiddleware: apidef.MiddlewareSection{
 			IdExtractor: apidef.MiddlewareIdExtractor{
+				Disabled:        disabled,
 				ExtractFrom:     extractorSource,
 				ExtractWith:     extractorType,
 				ExtractorConfig: config,
 			},
 		},
 	}
-	spec := createSpecTestFrom(t, def)
-	mw := BaseMiddleware{Spec: spec}
+
+	spec := ts.createSpecTestFrom(tb, def)
+	mw := &BaseMiddleware{Spec: spec, Gw: ts.Gw}
 	newExtractor(spec, mw)
-	return spec.CustomMiddleware.IdExtractor.Extractor.(IdExtractor), spec
+
+	extractor, ok := spec.CustomMiddleware.IdExtractor.Extractor.(IdExtractor)
+	if !ok {
+		return nil, spec
+	}
+
+	return extractor, spec
 }
 
 func prepareHeaderExtractorRequest(headers map[string]string) *http.Request {
@@ -82,19 +104,22 @@ func prepareExtractorFormRequest(values map[string]string) *http.Request {
 	return r
 }
 
-func generateSessionID(input string) string {
+func (s *Test) GenerateSessionID(input string) string {
 	data := []byte(input)
 	tokenID := fmt.Sprintf("%x", md5.Sum(data))
-	return generateToken(MockOrgID, tokenID)
+	return s.Gw.generateToken(MockOrgID, tokenID)
 }
 
 func TestValueExtractor(t *testing.T) {
-	testSessionID := generateSessionID(extractorValueInput)
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	testSessionID := ts.GenerateSessionID(extractorValueInput)
 
 	t.Run("HeaderSource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.HeaderSource, apidef.ValueExtractor, map[string]interface{}{
+		extractor, spec := ts.prepareExtractor(t, apidef.HeaderSource, apidef.ValueExtractor, map[string]interface{}{
 			"header_name": extractorHeaderName,
-		})
+		}, false)
 
 		r := prepareHeaderExtractorRequest(nil)
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -119,9 +144,9 @@ func TestValueExtractor(t *testing.T) {
 	})
 
 	t.Run("FormSource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.FormSource, apidef.ValueExtractor, map[string]interface{}{
+		extractor, spec := ts.prepareExtractor(t, apidef.FormSource, apidef.ValueExtractor, map[string]interface{}{
 			"param_name": extractorParamName,
-		})
+		}, false)
 
 		r := prepareExtractorFormRequest(nil)
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -147,14 +172,18 @@ func TestValueExtractor(t *testing.T) {
 }
 
 func TestRegexExtractor(t *testing.T) {
-	testSessionID := generateSessionID(extractorRegexInput)
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	testSessionID := ts.GenerateSessionID(extractorRegexInput)
 
 	t.Run("HeaderSource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.HeaderSource, apidef.RegexExtractor, map[string]interface{}{
-			"regex_expression":  extractorRegexExpr,
-			"regex_match_index": extractorRegexMatchIndex,
-			"header_name":       extractorHeaderName,
-		})
+		extractor, spec := ts.prepareExtractor(t, apidef.HeaderSource, apidef.RegexExtractor,
+			map[string]interface{}{
+				"regex_expression":  extractorRegexExpr,
+				"regex_match_index": extractorRegexMatchIndex,
+				"header_name":       extractorHeaderName,
+			}, false)
 
 		r := prepareHeaderExtractorRequest(nil)
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -179,10 +208,11 @@ func TestRegexExtractor(t *testing.T) {
 	})
 
 	t.Run("BodySource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.BodySource, apidef.RegexExtractor, map[string]interface{}{
-			"regex_expression":  extractorRegexExpr,
-			"regex_match_index": extractorRegexMatchIndex,
-		})
+		extractor, spec := ts.prepareExtractor(t, apidef.BodySource, apidef.RegexExtractor,
+			map[string]interface{}{
+				"regex_expression":  extractorRegexExpr,
+				"regex_match_index": extractorRegexMatchIndex,
+			}, false)
 
 		r := prepareBodyExtractorRequest("")
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -207,11 +237,12 @@ func TestRegexExtractor(t *testing.T) {
 	})
 
 	t.Run("FormSource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.FormSource, apidef.RegexExtractor, map[string]interface{}{
-			"regex_expression":  extractorRegexExpr,
-			"regex_match_index": extractorRegexMatchIndex,
-			"param_name":        extractorParamName,
-		})
+		extractor, spec := ts.prepareExtractor(t, apidef.FormSource, apidef.RegexExtractor,
+			map[string]interface{}{
+				"regex_expression":  extractorRegexExpr,
+				"regex_match_index": extractorRegexMatchIndex,
+				"param_name":        extractorParamName,
+			}, false)
 
 		r := prepareExtractorFormRequest(nil)
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -237,13 +268,17 @@ func TestRegexExtractor(t *testing.T) {
 }
 
 func TestXPathExtractor(t *testing.T) {
-	testSessionID := generateSessionID("thevalue")
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	testSessionID := ts.GenerateSessionID("thevalue")
 
 	t.Run("HeaderSource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.HeaderSource, apidef.XPathExtractor, map[string]interface{}{
-			"xpath_expression": extractorXPathExpr,
-			"header_name":      extractorHeaderName,
-		})
+		extractor, spec := ts.prepareExtractor(t, apidef.HeaderSource, apidef.XPathExtractor,
+			map[string]interface{}{
+				"xpath_expression": extractorXPathExpr,
+				"header_name":      extractorHeaderName,
+			}, false)
 
 		r := prepareHeaderExtractorRequest(nil)
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -268,9 +303,10 @@ func TestXPathExtractor(t *testing.T) {
 	})
 
 	t.Run("BodySource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.BodySource, apidef.XPathExtractor, map[string]interface{}{
-			"xpath_expression": extractorXPathExpr,
-		})
+		extractor, spec := ts.prepareExtractor(t, apidef.BodySource, apidef.XPathExtractor,
+			map[string]interface{}{
+				"xpath_expression": extractorXPathExpr,
+			}, false)
 
 		r := prepareBodyExtractorRequest("")
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -295,10 +331,11 @@ func TestXPathExtractor(t *testing.T) {
 	})
 
 	t.Run("FormSource", func(t *testing.T) {
-		extractor, spec := prepareExtractor(t, apidef.FormSource, apidef.XPathExtractor, map[string]interface{}{
-			"xpath_expression": extractorXPathExpr,
-			"param_name":       extractorParamName,
-		})
+		extractor, spec := ts.prepareExtractor(t, apidef.FormSource, apidef.XPathExtractor,
+			map[string]interface{}{
+				"xpath_expression": extractorXPathExpr,
+				"param_name":       extractorParamName,
+			}, false)
 
 		r := prepareExtractorFormRequest(nil)
 		sessionID, overrides := extractor.ExtractAndCheck(r)
@@ -326,9 +363,13 @@ func TestXPathExtractor(t *testing.T) {
 func BenchmarkValueExtractor(b *testing.B) {
 	b.Run("HeaderSource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.HeaderSource, apidef.ValueExtractor, map[string]interface{}{
-			"header_name": extractorHeaderName,
-		})
+
+		ts := StartTest(nil)
+		defer ts.Close()
+		extractor, _ := ts.prepareExtractor(b, apidef.HeaderSource, apidef.ValueExtractor,
+			map[string]interface{}{
+				"header_name": extractorHeaderName,
+			}, false)
 		headers := map[string]string{extractorHeaderName: extractorValueInput}
 		for i := 0; i < b.N; i++ {
 			r := prepareHeaderExtractorRequest(headers)
@@ -337,9 +378,13 @@ func BenchmarkValueExtractor(b *testing.B) {
 	})
 	b.Run("FormSource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.FormSource, apidef.ValueExtractor, map[string]interface{}{
-			"param_name": extractorParamName,
-		})
+
+		ts := StartTest(nil)
+		defer ts.Close()
+		extractor, _ := ts.prepareExtractor(b, apidef.FormSource, apidef.ValueExtractor,
+			map[string]interface{}{
+				"param_name": extractorParamName,
+			}, false)
 		params := map[string]string{extractorParamName: extractorValueInput}
 		for i := 0; i < b.N; i++ {
 			r := prepareExtractorFormRequest(params)
@@ -351,12 +396,16 @@ func BenchmarkValueExtractor(b *testing.B) {
 func BenchmarkRegexExtractor(b *testing.B) {
 	b.Run("HeaderSource", func(b *testing.B) {
 		b.ReportAllocs()
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		headerName := "testheader"
-		extractor, _ := prepareExtractor(b, apidef.HeaderSource, apidef.RegexExtractor, map[string]interface{}{
-			"regex_expression":  extractorRegexExpr,
-			"regex_match_index": extractorRegexMatchIndex,
-			"header_name":       headerName,
-		})
+		extractor, _ := ts.prepareExtractor(b, apidef.HeaderSource, apidef.RegexExtractor,
+			map[string]interface{}{
+				"regex_expression":  extractorRegexExpr,
+				"regex_match_index": extractorRegexMatchIndex,
+				"header_name":       headerName,
+			}, false)
 		headers := map[string]string{extractorHeaderName: extractorRegexInput}
 		for i := 0; i < b.N; i++ {
 			r := prepareHeaderExtractorRequest(headers)
@@ -365,10 +414,14 @@ func BenchmarkRegexExtractor(b *testing.B) {
 	})
 	b.Run("BodySource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.BodySource, apidef.RegexExtractor, map[string]interface{}{
-			"regex_expression":  extractorRegexExpr,
-			"regex_match_index": extractorRegexMatchIndex,
-		})
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		extractor, _ := ts.prepareExtractor(b, apidef.BodySource, apidef.RegexExtractor,
+			map[string]interface{}{
+				"regex_expression":  extractorRegexExpr,
+				"regex_match_index": extractorRegexMatchIndex,
+			}, false)
 		for i := 0; i < b.N; i++ {
 			r := prepareBodyExtractorRequest(extractorRegexInput)
 			extractor.ExtractAndCheck(r)
@@ -376,11 +429,15 @@ func BenchmarkRegexExtractor(b *testing.B) {
 	})
 	b.Run("FormSource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.FormSource, apidef.RegexExtractor, map[string]interface{}{
-			"regex_expression":  extractorRegexExpr,
-			"regex_match_index": extractorRegexMatchIndex,
-			"param_name":        extractorParamName,
-		})
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		extractor, _ := ts.prepareExtractor(b, apidef.FormSource, apidef.RegexExtractor,
+			map[string]interface{}{
+				"regex_expression":  extractorRegexExpr,
+				"regex_match_index": extractorRegexMatchIndex,
+				"param_name":        extractorParamName,
+			}, false)
 		params := map[string]string{extractorParamName: extractorRegexInput}
 		for i := 0; i < b.N; i++ {
 			r := prepareExtractorFormRequest(params)
@@ -392,10 +449,13 @@ func BenchmarkRegexExtractor(b *testing.B) {
 func BenchmarkXPathExtractor(b *testing.B) {
 	b.Run("HeaderSource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.HeaderSource, apidef.XPathExtractor, map[string]interface{}{
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		extractor, _ := ts.prepareExtractor(b, apidef.HeaderSource, apidef.XPathExtractor, map[string]interface{}{
 			"xpath_expression": extractorXPathExpr,
 			"header_name":      extractorHeaderName,
-		})
+		}, false)
 		headers := map[string]string{extractorHeaderName: extractorXPathInput}
 		for i := 0; i < b.N; i++ {
 			r := prepareHeaderExtractorRequest(headers)
@@ -404,9 +464,12 @@ func BenchmarkXPathExtractor(b *testing.B) {
 	})
 	b.Run("BodySource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.BodySource, apidef.XPathExtractor, map[string]interface{}{
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		extractor, _ := ts.prepareExtractor(b, apidef.BodySource, apidef.XPathExtractor, map[string]interface{}{
 			"xpath_expression": extractorXPathExpr,
-		})
+		}, false)
 		for i := 0; i < b.N; i++ {
 			r := prepareBodyExtractorRequest(extractorXPathInput)
 			extractor.ExtractAndCheck(r)
@@ -414,14 +477,26 @@ func BenchmarkXPathExtractor(b *testing.B) {
 	})
 	b.Run("FormSource", func(b *testing.B) {
 		b.ReportAllocs()
-		extractor, _ := prepareExtractor(b, apidef.FormSource, apidef.XPathExtractor, map[string]interface{}{
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		extractor, _ := ts.prepareExtractor(b, apidef.FormSource, apidef.XPathExtractor, map[string]interface{}{
 			"xpath_expression": extractorXPathExpr,
 			"param_name":       extractorParamName,
-		})
+		}, false)
 		params := map[string]string{extractorParamName: extractorXPathInput}
 		for i := 0; i < b.N; i++ {
 			r := prepareExtractorFormRequest(params)
 			extractor.ExtractAndCheck(r)
 		}
 	})
+}
+
+func TestIDExtractorDisabled(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+	extractor, _ := ts.prepareExtractor(t, apidef.HeaderSource, apidef.ValueExtractor, map[string]interface{}{
+		"header_name": extractorHeaderName,
+	}, true)
+	assert.Nil(t, extractor)
 }

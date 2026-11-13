@@ -1,0 +1,37 @@
+type: Test
+spec:
+  id: PVs_4XrVR
+  name: HTTP Test API - error request
+  description: proxying API returns an error
+  trigger:
+    type: http
+    httpRequest:
+      url: tyk:8080/test/status/500
+      method: GET
+      headers:
+      - key: Content-Type
+        value: application/json
+  specs:
+  - name: Check main span http attributes
+    selector: span[tracetest.span.type="http" name="GET /test/status/500" http.request.method="GET"]
+    assertions:
+    - attr:http.request.method    =    "GET"
+    - attr:url.scheme    =    "http"
+    - attr:http.response.status_code    =    500
+    - attr:tyk.api.id  =  "3"
+    - attr:tyk.api.name  =  "TestAPI"
+    - attr:tyk.api.orgid  =  "default"
+    - attr:tyk.api.tags  not-contains "test"
+    - attr:tyk.api.path  =  "/test/"
+    - attr:tyk.original_path  =  "/test/status/500"
+  - name: Check the number of spans
+    selector: "span[tracetest.span.type=\"general\" name=\"Tracetest trigger\"] span[tracetest.span.type=\"general\"],
+      \nspan[tracetest.span.type = \"http\"]"
+    assertions:
+    - attr:tracetest.selected_spans.count = 4
+  - name: Check the proxying request span
+    selector: span[tracetest.span.type="http" name="HTTP GET" http.request.method="GET"]
+    assertions:
+    - attr:http.response.status_code = 500
+    - attr:url.full = "http://httpbin.org/status/500"
+    - attr:tracetest.span.parent_id != ""

@@ -5,12 +5,14 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/TykTechnologies/tyk/ctx"
+	tykerrors "github.com/TykTechnologies/tyk/internal/errors"
 	"github.com/TykTechnologies/tyk/request"
 )
 
 // IPWhiteListMiddleware lets you define a list of IPs to allow upstream
 type IPWhiteListMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (i *IPWhiteListMiddleware) Name() string {
@@ -18,7 +20,9 @@ func (i *IPWhiteListMiddleware) Name() string {
 }
 
 func (i *IPWhiteListMiddleware) EnabledForSpec() bool {
-	return i.Spec.EnableIpWhiteListing && len(i.Spec.AllowedIPs) > 0
+	enabled := !i.Spec.APIDefinition.IPAccessControlDisabled || i.Spec.APIDefinition.EnableIpWhiteListing
+
+	return enabled && len(i.Spec.APIDefinition.AllowedIPs) > 0
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
@@ -47,6 +51,7 @@ func (i *IPWhiteListMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// Fire Authfailed Event
+	ctx.SetErrorClassification(r, tykerrors.NewErrorClassification(tykerrors.IPB, "ip_not_allowed").WithSource(i.Name()))
 	AuthFailed(i, r, remoteIP.String())
 	// Report in health check
 	reportHealthValue(i.Spec, KeyFailure, "-1")

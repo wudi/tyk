@@ -1,46 +1,72 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/headers"
+	"github.com/TykTechnologies/tyk/header"
+	"github.com/TykTechnologies/tyk/internal/certcheck"
+	"github.com/TykTechnologies/tyk/internal/model"
+	tyklog "github.com/TykTechnologies/tyk/log"
 )
 
-func createGetHandler() *WebHookHandler {
-	eventHandlerConf := config.WebHookHandlerConf{
+func (ts *Test) createWebHookHandler(t *testing.T) *WebHookHandler {
+	t.Helper()
+
+	handler := &WebHookHandler{Gw: ts.Gw}
+	err := handler.Init(config.WebHookHandlerConf{
 		TargetPath:   TestHttpGet,
 		Method:       "GET",
 		EventTimeout: 10,
-		TemplatePath: "../templates/default_webhook.json",
 		HeaderList:   map[string]string{"x-tyk-test": "TEST"},
-	}
-	ev := &WebHookHandler{}
-	if err := ev.Init(eventHandlerConf); err != nil {
-		panic(err)
-	}
-	return ev
+	})
+	assert.NoError(t, err)
+
+	return handler
 }
 
 func TestNewValid(t *testing.T) {
-	h := &WebHookHandler{}
-	err := h.Init(map[string]interface{}{
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	conf := map[string]interface{}{
+		"disabled":      false,
 		"method":        "POST",
 		"target_path":   testHttpPost,
 		"template_path": "../templates/default_webhook.json",
 		"header_map":    map[string]string{"X-Tyk-Test-Header": "Tyk v1.BANANA"},
 		"event_timeout": 10,
-	})
-	if err != nil {
-		t.Error("Webhook Handler should have created valid configuration")
 	}
+
+	t.Run("enabled", func(t *testing.T) {
+		h := &WebHookHandler{Gw: ts.Gw}
+		err := h.Init(conf)
+		assert.NoError(t, err)
+		assert.False(t, h.conf.Disabled)
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		conf["disabled"] = true
+		h := &WebHookHandler{Gw: ts.Gw}
+		err := h.Init(conf)
+		assert.ErrorIs(t, err, ErrEventHandlerDisabled)
+		assert.True(t, h.conf.Disabled)
+	})
 }
 
 func TestNewInvalid(t *testing.T) {
-	h := &WebHookHandler{}
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	h := &WebHookHandler{Gw: ts.Gw}
 	err := h.Init(map[string]interface{}{
 		"method":        123,
 		"target_path":   testHttpPost,
@@ -54,7 +80,11 @@ func TestNewInvalid(t *testing.T) {
 }
 
 func TestChecksum(t *testing.T) {
-	rBody := `{
+	t.Run("default case", func(t *testing.T) {
+		ts := StartTest(nil)
+		t.Cleanup(ts.Close)
+
+		rBody := `{
 		"event": "QuotaExceeded",
 		"message": "Key Quota Limit Exceeded",
 		"path": "/about-lonelycoder/",
@@ -63,21 +93,119 @@ func TestChecksum(t *testing.T) {
 		"timestamp": 2014-11-27 12:52:05.944549825 &#43;0000 GMT
 	}`
 
-	hook := createGetHandler()
-	checksum, err := hook.Checksum(rBody)
+		hook := ts.createWebHookHandler(t)
+		checksum, err := hook.Checksum(config.EventMessage{Type: EventQuotaExceeded}, rBody)
 
-	if err != nil {
-		t.Error("Checksum should not have failed with good objet and body")
-	}
+		if err != nil {
+			t.Error("Checksum should not have failed with good objet and body")
+		}
 
-	if checksum != "62a6b4fa9b45cd372b871764296fb3a5" {
-		t.Error("Checksum is incorrect")
-		t.Error(checksum)
-	}
+		if checksum != "62a6b4fa9b45cd372b871764296fb3a5" {
+			t.Error("Checksum is incorrect")
+			t.Error(checksum)
+		}
+	})
+
+	t.Run("certificate events", func(t *testing.T) {
+		t.Run("should produce the same checksum for EventCertificateExpiringSoon", func(t *testing.T) {
+			ts := StartTest(nil)
+			t.Cleanup(ts.Close)
+
+			em := config.EventMessage{
+				Type: EventCertificateExpiringSoon,
+				Meta: certcheck.EventCertificateExpiringSoonMeta{
+					EventMetaDefault: model.EventMetaDefault{},
+					CertID:           "123abc",
+					CertName:         "Cert Soon To Expire",
+					ExpiresAt:        time.Now().Add(time.Hour * 24),
+					DaysRemaining:    1,
+					APIID:            "123abc",
+				},
+				TimeStamp: "now",
+			}
+
+			hook := ts.createWebHookHandler(t)
+			firstChecksum, err := hook.Checksum(em, "dynamic 1")
+			assert.NoError(t, err)
+
+			secondChecksum, err := hook.Checksum(em, "dynamic 2")
+			assert.NoError(t, err)
+			assert.Equal(t, firstChecksum, secondChecksum)
+		})
+
+		t.Run("should produce the same checksum for EventCertificateExpired", func(t *testing.T) {
+			ts := StartTest(nil)
+			t.Cleanup(ts.Close)
+
+			em := config.EventMessage{
+				Type: EventCertificateExpired,
+				Meta: certcheck.EventCertificateExpiredMeta{
+					EventMetaDefault: model.EventMetaDefault{},
+					CertID:           "123abc",
+					CertName:         "Cert Expired",
+					ExpiredAt:        time.Now().Add(time.Hour * -24),
+					DaysSinceExpiry:  1,
+					APIID:            "123abc",
+				},
+				TimeStamp: "now",
+			}
+
+			hook := ts.createWebHookHandler(t)
+			firstChecksum, err := hook.Checksum(em, "dynamic 1")
+			assert.NoError(t, err)
+
+			secondChecksum, err := hook.Checksum(em, "dynamic 2")
+			assert.NoError(t, err)
+			assert.Equal(t, firstChecksum, secondChecksum)
+		})
+
+		t.Run("should produce different checksums for EventCertificateExpired and EventCertificateExpiringSoon", func(t *testing.T) {
+			ts := StartTest(nil)
+			t.Cleanup(ts.Close)
+
+			certID := "123abc"
+			certName := "Cert With Same Name"
+
+			emSoonToExpire := config.EventMessage{
+				Type: EventCertificateExpiringSoon,
+				Meta: certcheck.EventCertificateExpiringSoonMeta{
+					EventMetaDefault: model.EventMetaDefault{},
+					CertID:           certID,
+					CertName:         certName,
+					ExpiresAt:        time.Now().Add(time.Hour * 24),
+					DaysRemaining:    1,
+				},
+				TimeStamp: "now",
+			}
+
+			emExpired := config.EventMessage{
+				Type: EventCertificateExpired,
+				Meta: certcheck.EventCertificateExpiredMeta{
+					EventMetaDefault: model.EventMetaDefault{},
+					CertID:           certID,
+					CertName:         certName,
+					ExpiredAt:        time.Now().Add(time.Hour * -24),
+					DaysSinceExpiry:  1,
+				},
+				TimeStamp: "now",
+			}
+
+			hook := ts.createWebHookHandler(t)
+			soonToExpireChecksum, err := hook.Checksum(emSoonToExpire, "dynamic soon to expire")
+			assert.NoError(t, err)
+
+			expiredChecksum, err := hook.Checksum(emExpired, "dynamic expired")
+			assert.NoError(t, err)
+			assert.NotEqual(t, soonToExpireChecksum, expiredChecksum)
+		})
+	})
 }
 
 func TestBuildRequest(t *testing.T) {
-	hook := createGetHandler()
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	hook := ts.createWebHookHandler(t)
 
 	rBody := `{
 		"event": "QuotaExceeded",
@@ -96,35 +224,68 @@ func TestBuildRequest(t *testing.T) {
 		t.Error("Method hould be GET")
 	}
 
-	if got := req.Header.Get(headers.UserAgent); got != headers.TykHookshot {
+	if got := req.Header.Get(header.UserAgent); got != header.TykHookshot {
 		t.Error("Header User Agent is not correct!")
 	}
 
-	if got := req.Header.Get(headers.ContentType); got != headers.ApplicationJSON {
+	if got := req.Header.Get(header.ContentType); got != header.ApplicationJSON {
 		t.Error("Header Content-Type is not correct!")
 	}
 }
 
+func TestBuildRequestIngoreCanonicalHeaderKey(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	c := ts.Gw.GetConfig()
+	c.IgnoreCanonicalMIMEHeaderKey = true
+	ts.Gw.SetConfig(c)
+	eventHandlerConf := config.WebHookHandlerConf{
+		TargetPath:   TestHttpGet,
+		Method:       "GET",
+		EventTimeout: 10,
+		TemplatePath: "../templates/default_webhook.json",
+		HeaderList:   map[string]string{NonCanonicalHeaderKey: NonCanonicalHeaderKey},
+	}
+
+	ev := &WebHookHandler{Gw: ts.Gw}
+	if err := ev.Init(eventHandlerConf); err != nil {
+		t.Fatal(err)
+	}
+	req, err := ev.BuildRequest("")
+	assert.NoError(t, err)
+
+	got := req.Header[NonCanonicalHeaderKey][0]
+	if got != NonCanonicalHeaderKey {
+		t.Errorf("expected %q got %q", NonCanonicalHeaderKey, got)
+	}
+}
+
 func TestCreateBody(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	em := config.EventMessage{
 		Type:      EventQuotaExceeded,
 		TimeStamp: "0",
+		Meta:      EventKeyFailureMeta{},
 	}
 
-	hook := createGetHandler()
+	hook := ts.createWebHookHandler(t)
 	body, err := hook.CreateBody(em)
-	if err != nil {
-		t.Error("Create body failed with error! ", err)
-	}
+	assert.NoError(t, err)
 
 	expectedBody := `"event": "QuotaExceeded"`
 	if !strings.Contains(body, expectedBody) {
-		t.Error("Body incorrect, is: ", body)
+		t.Errorf("Body incorrect, is: %q", body)
 	}
 }
 
 func TestGet(t *testing.T) {
-	eventHandler := createGetHandler()
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	eventHandler := ts.createWebHookHandler(t)
 
 	eventMessage := config.EventMessage{
 		Type: EventKeyExpired,
@@ -135,9 +296,11 @@ func TestGet(t *testing.T) {
 			Key:              "123456789",
 		},
 	}
-	body, _ := eventHandler.CreateBody(eventMessage)
 
-	checksum, _ := eventHandler.Checksum(body)
+	body, err := eventHandler.CreateBody(eventMessage)
+	assert.NoError(t, err)
+
+	checksum, _ := eventHandler.Checksum(config.EventMessage{Type: EventKeyExpired}, body)
 	eventHandler.HandleEvent(eventMessage)
 
 	if wasFired := eventHandler.WasHookFired(checksum); !wasFired {
@@ -147,6 +310,9 @@ func TestGet(t *testing.T) {
 }
 
 func TestPost(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	eventHandlerConf := config.WebHookHandlerConf{
 		TargetPath:   "`+testHttpPost+`",
 		Method:       "POST",
@@ -155,7 +321,7 @@ func TestPost(t *testing.T) {
 		HeaderList:   map[string]string{"x-tyk-test": "TEST POST"},
 	}
 
-	eventHandler := &WebHookHandler{}
+	eventHandler := &WebHookHandler{Gw: ts.Gw}
 	if err := eventHandler.Init(eventHandlerConf); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +338,7 @@ func TestPost(t *testing.T) {
 
 	body, _ := eventHandler.CreateBody(eventMessage)
 
-	checksum, _ := eventHandler.Checksum(body)
+	checksum, _ := eventHandler.Checksum(config.EventMessage{Type: EventKeyExpired}, body)
 	eventHandler.HandleEvent(eventMessage)
 
 	if wasFired := eventHandler.WasHookFired(checksum); !wasFired {
@@ -180,7 +346,117 @@ func TestPost(t *testing.T) {
 	}
 }
 
+func TestTemplates(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	conf := map[string]interface{}{
+		"disabled":      false,
+		"method":        "POST",
+		"target_path":   testHttpPost,
+		"template_path": "../templates/default_webhook.json",
+		"header_map":    nil,
+		"event_timeout": 10,
+	}
+
+	webhookHandler := ts.createWebHookHandler(t)
+	err := webhookHandler.Init(conf)
+	require.NoError(t, err)
+
+	t.Run("CertificateExpiringSoon", func(t *testing.T) {
+		type ActualExpiringSoon struct {
+			Event         string `json:"event"`
+			Message       string `json:"message"`
+			CertID        string `json:"cert_id"`
+			CertName      string `json:"cert_name"`
+			ExpiresAt     string `json:"expires_at"`
+			DaysRemaining int    `json:"days_remaining"`
+			APIID         string `json:"api_id"`
+			Timestamp     string `json:"timestamp"`
+		}
+
+		meta := certcheck.EventCertificateExpiringSoonMeta{
+			EventMetaDefault: model.EventMetaDefault{
+				Message: "Certificate will expire in 1 day",
+			},
+			CertID:        "123abc",
+			CertName:      "Cert Soon To Expire",
+			ExpiresAt:     time.Now().Add(time.Hour * 24),
+			DaysRemaining: 1,
+			APIID:         "123abc",
+		}
+
+		eventMessage := config.EventMessage{
+			Type: EventCertificateExpiringSoon,
+			Meta: meta,
+		}
+
+		stringMessage, err := webhookHandler.CreateBody(eventMessage)
+		assert.NoError(t, err)
+
+		var actualExpiringSoon ActualExpiringSoon
+		err = json.Unmarshal([]byte(stringMessage), &actualExpiringSoon)
+		assert.NoError(t, err)
+
+		assert.Equal(t, string(EventCertificateExpiringSoon), actualExpiringSoon.Event)
+		assert.Equal(t, meta.EventMetaDefault.Message, actualExpiringSoon.Message)
+		assert.Equal(t, meta.CertID, actualExpiringSoon.CertID)
+		assert.Equal(t, meta.CertName, actualExpiringSoon.CertName)
+		assert.NotEmpty(t, actualExpiringSoon.ExpiresAt)
+		assert.Equal(t, 1, actualExpiringSoon.DaysRemaining)
+		assert.Equal(t, meta.APIID, actualExpiringSoon.APIID)
+	})
+
+	t.Run("CertificateExpired", func(t *testing.T) {
+		type ActualExpired struct {
+			Event           string `json:"event"`
+			Message         string `json:"message"`
+			CertID          string `json:"cert_id"`
+			CertName        string `json:"cert_name"`
+			ExpiredAt       string `json:"expired_at"`
+			DaysSinceExpiry int    `json:"days_since_expiry"`
+			APIID           string `json:"api_id"`
+			Timestamp       string `json:"timestamp"`
+		}
+
+		meta := certcheck.EventCertificateExpiredMeta{
+			EventMetaDefault: model.EventMetaDefault{
+				Message: "Certificate expired since 1 day",
+			},
+			CertID:          "123abc",
+			CertName:        "Cert Expired",
+			ExpiredAt:       time.Now().Add(time.Hour * -24),
+			DaysSinceExpiry: 1,
+			APIID:           "123abc",
+		}
+
+		eventMessage := config.EventMessage{
+			Type: EventCertificateExpired,
+			Meta: meta,
+		}
+
+		stringMessage, err := webhookHandler.CreateBody(eventMessage)
+		assert.NoError(t, err)
+
+		var actualExpired ActualExpired
+		err = json.Unmarshal([]byte(stringMessage), &actualExpired)
+		assert.NoError(t, err)
+
+		assert.Equal(t, string(EventCertificateExpired), actualExpired.Event)
+		assert.Equal(t, meta.EventMetaDefault.Message, actualExpired.Message)
+		assert.Equal(t, meta.CertID, actualExpired.CertID)
+		assert.Equal(t, meta.CertName, actualExpired.CertName)
+		assert.NotEmpty(t, actualExpired.ExpiredAt)
+		assert.Equal(t, 1, actualExpired.DaysSinceExpiry)
+		assert.Equal(t, meta.APIID, actualExpired.APIID)
+	})
+}
+
 func TestNewCustomTemplate(t *testing.T) {
+
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	tests := []struct {
 		name           string
 		missingDefault bool
@@ -192,21 +468,21 @@ func TestNewCustomTemplate(t *testing.T) {
 		{"UseCustom", false, "templates/breaker_webhook.json", false},
 		{"MissingDefault", true, "", true},
 		{"MissingDefaultFallback", true, "missing_webhook.json", true},
-		{"MissingDefaultNotNeeded", true, "../templates/breaker_webhook.json", false},
+		{"MissingDefaultNotNeeded", true, "../templates/breaker_webhook.json", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.missingDefault {
-				globalConf := config.Global()
+				globalConf := ts.Gw.GetConfig()
 				old := globalConf.TemplatePath
 				globalConf.TemplatePath = "missing-dir"
-				config.SetGlobal(globalConf)
+				ts.Gw.SetConfig(globalConf)
 				defer func() {
 					globalConf.TemplatePath = old
-					config.SetGlobal(globalConf)
+					ts.Gw.SetConfig(globalConf)
 				}()
 			}
-			h := &WebHookHandler{}
+			h := &WebHookHandler{Gw: ts.Gw}
 			err := h.Init(map[string]interface{}{
 				"target_path":   testHttpPost,
 				"template_path": tc.templatePath,
@@ -224,7 +500,10 @@ func TestNewCustomTemplate(t *testing.T) {
 }
 
 func TestWebhookContentTypeHeader(t *testing.T) {
-	globalConf := config.Global()
+	gw := StartTest(nil)
+	defer gw.Close()
+
+	globalConf := gw.Gw.GetConfig()
 	templatePath := globalConf.TemplatePath
 
 	tests := []struct {
@@ -234,11 +513,12 @@ func TestWebhookContentTypeHeader(t *testing.T) {
 		ExpectedContentType string
 	}{
 		{"MissingTemplatePath", "", nil, "application/json"},
-		{"MissingTemplatePath/CustomHeaders", "", map[string]string{"Content-Type": "application/xml"}, "application/xml"},
+		{"MissingTemplatePath_CustomHeaders", "", map[string]string{"Content-Type": "application/xml"}, "application/xml"},
 		{"InvalidTemplatePath", "randomPath", nil, "application/json"},
-		{"InvalidTemplatePath/CustomHeaders", "randomPath", map[string]string{"Content-Type": "application/xml"}, "application/xml"},
+		{"InvalidTemplatePath_CustomHeaders", "randomPath", map[string]string{"Content-Type": "application/xml"}, "application/xml"},
 		{"CustomTemplate", filepath.Join(templatePath, "transform_test.tmpl"), nil, ""},
-		{"CustomTemplate/CustomHeaders", filepath.Join(templatePath, "breaker_webhook.json"), map[string]string{"Content-Type": "application/xml"}, "application/xml"},
+		{"CustomTemplate_RelativePath", "transform_test.tmpl", nil, ""},
+		{"CustomTemplate_CustomHeaders", filepath.Join(templatePath, "breaker_webhook.json"), map[string]string{"Content-Type": "application/xml"}, "application/xml"},
 	}
 
 	for _, ts := range tests {
@@ -248,20 +528,97 @@ func TestWebhookContentTypeHeader(t *testing.T) {
 				HeaderList:   ts.InputHeaders,
 			}
 
-			hook := &WebHookHandler{}
+			hook := &WebHookHandler{Gw: gw.Gw}
 			if err := hook.Init(conf); err != nil {
 				t.Fatal("Webhook Init failed with err ", err)
 			}
 
 			req, err := hook.BuildRequest("")
-			if err != nil {
-				t.Fatal("Failed to build request with error ", err)
-			}
-
-			if req.Header.Get(headers.ContentType) != ts.ExpectedContentType {
-				t.Fatalf("Expect Content-Type %s. Got %s", ts.ExpectedContentType, req.Header.Get("Content-Type"))
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, ts.ExpectedContentType, req.Header.Get("Content-Type"))
 		})
 	}
 
+}
+
+func TestWebhookTemplateFuncs(t *testing.T) {
+	t.Run("as_RFC3339", func(t *testing.T) {
+		asRFC3339Func := templateFuncAsRFC3339()
+		inputTime := time.Date(2025, 1, 2, 3, 4, 5, 6, time.UTC)
+		expected := "2025-01-02T03:04:05Z"
+		actual := asRFC3339Func(inputTime)
+		assert.Equal(t, expected, actual)
+	})
+
+	t.Run("as_RFC3339_from_string", func(t *testing.T) {
+		asRFC3339FromStringFunc := templateFuncAsRFC3339FromString(tyklog.Get())
+
+		t.Run("invalid time", func(t *testing.T) {
+			input := "2025/01/02 03:04:05"
+			expected := "2025/01/02 03:04:05"
+			assert.Equal(t, expected, asRFC3339FromStringFunc(input))
+		})
+
+		t.Run("valid time", func(t *testing.T) {
+			input := "2025-01-02 03:04:05.999999 +0200 CEST"
+			expected := "2025-01-02T03:04:05+02:00"
+			assert.Equal(t, expected, asRFC3339FromStringFunc(input))
+		})
+	})
+}
+
+func TestWebHookHandler_resolveTemplatePath(t *testing.T) {
+	tests := []struct {
+		name        string
+		allowUnsafe bool
+		rootPath    string
+		path        string
+		want        string
+		wantErr     bool
+	}{
+		{
+			// Flag on: path returned verbatim, template root is never opened.
+			name:        "unsafe flag bypasses validation",
+			allowUnsafe: true,
+			rootPath:    "does-not-exist",
+			path:        "../../etc/passwd",
+			want:        "../../etc/passwd",
+		},
+		{
+			// Flag off: same input is handed to osutil.Root and rejected.
+			name:     "flag off delegates to root validation",
+			rootPath: "templates",
+			path:     "../../etc/passwd",
+			wantErr:  true,
+		},
+		{
+			// Flag off: missing template root surfaces as an error.
+			name:     "flag off requires a valid template root",
+			rootPath: "does-not-exist",
+			path:     "breaker_webhook.json",
+			wantErr:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &Gateway{}
+			gw.SetConfig(config.Config{
+				TemplatePath:                    tc.rootPath,
+				AllowUnsafeWebhookTemplatePaths: tc.allowUnsafe,
+			})
+			h := &WebHookHandler{Gw: gw}
+
+			got, err := h.resolveTemplatePath(tc.path)
+
+			if tc.wantErr {
+				assert.Error(t, err)
+				assert.Empty(t, got)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

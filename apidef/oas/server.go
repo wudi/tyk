@@ -1,0 +1,499 @@
+package oas
+
+import (
+	"github.com/TykTechnologies/tyk/apidef"
+)
+
+// Server contains the configuration that sets Tyk up to receive requests from the client applications.
+type Server struct {
+	// ListenPath is the base path on Tyk to which requests for this API should
+	// be sent. Tyk listens for any requests coming into the host at this
+	// path, on the port that Tyk is configured to run on and processes these
+	// accordingly.
+	ListenPath ListenPath `bson:"listenPath" json:"listenPath"` // required
+
+	// Authentication contains the configurations that manage how clients can authenticate with Tyk to access the API.
+	Authentication *Authentication `bson:"authentication,omitempty" json:"authentication,omitempty"`
+
+	// ClientCertificates contains the configurations related to establishing static mutual TLS between the client and Tyk.
+	ClientCertificates *ClientCertificates `bson:"clientCertificates,omitempty" json:"clientCertificates,omitempty"`
+
+	// GatewayTags contain segment tags to indicate which Gateways your upstream service is connected to (and hence where to deploy the API).
+	GatewayTags *GatewayTags `bson:"gatewayTags,omitempty" json:"gatewayTags,omitempty"`
+
+	// CustomDomain is the domain to bind this API to. This enforces domain matching for client requests.
+	//
+	// Tyk classic API definition: `domain`
+	CustomDomain *Domain `bson:"customDomain,omitempty" json:"customDomain,omitempty"`
+
+	// DetailedActivityLogs configures detailed analytics recording.
+	DetailedActivityLogs *DetailedActivityLogs `bson:"detailedActivityLogs,omitempty" json:"detailedActivityLogs,omitempty"`
+
+	// DetailedTracing enables OpenTelemetry's detailed tracing for this API.
+	//
+	// Tyk classic API definition: `detailed_tracing`
+	DetailedTracing *DetailedTracing `bson:"detailedTracing,omitempty" json:"detailedTracing,omitempty"`
+
+	// MCP contains request-security settings for MCP APIs.
+	MCP *MCP `bson:"mcp,omitempty" json:"mcp,omitempty"`
+
+	// EventHandlers contains the configuration related to Tyk Events.
+	//
+	// Tyk classic API definition: `event_handlers`
+	EventHandlers EventHandlers `bson:"eventHandlers,omitempty" json:"eventHandlers,omitempty"`
+
+	// IPAccessControl configures IP access control for this API.
+	//
+	// Tyk classic API definition: `allowed_ips` and `blacklisted_ips`.
+	IPAccessControl *IPAccessControl `bson:"ipAccessControl,omitempty" json:"ipAccessControl,omitempty"`
+
+	// BatchProcessing contains configuration settings to enable or disable batch request support for the API.
+	//
+	// Tyk classic API definition: `enable_batch_request_support`.
+	BatchProcessing *BatchProcessing `bson:"batchProcessing,omitempty" json:"batchProcessing,omitempty"`
+
+	// Protocol configures the HTTP protocol used by the API.
+	// Possible values are:
+	// - "http": Standard HTTP/1.1 protocol
+	// - "http2": HTTP/2 protocol with TLS
+	// - "h2c": HTTP/2 protocol without TLS (cleartext).
+	//
+	// Tyk classic API definition: `protocol`.
+	Protocol string `bson:"protocol,omitempty" json:"protocol,omitempty"`
+	// Port Setting this value will change the port that Tyk listens on. Default: 8080.
+	//
+	// Tyk classic API definition: `listen_port`.
+	Port int `bson:"port,omitempty" json:"port,omitempty"`
+}
+
+// Fill fills *Server from apidef.APIDefinition.
+func (s *Server) Fill(api apidef.APIDefinition) {
+	s.Protocol = api.Protocol
+	s.Port = api.ListenPort
+
+	s.ListenPath.Fill(api)
+
+	if s.ClientCertificates == nil {
+		s.ClientCertificates = &ClientCertificates{}
+	}
+
+	s.ClientCertificates.Fill(api)
+	if ShouldOmit(s.ClientCertificates) {
+		s.ClientCertificates = nil
+	}
+
+	if s.GatewayTags == nil {
+		s.GatewayTags = &GatewayTags{}
+	}
+	s.GatewayTags.Fill(api)
+	if ShouldOmit(s.GatewayTags) {
+		s.GatewayTags = nil
+	}
+
+	if s.CustomDomain == nil {
+		s.CustomDomain = &Domain{}
+	}
+
+	s.CustomDomain.Fill(api)
+	if ShouldOmit(s.CustomDomain) {
+		s.CustomDomain = nil
+	}
+
+	if s.DetailedActivityLogs == nil {
+		s.DetailedActivityLogs = &DetailedActivityLogs{}
+	}
+
+	s.DetailedActivityLogs.Fill(api)
+	if ShouldOmit(s.DetailedActivityLogs) {
+		s.DetailedActivityLogs = nil
+	}
+
+	if s.DetailedTracing == nil {
+		s.DetailedTracing = &DetailedTracing{}
+	}
+	s.DetailedTracing.Fill(api)
+	if ShouldOmit(s.DetailedTracing) {
+		s.DetailedTracing = nil
+	}
+
+	s.MCP = nil
+	if api.MCP != nil {
+		s.MCP = &MCP{TrustedOrigins: append([]string(nil), api.MCP.TrustedOrigins...)}
+		if api.MCP.OAuthBroker != nil {
+			s.MCP.OAuthBroker = &MCPOAuthBroker{
+				Enabled:                api.MCP.OAuthBroker.Enabled,
+				PublicOrigin:           api.MCP.OAuthBroker.PublicOrigin,
+				PublicResource:         api.MCP.OAuthBroker.PublicResource,
+				UpstreamResource:       api.MCP.OAuthBroker.UpstreamResource,
+				TrustedEndpointOrigins: append([]string(nil), api.MCP.OAuthBroker.TrustedEndpointOrigins...),
+				AllowInsecureLoopback:  api.MCP.OAuthBroker.AllowInsecureLoopback,
+			}
+		}
+	}
+
+	if s.EventHandlers == nil {
+		s.EventHandlers = EventHandlers{}
+	}
+	s.EventHandlers.Fill(api)
+	if ShouldOmit(s.EventHandlers) {
+		s.EventHandlers = nil
+	}
+
+	s.fillIPAccessControl(api)
+	s.fillBatchProcessing(api)
+}
+
+// ExtractTo extracts *Server into *apidef.APIDefinition.
+func (s *Server) ExtractTo(api *apidef.APIDefinition) {
+	api.Protocol = s.Protocol
+	api.ListenPort = s.Port
+	s.ListenPath.ExtractTo(api)
+
+	if s.ClientCertificates == nil {
+		s.ClientCertificates = &ClientCertificates{}
+		defer func() {
+			s.ClientCertificates = nil
+		}()
+	}
+
+	s.ClientCertificates.ExtractTo(api)
+
+	if s.GatewayTags == nil {
+		s.GatewayTags = &GatewayTags{}
+		defer func() {
+			s.GatewayTags = nil
+		}()
+	}
+
+	s.GatewayTags.ExtractTo(api)
+
+	if s.CustomDomain == nil {
+		s.CustomDomain = &Domain{}
+		defer func() {
+			s.CustomDomain = nil
+		}()
+	}
+
+	s.CustomDomain.ExtractTo(api)
+
+	if s.DetailedActivityLogs == nil {
+		s.DetailedActivityLogs = &DetailedActivityLogs{}
+		defer func() {
+			s.DetailedActivityLogs = nil
+		}()
+	}
+
+	s.DetailedActivityLogs.ExtractTo(api)
+
+	if s.DetailedTracing == nil {
+		s.DetailedTracing = &DetailedTracing{}
+		defer func() {
+			s.DetailedTracing = nil
+		}()
+	}
+
+	s.DetailedTracing.ExtractTo(api)
+
+	api.MCP = nil
+	if s.MCP != nil {
+		api.MCP = &apidef.MCPConfig{TrustedOrigins: append([]string(nil), s.MCP.TrustedOrigins...)}
+		if s.MCP.OAuthBroker != nil {
+			api.MCP.OAuthBroker = &apidef.MCPOAuthBrokerConfig{
+				Enabled:                s.MCP.OAuthBroker.Enabled,
+				PublicOrigin:           s.MCP.OAuthBroker.PublicOrigin,
+				PublicResource:         s.MCP.OAuthBroker.PublicResource,
+				UpstreamResource:       s.MCP.OAuthBroker.UpstreamResource,
+				TrustedEndpointOrigins: append([]string(nil), s.MCP.OAuthBroker.TrustedEndpointOrigins...),
+				AllowInsecureLoopback:  s.MCP.OAuthBroker.AllowInsecureLoopback,
+			}
+		}
+	}
+
+	if s.EventHandlers == nil {
+		s.EventHandlers = EventHandlers{}
+		defer func() {
+			s.EventHandlers = nil
+		}()
+	}
+
+	s.EventHandlers.ExtractTo(api)
+
+	s.extractIPAccessControlTo(api)
+	s.extractBatchProcessingTo(api)
+}
+
+// MCP contains MCP request-security settings.
+type MCP struct {
+	// TrustedOrigins contains concrete HTTP(S) origins allowed to send MCP
+	// requests in addition to the API's own externally visible origin.
+	//
+	// Tyk classic API definition: `mcp.trusted_origins`.
+	TrustedOrigins []string `bson:"trustedOrigins,omitempty" json:"trustedOrigins,omitempty"`
+
+	// OAuthBroker configures a Gateway-owned OAuth identity for an MCP mirror.
+	OAuthBroker *MCPOAuthBroker `bson:"oauthBroker,omitempty" json:"oauthBroker,omitempty"`
+}
+
+// MCPOAuthBroker contains the fixed public and upstream identities used by
+// the MCP OAuth authorization broker.
+type MCPOAuthBroker struct {
+	// Enabled activates the Gateway-owned OAuth authorization broker for this MCP mirror.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// PublicOrigin is the fixed externally visible origin used to construct the broker issuer and callback URLs.
+	PublicOrigin string `bson:"publicOrigin,omitempty" json:"publicOrigin,omitempty"`
+	// PublicResource identifies the MCP resource requested by downstream OAuth clients.
+	PublicResource string `bson:"publicResource,omitempty" json:"publicResource,omitempty"`
+	// UpstreamResource identifies the upstream MCP resource used in authorization and token requests.
+	UpstreamResource string `bson:"upstreamResource,omitempty" json:"upstreamResource,omitempty"`
+	// TrustedEndpointOrigins lists additional origins permitted for upstream OAuth endpoints outside the issuer origin.
+	TrustedEndpointOrigins []string `bson:"trustedEndpointOrigins,omitempty" json:"trustedEndpointOrigins,omitempty"`
+	// AllowInsecureLoopback permits HTTP loopback OAuth endpoints for local development.
+	AllowInsecureLoopback bool `bson:"allowInsecureLoopback,omitempty" json:"allowInsecureLoopback,omitempty"`
+}
+
+// ListenPath is the base path on Tyk to which requests for this API
+// should be sent. Tyk listens out for any requests coming into the host at
+// this path, on the port that Tyk is configured to run on and processes
+// these accordingly.
+type ListenPath struct {
+	// Value is the listen path, for example `/api/` or `/`. It must start with
+	// a slash (`/`). Tyk Dashboard rejects a listen path without a leading slash,
+	// and Tyk Gateway adds a missing leading slash when it loads the API.
+	// See [Request Matching](/getting-started/key-concepts/url-matching) for how
+	// Tyk Gateway matches requests to the listen path.
+	//
+	// Tyk classic API definition: `proxy.listen_path`
+	Value string `bson:"value" json:"value"` // required
+
+	// Strip removes the listen path from the request path before Tyk Gateway
+	// forwards the request to the upstream service. See
+	// [Request Forwarding](/planning-for-production/ensure-high-availability/load-balancing#the-upstream-target)
+	// for an example.
+	//
+	// Tyk classic API definition: `proxy.strip_listen_path`
+	Strip bool `bson:"strip,omitempty" json:"strip,omitempty"`
+}
+
+// Fill fills *ListenPath from apidef.APIDefinition.
+func (lp *ListenPath) Fill(api apidef.APIDefinition) {
+	lp.Value = api.Proxy.ListenPath
+	lp.Strip = api.Proxy.StripListenPath
+}
+
+// ExtractTo extracts *ListenPath into *apidef.APIDefinition.
+func (lp *ListenPath) ExtractTo(api *apidef.APIDefinition) {
+	api.Proxy.ListenPath = lp.Value
+	api.Proxy.StripListenPath = lp.Strip
+}
+
+// ClientCertificates contains the configurations related to establishing static mutual TLS between the client and Tyk.
+type ClientCertificates struct {
+	// Enabled activates static mTLS for the API.
+	//
+	// Tyk classic API definition: `use_mutual_tls_auth`.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Allowlist is the list of client certificates which are allowed.
+	//
+	// Tyk classic API definition: `client_certificates`.
+	Allowlist []string `bson:"allowlist" json:"allowlist"`
+}
+
+// Fill fills *ClientCertificates from apidef.APIDefinition.
+func (cc *ClientCertificates) Fill(api apidef.APIDefinition) {
+	cc.Enabled = api.UseMutualTLSAuth
+	cc.Allowlist = api.ClientCertificates
+}
+
+// ExtractTo extracts *ClientCertificates into *apidef.APIDefinition.
+func (cc *ClientCertificates) ExtractTo(api *apidef.APIDefinition) {
+	api.UseMutualTLSAuth = cc.Enabled
+	api.ClientCertificates = cc.Allowlist
+}
+
+// GatewayTags holds a list of segment tags that should apply for a gateway.
+type GatewayTags struct {
+	// Enabled activates use of segment tags.
+	//
+	// Tyk classic API definition: `tags_disabled` (negated).
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Tags contains a list of segment tags.
+	//
+	// Tyk classic API definition: `tags`.
+	Tags []string `bson:"tags" json:"tags"`
+}
+
+// Fill fills *GatewayTags from apidef.APIDefinition.
+func (gt *GatewayTags) Fill(api apidef.APIDefinition) {
+	gt.Enabled = !api.TagsDisabled
+	gt.Tags = api.Tags
+}
+
+// ExtractTo extracts *GatewayTags into *apidef.APIDefinition.
+func (gt *GatewayTags) ExtractTo(api *apidef.APIDefinition) {
+	api.TagsDisabled = !gt.Enabled
+	api.Tags = gt.Tags
+}
+
+// Domain holds the configuration of the domain name the server should listen on.
+type Domain struct {
+	// Enabled allow/disallow the usage of the domain.
+	//
+	// Tyk classic API definition: `domain_disabled` (negated).
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Name is the name of the domain.
+	//
+	// Tyk classic API definition: `domain`.
+	Name string `bson:"name" json:"name"`
+	// Certificates defines a field for specifying certificate IDs or file paths
+	// that the Gateway can utilise to dynamically load certificates for your custom domain.
+	//
+	// Tyk classic API definition: `certificates`
+	Certificates []string `bson:"certificates,omitempty" json:"certificates,omitempty"`
+}
+
+// ExtractTo extracts *Domain into *apidef.APIDefinition.
+func (cd *Domain) ExtractTo(api *apidef.APIDefinition) {
+	api.DomainDisabled = !cd.Enabled
+	api.Domain = cd.Name
+	api.Certificates = cd.Certificates
+}
+
+// Fill fills *Domain from apidef.APIDefinition.
+func (cd *Domain) Fill(api apidef.APIDefinition) {
+	cd.Enabled = !api.DomainDisabled
+	cd.Name = api.Domain
+	cd.Certificates = api.Certificates
+}
+
+// DetailedActivityLogs holds the configuration related to recording detailed analytics.
+type DetailedActivityLogs struct {
+	// Enabled activates detailed activity logs.
+	//
+	// Tyk classic API definition: `enable_detailed_recording`
+	Enabled bool `bson:"enabled" json:"enabled"`
+}
+
+// ExtractTo extracts *DetailedActivityLogs into *apidef.APIDefinition.
+func (d *DetailedActivityLogs) ExtractTo(api *apidef.APIDefinition) {
+	api.EnableDetailedRecording = d.Enabled
+}
+
+// Fill fills *DetailedActivityLogs from apidef.APIDefinition.
+func (d *DetailedActivityLogs) Fill(api apidef.APIDefinition) {
+	d.Enabled = api.EnableDetailedRecording
+}
+
+// DetailedTracing holds the configuration of the detailed tracing.
+type DetailedTracing struct {
+	// Enabled activates detailed tracing.
+	//
+	// Tyk classic API definition: `detailed_tracing`.
+	Enabled bool `bson:"enabled" json:"enabled"`
+}
+
+// Fill fills *DetailedTracing from apidef.APIDefinition.
+func (dt *DetailedTracing) Fill(api apidef.APIDefinition) {
+	dt.Enabled = api.DetailedTracing
+}
+
+// ExtractTo extracts *DetailedTracing into *apidef.APIDefinition.
+func (dt *DetailedTracing) ExtractTo(api *apidef.APIDefinition) {
+	api.DetailedTracing = dt.Enabled
+}
+
+// IPAccessControl represents IP access control configuration.
+type IPAccessControl struct {
+	// Enabled indicates whether IP access control is enabled.
+	//
+	// Tyk classic API definition: `ip_access_control_disabled` (negated).
+	Enabled bool `bson:"enabled" json:"enabled"`
+
+	// Allow is a list of allowed IP addresses or CIDR blocks (e.g. "192.168.1.0/24").
+	// Note that if an IP address is present in both Allow and Block, the Block rule will take precedence.
+	//
+	// Tyk classic API definition: `allowed_ips`.
+	Allow []string `bson:"allow,omitempty" json:"allow,omitempty"`
+
+	// Block is a list of blocked IP addresses or CIDR blocks (e.g. "192.168.1.100/32").
+	// If an IP address is present in both Allow and Block, the Block rule will take precedence.
+	//
+	// Tyk classic API definition: `blacklisted_ips`.
+	Block []string `bson:"block,omitempty" json:"block,omitempty"`
+}
+
+// Fill fills *IPAccessControl from apidef.APIDefinition.
+func (i *IPAccessControl) Fill(api apidef.APIDefinition) {
+	i.Enabled = !api.IPAccessControlDisabled
+	i.Block = api.BlacklistedIPs
+	i.Allow = api.AllowedIPs
+}
+
+// ExtractTo extracts *IPAccessControl into *apidef.APIDefinition.
+func (i *IPAccessControl) ExtractTo(api *apidef.APIDefinition) {
+	api.IPAccessControlDisabled = !i.Enabled
+	api.BlacklistedIPs = i.Block
+	api.AllowedIPs = i.Allow
+}
+
+func (s *Server) fillIPAccessControl(api apidef.APIDefinition) {
+	if s.IPAccessControl == nil {
+		s.IPAccessControl = &IPAccessControl{}
+	}
+
+	s.IPAccessControl.Fill(api)
+	if ShouldOmit(s.IPAccessControl) {
+		s.IPAccessControl = nil
+	}
+}
+
+func (s *Server) extractIPAccessControlTo(api *apidef.APIDefinition) {
+	if s.IPAccessControl == nil {
+		s.IPAccessControl = &IPAccessControl{}
+		defer func() {
+			s.IPAccessControl = nil
+		}()
+	}
+
+	s.IPAccessControl.ExtractTo(api)
+}
+
+// BatchProcessing represents the configuration for enabling or disabling batch request support for an API.
+type BatchProcessing struct {
+	// Enabled determines whether batch request support is enabled or disabled for the API.
+	//
+	// Tyk classic API definition: `enable_batch_request_support`.
+	Enabled bool `bson:"enabled" json:"enabled"` // required
+}
+
+// Fill updates the BatchProcessing configuration based on the EnableBatchRequestSupport value from the given APIDefinition.
+func (b *BatchProcessing) Fill(api apidef.APIDefinition) {
+	b.Enabled = api.EnableBatchRequestSupport
+}
+
+// ExtractTo copies the Enabled state of BatchProcessing into the EnableBatchRequestSupport field of the provided APIDefinition.
+func (b *BatchProcessing) ExtractTo(api *apidef.APIDefinition) {
+	api.EnableBatchRequestSupport = b.Enabled
+}
+
+func (s *Server) fillBatchProcessing(api apidef.APIDefinition) {
+	if s.BatchProcessing == nil {
+		s.BatchProcessing = &BatchProcessing{}
+	}
+
+	s.BatchProcessing.Fill(api)
+
+	if ShouldOmit(s.BatchProcessing) {
+		s.BatchProcessing = nil
+	}
+}
+
+func (s *Server) extractBatchProcessingTo(api *apidef.APIDefinition) {
+	if s.BatchProcessing == nil {
+		s.BatchProcessing = &BatchProcessing{}
+		defer func() {
+			s.BatchProcessing = nil
+		}()
+	}
+
+	s.BatchProcessing.ExtractTo(api)
+}

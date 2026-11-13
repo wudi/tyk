@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"crypto"
 	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha1"
@@ -21,6 +20,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/crypto"
 	"github.com/TykTechnologies/tyk/regexp"
 	"github.com/TykTechnologies/tyk/user"
 )
@@ -30,7 +30,8 @@ const altHeaderSpec = "x-aux-date"
 
 // HTTPSignatureValidationMiddleware will check if the request has a signature, and if the request is allowed through
 type HTTPSignatureValidationMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	lowercasePattern *regexp.Regexp
 }
 
@@ -48,7 +49,7 @@ func (hm *HTTPSignatureValidationMiddleware) Init() {
 
 // getAuthType overrides BaseMiddleware.getAuthType.
 func (hm *HTTPSignatureValidationMiddleware) getAuthType() string {
-	return hmacType
+	return apidef.HMACType
 }
 
 func (hm *HTTPSignatureValidationMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
@@ -60,7 +61,7 @@ func (hm *HTTPSignatureValidationMiddleware) ProcessRequest(w http.ResponseWrite
 	if token == "" {
 		return hm.authorizationError(r)
 	}
-	logger := hm.Logger().WithField("key", obfuscateKey(token))
+	logger := hm.Logger().WithField("key", hm.Gw.obfuscateKey(token))
 
 	// Clean it
 	token = stripSignature(token)
@@ -109,7 +110,7 @@ func (hm *HTTPSignatureValidationMiddleware) ProcessRequest(w http.ResponseWrite
 			return hm.authorizationError(r)
 		}
 
-		publicKey := CertificateManager.ListRawPublicKey(certificateId)
+		publicKey := hm.Gw.CertificateManager.ListRawPublicKey(certificateId)
 		if publicKey == nil {
 			log.Error("Certificate not found")
 			return errors.New("Certificate not found"), http.StatusInternalServerError
@@ -184,8 +185,7 @@ func (hm *HTTPSignatureValidationMiddleware) ProcessRequest(w http.ResponseWrite
 
 		if !matchPass {
 			logger.WithFields(logrus.Fields{
-				"expected": encodedSignature,
-				"got":      fieldValues.Signature,
+				"got": fieldValues.Signature,
 			}).Error("Signature string does not match!")
 			return hm.authorizationError(r)
 		}
@@ -201,7 +201,8 @@ func (hm *HTTPSignatureValidationMiddleware) ProcessRequest(w http.ResponseWrite
 	// Set session state on context, we will need it later
 	switch hm.Spec.BaseIdentityProvidedBy {
 	case apidef.HMACKey, apidef.UnsetAuth:
-		ctxSetSession(r, &session, fieldValues.KeyID, false)
+		session.KeyID = fieldValues.KeyID
+		ctxSetSession(r, &session, false, hm.Gw.GetConfig().HashKeys)
 		hm.setContextVars(r, fieldValues.KeyID)
 	}
 
@@ -294,31 +295,33 @@ type HMACFieldValues struct {
 
 func (hm *HTTPSignatureValidationMiddleware) getSecretAndSessionForKeyID(r *http.Request, keyId string) (string, user.SessionState, error) {
 	session, keyExists := hm.CheckSessionAndIdentityForValidKey(keyId, r)
+	keyId = session.KeyID
 	if !keyExists {
-		return "", session, errors.New("Key ID does not exist")
+		return "", session.Clone(), errors.New("Key ID does not exist")
 	}
 
 	if session.HmacSecret == "" || !session.HMACEnabled && !session.EnableHTTPSignatureValidation {
 		hm.Logger().Info("API Requires HMAC signature, session missing HMACSecret or HMAC not enabled for key")
 
-		return "", session, errors.New("This key ID is invalid")
+		return "", session.Clone(), errors.New("This key ID is invalid")
 	}
 
-	return session.HmacSecret, session, nil
+	return session.HmacSecret, session.Clone(), nil
 }
 
 func (hm *HTTPSignatureValidationMiddleware) getRSACertificateIdAndSessionForKeyID(r *http.Request, keyId string) (string, user.SessionState, error) {
 	session, keyExists := hm.CheckSessionAndIdentityForValidKey(keyId, r)
+	keyId = session.KeyID
 	if !keyExists {
-		return "", session, errors.New("Key ID does not exist")
+		return "", session.Clone(), errors.New("Key ID does not exist")
 	}
 
 	if session.RSACertificateId == "" || !session.EnableHTTPSignatureValidation {
 		hm.Logger().Info("API Requires RSA signature, session missing RSA Certificate Id or RSA not enabled for key")
-		return "", session, errors.New("This key ID is invalid")
+		return "", session.Clone(), errors.New("This key ID is invalid")
 	}
 
-	return session.RSACertificateId, session, nil
+	return session.RSACertificateId, session.Clone(), nil
 }
 
 func getDateHeader(r *http.Request) (string, string) {

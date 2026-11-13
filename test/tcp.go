@@ -39,6 +39,7 @@ func (r TCPTestRunner) Run(t testing.TB, testCases ...TCPTestCase) error {
 			r.TLSClientConfig = &tls.Config{
 				ServerName:         r.Hostname,
 				InsecureSkipVerify: true,
+				MaxVersion:         tls.VersionTLS12,
 			}
 		}
 		client, err = tls.Dial("tcp", r.Target, r.TLSClientConfig)
@@ -72,17 +73,14 @@ func (r TCPTestRunner) Run(t testing.TB, testCases ...TCPTestCase) error {
 		if tc.ErrorMatch != "" {
 			if err == nil {
 				t.Fatalf("[%d] Expected error: %s", ti, tc.ErrorMatch)
-				break
 			}
 
 			if !strings.Contains(err.Error(), tc.ErrorMatch) {
 				t.Fatalf("[%d] Expected error %s, got %s", ti, err.Error(), tc.ErrorMatch)
-				break
 			}
 		} else {
 			if err != nil {
 				t.Fatalf("[%d] Unexpected error: %s", ti, err.Error())
-				break
 			}
 		}
 	}
@@ -97,6 +95,7 @@ func TcpMock(useSSL bool, cb func(in []byte, err error) (out []byte)) net.Listen
 		tlsConfig := &tls.Config{
 			Certificates:       []tls.Certificate{Cert("localhost")},
 			InsecureSkipVerify: true,
+			MaxVersion:         tls.VersionTLS12,
 		}
 		tlsConfig.BuildNameToCertificate()
 		l, _ = tls.Listen("tcp", ":0", tlsConfig)
@@ -135,7 +134,8 @@ func TcpMock(useSSL bool, cb func(in []byte, err error) (out []byte)) net.Listen
 
 // Generate cert
 func Cert(domain string) tls.Certificate {
-	private, _ := rsa.GenerateKey(rand.Reader, 512)
+	// crypto/rsa: 512-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)
+	private, _ := rsa.GenerateKey(rand.Reader, 2048)
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{

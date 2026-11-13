@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -14,30 +15,59 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/headers"
+	"github.com/TykTechnologies/tyk/header"
 	"github.com/TykTechnologies/tyk/user"
 )
 
+const (
+	msgBodyTransformed = "Body transformed"
+	// msgTemplateExecutionFailed is deliberately generic so a rejected template
+	// path gives no hint about the filesystem.
+	msgTemplateExecutionFailed   = "Template execution failed"
+	msgTemplateCompilationFailed = "Template compilation failed"
+)
+
+var (
+	ErrResponseSizeLimitExceeded = errors.New("response body size exceeded the allowed limit")
+)
+
 type ResponseTransformMiddleware struct {
-	Spec *APISpec
+	BaseTykResponseHandler
 }
 
-func (ResponseTransformMiddleware) Name() string {
+func (r *ResponseTransformMiddleware) Base() *BaseTykResponseHandler {
+	return &r.BaseTykResponseHandler
+}
+
+func (r *ResponseTransformMiddleware) Enabled() bool {
+	for _, version := range r.Spec.VersionData.Versions {
+		if len(version.ExtendedPaths.TransformResponse) > 0 {
+			for _, transformResponse := range version.ExtendedPaths.TransformResponse {
+				if !transformResponse.Disabled {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (r *ResponseTransformMiddleware) Name() string {
 	return "ResponseTransformMiddleware"
 }
 
-func (h *ResponseTransformMiddleware) Init(c interface{}, spec *APISpec) error {
-	h.Spec = spec
+func (r *ResponseTransformMiddleware) Init(c interface{}, spec *APISpec) error {
+	r.Spec = spec
 	return nil
 }
 
 func respBodyReader(req *http.Request, resp *http.Response) io.ReadCloser {
 
-	if req.Header.Get(headers.AcceptEncoding) == "" {
+	if req.Header.Get(header.AcceptEncoding) == "" {
 		return resp.Body
 	}
 
-	switch resp.Header.Get(headers.ContentEncoding) {
+	switch resp.Header.Get(header.ContentEncoding) {
 	case "gzip":
 		reader, err := gzip.NewReader(resp.Body)
 		if err != nil {
@@ -76,28 +106,38 @@ func compressBuffer(in bytes.Buffer, encoding string) (out bytes.Buffer) {
 	return out
 }
 
-func (h *ResponseTransformMiddleware) HandleError(rw http.ResponseWriter, req *http.Request) {
+func (r *ResponseTransformMiddleware) HandleError(rw http.ResponseWriter, req *http.Request) {
 }
 
-func (h *ResponseTransformMiddleware) HandleResponse(rw http.ResponseWriter, res *http.Response, req *http.Request, ses *user.SessionState) error {
-
-	logger := log.WithFields(logrus.Fields{
+func (r *ResponseTransformMiddleware) HandleResponse(rw http.ResponseWriter, res *http.Response, req *http.Request, ses *user.SessionState) error {
+	logger := r.logger().WithFields(logrus.Fields{
 		"prefix":      "outbound-transform",
-		"server_name": h.Spec.Proxy.TargetURL,
-		"api_id":      h.Spec.APIID,
+		"server_name": r.Spec.Proxy.TargetURL,
+		"api_id":      r.Spec.APIID,
 		"path":        req.URL.Path,
 	})
 
-	_, versionPaths, _, _ := h.Spec.Version(req)
-	found, meta := h.Spec.CheckSpecMatchesStatus(req, versionPaths, TransformedResponse)
+	versionInfo, _ := r.Spec.Version(req)
+	versionPaths := r.Spec.RxPaths[versionInfo.Name]
+	found, meta := r.Spec.CheckSpecMatchesStatus(req, versionPaths, TransformedResponse)
+
 	if !found {
+		logger.Warning("CheckSpecMatchesStatus not found. Transformation stopped.")
 		return nil
 	}
 	tmeta := meta.(*TransformSpec)
 
 	respBody := respBodyReader(req, res)
-	body, _ := ioutil.ReadAll(respBody)
 	defer respBody.Close()
+
+	body, err := r.GetResponseBody(respBody, logger)
+	if err != nil {
+		if errors.Is(err, ErrResponseSizeLimitExceeded) {
+			r.handleError(rw, req, http.StatusInternalServerError, "Response body too large")
+		}
+
+		return err
+	}
 
 	// Put into an interface:
 	bodyData := make(map[string]interface{})
@@ -139,7 +179,7 @@ func (h *ResponseTransformMiddleware) HandleResponse(rw http.ResponseWriter, res
 		}
 	}
 
-	if h.Spec.EnableContextVars {
+	if r.Spec.EnableContextVars {
 		bodyData["_tyk_context"] = ctxGetData(req)
 	}
 
@@ -151,11 +191,23 @@ func (h *ResponseTransformMiddleware) HandleResponse(rw http.ResponseWriter, res
 		}
 	}
 
+	tpl, err := tmeta.Template.Get()
+	if err != nil {
+		logger.WithError(err).Error("Body transform failure")
+		code, msg := templateLoadFailure(err)
+		r.handleError(rw, req, code, msg)
+		return err
+	}
+
 	// Apply to template
 	var bodyBuffer bytes.Buffer
-	if err := tmeta.Template.Execute(&bodyBuffer, bodyData); err != nil {
+	if err := tpl.Execute(&bodyBuffer, bodyData); err != nil {
 		logger.WithError(err).Error("Failed to apply template to request")
+		r.handleError(rw, req, http.StatusInternalServerError, msgTemplateExecutionFailed)
+		return err
 	}
+
+	logger.Debugf("%s", msgBodyTransformed)
 
 	// Re-compress if original upstream response was compressed
 	encoding := res.Header.Get("Content-Encoding")
@@ -166,4 +218,46 @@ func (h *ResponseTransformMiddleware) HandleResponse(rw http.ResponseWriter, res
 	res.Body = ioutil.NopCloser(&bodyBuffer)
 
 	return nil
+}
+
+// GetResponseBody reads the response body with size limit enforcement
+// and returns an error if the body exceeds the configured maximum size.
+func (r *ResponseTransformMiddleware) GetResponseBody(respBody io.Reader, logger *logrus.Entry) ([]byte, error) {
+	var reader = respBody
+	maxSize := r.Gw.GetConfig().HttpServerOptions.MaxResponseBodySize
+	if maxSize > 0 {
+		reader = io.LimitReader(respBody, maxSize+1)
+	}
+
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		logger.WithError(err).Error("Error reading response body")
+
+		return nil, err
+	}
+
+	if maxSize > 0 && int64(len(body)) > maxSize {
+		logger.WithFields(logrus.Fields{
+			"max_size": maxSize,
+		}).Error("Response body exceeded maximum size limit")
+
+		return nil, ErrResponseSizeLimitExceeded
+	}
+
+	return body, nil
+}
+
+func (r *ResponseTransformMiddleware) handleError(rw http.ResponseWriter, req *http.Request, code int, message string) {
+	handler := ErrorHandler{&BaseMiddleware{Spec: r.Spec, Gw: r.Gw}}
+	handler.HandleError(rw, req, message, code, true)
+}
+
+// templateLoadFailure maps a template load error to the client status and message.
+// A rejected template path keeps the 400 shipped in v5.16.0 (TT-6554).
+func templateLoadFailure(err error) (int, string) {
+	if errors.Is(err, errUnsafeTemplatePath) {
+		return http.StatusBadRequest, msgTemplateExecutionFailed
+	}
+
+	return http.StatusInternalServerError, msgTemplateCompilationFailed
 }

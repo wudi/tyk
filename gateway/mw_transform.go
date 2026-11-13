@@ -3,10 +3,12 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
+	texttemplate "text/template"
 
 	"github.com/clbanning/mxj"
 	"golang.org/x/net/html/charset"
@@ -20,11 +22,11 @@ func WrappedCharsetReader(s string, i io.Reader) (io.Reader, error) {
 
 // TransformMiddleware is a middleware that will apply a template to a request body to transform it's contents ready for an upstream API
 type TransformMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (t *TransformMiddleware) Name() string {
-	return "TransformMiddleware"
+	return "RequestTransformMiddleware"
 }
 
 func (t *TransformMiddleware) EnabledForSpec() bool {
@@ -37,27 +39,48 @@ func (t *TransformMiddleware) EnabledForSpec() bool {
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
-func (t *TransformMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	_, versionPaths, _, _ := t.Spec.Version(r)
+//
+//nolint:staticcheck
+func (t *TransformMiddleware) ProcessRequest(_ http.ResponseWriter, r *http.Request, _ any) (error, int) {
+	vInfo, _ := t.Spec.Version(r)
+	versionPaths := t.Spec.RxPaths[vInfo.Name]
 	found, meta := t.Spec.CheckSpecMatchesStatus(r, versionPaths, Transformed)
+
 	if !found {
 		return nil, http.StatusOK
 	}
-	err := transformBody(r, meta.(*TransformSpec), t.Spec.EnableContextVars)
+
+	tMeta, ok := meta.(*TransformSpec)
+	if !ok {
+		t.Logger().Error("Invalid casting")
+		return errors.New("internal server error"), http.StatusInternalServerError
+	}
+
+	tpl, err := tMeta.Template.Get()
 	if err != nil {
 		t.Logger().WithError(err).Error("Body transform failure")
+		code, msg := templateLoadFailure(err)
+		return errors.New(msg), code
 	}
+
+	if err := t.transformBody(r, tMeta, tpl); err != nil {
+		t.Logger().WithError(err).Error("Body transform failure")
+		return errors.New(msgTemplateExecutionFailed), http.StatusInternalServerError
+	}
+
+	t.Logger().Debugf("%s", msgBodyTransformed)
+
 	return nil, http.StatusOK
 }
 
-func transformBody(r *http.Request, tmeta *TransformSpec, contextVars bool) error {
+func (t *TransformMiddleware) transformBody(r *http.Request, meta *TransformSpec, tpl *texttemplate.Template) error {
 	body, _ := ioutil.ReadAll(r.Body)
 	defer r.Body.Close()
 
 	// Put into an interface:
 	bodyData := make(map[string]interface{})
 
-	switch tmeta.TemplateData.Input {
+	switch meta.TemplateData.Input {
 	case apidef.RequestXML:
 		if len(body) == 0 {
 			body = []byte("<_/>")
@@ -66,7 +89,7 @@ func transformBody(r *http.Request, tmeta *TransformSpec, contextVars bool) erro
 		var err error
 		bodyData, err = mxj.NewMapXml(body) // unmarshal
 		if err != nil {
-			return fmt.Errorf("error unmarshalling XML: %v", err)
+			return fmt.Errorf("error unmarshalling XML: %w", err)
 		}
 	case apidef.RequestJSON:
 		if len(body) == 0 {
@@ -85,10 +108,10 @@ func transformBody(r *http.Request, tmeta *TransformSpec, contextVars bool) erro
 			bodyData = tempBody.(map[string]interface{})
 		}
 	default:
-		return fmt.Errorf("unsupported request input type: %v", tmeta.TemplateData.Input)
+		return fmt.Errorf("unsupported request input type: %v", meta.TemplateData.Input)
 	}
 
-	if tmeta.TemplateData.EnableSession {
+	if meta.TemplateData.EnableSession {
 		if session := ctxGetSession(r); session != nil {
 			bodyData["_tyk_meta"] = session.MetaData
 		} else {
@@ -96,21 +119,21 @@ func transformBody(r *http.Request, tmeta *TransformSpec, contextVars bool) erro
 		}
 	}
 
-	if contextVars {
+	if t.Spec.EnableContextVars {
 		bodyData["_tyk_context"] = ctxGetData(r)
 	}
 
 	// Apply to template
 	var bodyBuffer bytes.Buffer
-	if err := tmeta.Template.Execute(&bodyBuffer, bodyData); err != nil {
-		return fmt.Errorf("failed to apply template to request: %v", err)
+	if err := tpl.Execute(&bodyBuffer, bodyData); err != nil {
+		return fmt.Errorf("failed to apply template to request: %w", err)
 	}
 
-	s := replaceTykVariables(r, bodyBuffer.String(), true)
+	s := t.Gw.ReplaceTykVariables(r, bodyBuffer.String(), true)
 
 	newBuf := bytes.NewBufferString(s)
 
-	r.Body = ioutil.NopCloser(newBuf)
+	r.Body = io.NopCloser(newBuf)
 
 	r.ContentLength = int64(newBuf.Len())
 	nopCloseRequestBody(r)

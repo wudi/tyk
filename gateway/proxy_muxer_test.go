@@ -3,21 +3,81 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/TykTechnologies/tyk/test"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/TykTechnologies/tyk/config"
+	tyklog "github.com/TykTechnologies/tyk/log"
+	"github.com/TykTechnologies/tyk/test"
 )
 
+func Test_handleRequestLimits(t *testing.T) {
+	t.Parallel()
+
+	testcases := []struct {
+		input  io.Reader
+		method string
+		want   int
+	}{
+		{
+			method: http.MethodGet,
+			input:  nil,
+			want:   http.StatusOK,
+		},
+		{
+			method: http.MethodDelete,
+			input:  nil,
+			want:   http.StatusOK,
+		},
+		{
+			method: http.MethodPost,
+			input:  strings.NewReader("tit petric"),
+			want:   http.StatusOK,
+		},
+		{
+			method: http.MethodPost,
+			input:  strings.NewReader("lorem ipsum dolor sit amet"),
+			want:   http.StatusRequestEntityTooLarge,
+		},
+	}
+
+	for index, testcase := range testcases {
+		testcase := testcase
+		t.Run(fmt.Sprintf("Test #%v", index), func(t *testing.T) {
+			t.Parallel()
+
+			// Create a test request with a request body larger than the limit
+			req := httptest.NewRequest(testcase.method, "/test", testcase.input)
+			req.ContentLength = 0
+
+			// Create a test response recorder
+			w := httptest.NewRecorder()
+
+			handler := &handleWrapper{
+				maxRequestBodySize: 10,
+			}
+			handler.ServeHTTP(w, req)
+
+			// Check the response status code
+			assert.Equal(t, testcase.want, w.Result().StatusCode)
+		})
+	}
+}
+
 func TestTCPDial_with_service_discovery(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	service1, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -78,8 +138,7 @@ func TestTCPDial_with_service_discovery(t *testing.T) {
 		})
 	}))
 	defer sds.Close()
-	ts := StartTest()
-	defer ts.Close()
+
 	rp, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -92,11 +151,10 @@ func TestTCPDial_with_service_discovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	EnablePort(p, "tcp")
-	defer ResetTestConfig()
+	ts.EnablePort(p, "tcp")
 	address := rp.Addr().String()
 	rp.Close()
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 		spec.Protocol = "tcp"
 		spec.Proxy.ServiceDiscovery.UseDiscoveryService = true
@@ -129,9 +187,7 @@ func TestTCPDial_with_service_discovery(t *testing.T) {
 		return string(buf)
 	}
 	for i := 0; i < 4; i++ {
-		if ServiceCache != nil {
-			ServiceCache.Flush()
-		}
+		ts.Gw.ServiceCache.Flush()
 		result = append(result, dial())
 	}
 	expect := []string{"service2", "service1", "service2", "service1"}
@@ -141,15 +197,15 @@ func TestTCPDial_with_service_discovery(t *testing.T) {
 }
 
 func TestTCP_missing_port(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Name = "no -listen-port"
 		spec.Protocol = "tcp"
 	})
-	apisMu.RLock()
-	n := len(apiSpecs)
-	apisMu.RUnlock()
+	ts.Gw.apisMu.RLock()
+	n := len(ts.Gw.apiSpecs)
+	ts.Gw.apisMu.RUnlock()
 	if n != 0 {
 		t.Errorf("expected 0 apis to be loaded got %d", n)
 	}
@@ -174,7 +230,10 @@ func getUnusedPort() (int, error) {
 }
 
 func TestCheckPortWhiteList(t *testing.T) {
-	base := config.Global()
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	base := ts.Gw.GetConfig()
 	cases := []struct {
 		name     string
 		protocol string
@@ -258,7 +317,7 @@ func TestCheckPortWhiteList(t *testing.T) {
 }
 
 func TestHTTP_custom_ports(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 	echo := "Hello, world"
 	us := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -269,8 +328,8 @@ func TestHTTP_custom_ports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	EnablePort(port, "http")
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.EnablePort(port, "http")
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 		spec.Protocol = "http"
 		spec.ListenPort = port
@@ -293,10 +352,10 @@ func TestHTTP_custom_ports(t *testing.T) {
 }
 
 func TestHandle404(t *testing.T) {
-	g := StartTest()
+	g := StartTest(nil)
 	defer g.Close()
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	g.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/existing"
 		spec.UseKeylessAccess = true
 	})
@@ -304,5 +363,105 @@ func TestHandle404(t *testing.T) {
 	_, _ = g.Run(t, []test.TestCase{
 		{Path: "/existing", Code: http.StatusOK},
 		{Path: "/nonexisting", Code: http.StatusNotFound, BodyMatch: http.StatusText(http.StatusNotFound)},
+	}...)
+
+	t.Run("check logger entry for different formatters when 404 occurs", func(t *testing.T) {
+		formatters := []tyklog.Format{tyklog.FormatLegacy, tyklog.FormatJson}
+		testReq := httptest.NewRequest(http.MethodGet, "/testLogger", nil)
+
+		for _, formatter := range formatters {
+			lgr := tyklog.New()
+			lgr.Setup(func(b *tyklog.Builder) {
+				b.SetLogformat(formatter)
+			})
+			entry := getLogEntryFor404(lgr, testReq)
+
+			for _, field := range []string{"request", "origin", "host"} {
+				if formatter == tyklog.FormatLegacy && field == "host" {
+					_, ok := entry.Data[field]
+					assert.False(t, ok)
+				} else {
+					_, ok := entry.Data[field]
+					assert.True(t, ok)
+				}
+			}
+		}
+	})
+}
+
+func TestHandleSubroutes(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+	})
+	defer ts.Close()
+
+	ts.Gw.BuildAndLoadAPI(
+		func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/"
+			spec.UseKeylessAccess = false
+		},
+		func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/apple"
+			spec.UseKeylessAccess = true
+		},
+		func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/apple/bottom"
+			spec.UseKeylessAccess = false
+		},
+		func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/bob/{name:.*}"
+			spec.UseKeylessAccess = true
+		},
+		func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/charlie/{name:.*}/suffix"
+			spec.UseKeylessAccess = true
+		},
+	)
+	_, _ = ts.Run(t, []test.TestCase{
+		{Path: "/", Code: http.StatusUnauthorized},
+		{Path: "/app", Code: http.StatusUnauthorized},
+		{Path: "/apple", Code: http.StatusOK},
+		{Path: "/apple/", Code: http.StatusOK},
+		{Path: "/apple/bot", Code: http.StatusOK},
+		{Path: "/apple/bottom", Code: http.StatusUnauthorized},
+		{Path: "/apple/bottom/", Code: http.StatusUnauthorized},
+		{Path: "/apple/bottom/jeans", Code: http.StatusUnauthorized},
+		{Path: "/applebottomjeans", Code: http.StatusNotFound, BodyMatch: http.StatusText(http.StatusNotFound)},
+		{Path: "/apple-bottom-jeans", Code: http.StatusNotFound, BodyMatch: http.StatusText(http.StatusNotFound)},
+		{Path: "/apple/bottom-jeans", Code: http.StatusNotFound, BodyMatch: http.StatusText(http.StatusNotFound)},
+		{Path: "/bob", Code: http.StatusUnauthorized},
+		{Path: "/bob/", Code: http.StatusOK},
+		{Path: "/bob/name", Code: http.StatusOK},
+		{Path: "/bob/name/surname", Code: http.StatusOK},
+		{Path: "/bob/name/patronym/surname", Code: http.StatusOK},
+
+		// This one is a particular re2/gorilla implementation detail,
+		// the .* regex should match "", and .+ should match length >= 1.
+		// The reality doesn't reflect the route definition.
+		{Path: "/charlie//suffix/", Code: http.StatusUnauthorized},
+
+		// Regex paths will behave as they did before
+		{Path: "/charlie/name/suffix", Code: http.StatusOK},
+		{Path: "/charlie/name/suffix/", Code: http.StatusOK},
+		{Path: "/charlie/name/suffix/foo", Code: http.StatusOK},
+		{Path: "/charlie/name/suffixfoo", Code: http.StatusOK},
+		{Path: "/charlie/name/name/suffix/foo", Code: http.StatusOK},
+		{Path: "/charlie/name/name/name/suffix/foo", Code: http.StatusOK},
+	}...)
+}
+
+func TestRequestBodyLimit(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HttpServerOptions.MaxRequestBodySize = 1024
+	})
+	defer ts.Close()
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.UseKeylessAccess = true
+	})
+
+	_, _ = ts.Run(t, []test.TestCase{
+		{Path: "/sample/", Method: "POST", Data: strings.Repeat("a", 1024), Code: http.StatusOK},
+		{Path: "/sample/", Method: "POST", Data: strings.Repeat("a", 1025), Code: http.StatusRequestEntityTooLarge},
 	}...)
 }

@@ -1,0 +1,36 @@
+# Keep the branch on tyk-analytics in sync with this branch
+
+name: Update tyk-analytics branch
+
+on:
+  push:
+    branches:
+      - master
+      - release-**
+      - integration/**
+
+jobs:
+  sync:
+    name: tyk-analytics
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.PROBE_APP_ID }}
+          private-key: ${{ secrets.PROBE_APP_PRIVATE_KEY }}
+          owner: TykTechnologies
+
+      - uses: peter-evans/repository-dispatch@ce5485de42c9b2622d2ed064be479e8ed65e76f4  # v1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: TykTechnologies/tyk-analytics
+          event-type: new-tyk
+          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
+      - uses: peter-evans/repository-dispatch@ce5485de42c9b2622d2ed064be479e8ed65e76f4  # v1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: TykTechnologies/tyk-sink
+          event-type: new-tyk
+          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'

@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"sync"
 
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/sirupsen/logrus"
 
 	"github.com/TykTechnologies/openid2go/openid"
@@ -19,7 +19,8 @@ import (
 const OIDPREFIX = "openid"
 
 type OpenIDMW struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	providerConfiguration     *openid.Configuration
 	provider_client_policymap map[string]map[string]string
 	lock                      sync.RWMutex
@@ -30,6 +31,10 @@ func (k *OpenIDMW) Name() string {
 }
 
 func (k *OpenIDMW) EnabledForSpec() bool {
+	if k.Spec.UseOpenID {
+		log.Warn("Support for OpenID Connect Middleware will be deprecated starting from 5.7.0. To avoid any disruptions, we recommend that you use JSON Web Token (JWT) instead, as explained in https://tyk.io/docs/basic-config-and-security/security/authentication-authorization/openid-connect/")
+	}
+
 	return k.Spec.UseOpenID
 }
 
@@ -92,7 +97,7 @@ func (k *OpenIDMW) dummyErrorHandler(e error, w http.ResponseWriter, r *http.Req
 }
 
 func (k *OpenIDMW) getAuthType() string {
-	return oidcType
+	return apidef.OIDCType
 }
 
 func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
@@ -127,7 +132,7 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 	}
 
 	// decide if we use policy ID from provider client settings or list of policies from scope-policy mapping
-	useScope := len(k.Spec.JWTScopeToPolicyMapping) != 0
+	useScope := len(k.Spec.GetScopeToPolicyMapping()) != 0
 
 	k.lock.RLock()
 	clientSet, foundIssuer := k.provider_client_policymap[iss.(string)]
@@ -167,12 +172,12 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 
 	data := []byte(ouser.ID)
 	keyID := fmt.Sprintf("%x", md5.Sum(data))
-	sessionID := generateToken(k.Spec.OrgID, keyID)
+	sessionID := k.Gw.generateToken(k.Spec.OrgID, keyID)
 
 	if k.Spec.OpenIDOptions.SegregateByClient {
 		// We are segregating by client, so use it as part of the internal token
 		logger.Debug("Client ID:", clientID)
-		sessionID = generateToken(k.Spec.OrgID, fmt.Sprintf("%x", md5.Sum([]byte(clientID)))+keyID)
+		sessionID = k.Gw.generateToken(k.Spec.OrgID, fmt.Sprintf("%x", md5.Sum([]byte(clientID)))+keyID)
 	}
 
 	logger.Debug("Generated Session ID: ", sessionID)
@@ -181,18 +186,19 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 	if !useScope {
 		policiesToApply = append(policiesToApply, policyID)
 	} else {
-		scopeClaimName := k.Spec.JWTScopeClaimName
+		scopeClaimName := k.Spec.GetScopeClaimName()
 		if scopeClaimName == "" {
 			scopeClaimName = "scope"
 		}
 
 		if scope := getScopeFromClaim(token.Claims.(jwt.MapClaims), scopeClaimName); scope != nil {
 			// add all policies matched from scope-policy mapping
-			policiesToApply = mapScopeToPolicies(k.Spec.JWTScopeToPolicyMapping, scope)
+			policiesToApply = mapScopeToPolicies(k.Spec.GetScopeToPolicyMapping(), scope, log.AsLogrus())
 		}
 	}
 
 	session, exists := k.CheckSessionAndIdentityForValidKey(sessionID, r)
+	sessionID = session.KeyID
 	if !exists {
 		// Create it
 		logger.Debug("Key does not exist, creating")
@@ -200,7 +206,7 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 
 		if !useScope {
 			// We need a base policy as a template, either get it from the token itself OR a proxy client ID within Tyk
-			newSession, err := generateSessionFromPolicy(policyID,
+			newSession, err := k.Gw.generateSessionFromPolicy(policyID,
 				k.Spec.OrgID,
 				true)
 
@@ -210,12 +216,13 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 				return errors.New("Key not authorized: no matching policy"), http.StatusForbidden
 			}
 
-			session = newSession
+			session = newSession.Clone()
 		}
 
 		session.OrgID = k.Spec.OrgID
 		session.MetaData = map[string]interface{}{"TykJWTSessionID": sessionID, "ClientID": clientID}
 		session.Alias = clientID + ":" + ouser.ID
+		session.KeyID = sessionID
 
 		// Update the session in the session manager in case it gets called again
 		logger.Debug("Policy applied to key")
@@ -230,7 +237,7 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 	// 4. Set session state on context, we will need it later
 	switch k.Spec.BaseIdentityProvidedBy {
 	case apidef.OIDCUser, apidef.UnsetAuth:
-		ctxSetSession(r, &session, sessionID, true)
+		ctxSetSession(r, &session, true, k.Gw.GetConfig().HashKeys)
 	}
 	ctxSetJWTContextVars(k.Spec, r, token)
 
@@ -239,7 +246,7 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 
 func (k *OpenIDMW) reportLoginFailure(tykId string, r *http.Request) {
 	k.Logger().WithFields(logrus.Fields{
-		"key": obfuscateKey(tykId),
+		"key": k.Gw.obfuscateKey(tykId),
 	}).Warning("Attempted access with invalid key.")
 
 	// Fire Authfailed Event

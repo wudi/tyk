@@ -6,11 +6,21 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/url"
+	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/TykTechnologies/tyk/internal/redis"
+
+	"github.com/TykTechnologies/tyk/config"
 
 	"fmt"
 
@@ -19,10 +29,10 @@ import (
 	"time"
 
 	"github.com/lonelycode/osin"
-	uuid "github.com/satori/go.uuid"
+
+	"github.com/TykTechnologies/tyk/internal/uuid"
 
 	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/config"
 	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
@@ -38,7 +48,7 @@ const (
 const keyRules = `{
 	"last_check": 1402492859,
 	"org_id": "53ac07777cbb8c2d53000002",
-	"rate": 1,
+	"rate": 3,
 	"per": 1,
 	"quota_max": -1,
 	"quota_renews": 1399567002,
@@ -49,7 +59,7 @@ const keyRules = `{
 const keyRulesWithMetadata = `{
 	"last_check": 1402492859,
 	"org_id": "53ac07777cbb8c2d53000002",
-	"rate": 1,
+	"rate": 3,
 	"per": 1,
 	"quota_max": -1,
 	"quota_renews": 1399567002,
@@ -108,12 +118,13 @@ func buildTestOAuthSpec(apiGens ...func(spec *APISpec)) *APISpec {
 	})[0]
 }
 
-func loadTestOAuthSpec() *APISpec {
-	return LoadAPI(buildTestOAuthSpec())[0]
+func (s *Test) LoadTestOAuthSpec() *APISpec {
+	return s.Gw.LoadAPI(buildTestOAuthSpec())[0]
 }
 
-func createTestOAuthClient(spec *APISpec, clientID string) {
-	pID := CreatePolicy(func(p *user.Policy) {
+func (ts *Test) createTestOAuthClient(spec *APISpec, clientID string) OAuthClient {
+
+	pID := ts.CreatePolicy(func(p *user.Policy) {
 		p.ID = "TEST-4321"
 		p.AccessRights = map[string]user.AccessDefinition{
 			"test": {
@@ -127,12 +138,12 @@ func createTestOAuthClient(spec *APISpec, clientID string) {
 
 	var redirectURI string
 	// If separator is not set that means multiple redirect uris not supported
-	if config.Global().OauthRedirectUriSeparator == "" {
+	if ts.Gw.GetConfig().OauthRedirectUriSeparator == "" {
 		redirectURI = "http://client.oauth.com"
 
 		// If separator config is set that means multiple redirect uris are supported
 	} else {
-		redirectURI = strings.Join([]string{"http://client.oauth.com", "http://client2.oauth.com", "http://client3.oauth.com"}, config.Global().OauthRedirectUriSeparator)
+		redirectURI = strings.Join([]string{"http://client.oauth.com", "http://client2.oauth.com", "http://client3.oauth.com"}, ts.Gw.GetConfig().OauthRedirectUriSeparator)
 	}
 	testClient := OAuthClient{
 		ClientID:          clientID,
@@ -141,11 +152,47 @@ func createTestOAuthClient(spec *APISpec, clientID string) {
 		PolicyID:          pID,
 		MetaData:          map[string]interface{}{"foo": "bar", "client": "meta"},
 	}
-	spec.OAuthManager.OsinServer.Storage.SetClient(testClient.ClientID, "org-id-1", &testClient, false)
+	spec.OAuthManager.Storage().SetClient(testClient.ClientID, "org-id-1", &testClient, false)
+	return testClient
+}
+
+func (ts *Test) createOAuthClientIDAndTokens(t *testing.T, spec *APISpec, clientID string) {
+	t.Helper()
+	ts.createTestOAuthClient(spec, clientID)
+
+	param := make(url.Values)
+	param.Set("response_type", "token")
+	param.Set("redirect_uri", authRedirectUri)
+	param.Set("client_id", clientID)
+	param.Set("client_secret", authClientSecret)
+	param.Set("key_rules", keyRules)
+
+	headers := map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	}
+
+	for i := 0; i < 3; i++ {
+		resp, err := ts.Run(t, test.TestCase{
+			Path:      path.Join(spec.Proxy.ListenPath, "/tyk/oauth/authorize-client/"),
+			Data:      param.Encode(),
+			AdminAuth: true,
+			Headers:   headers,
+			Method:    http.MethodPost,
+			Code:      http.StatusOK,
+		})
+		if err != nil {
+			t.Error(err)
+		}
+
+		response := map[string]interface{}{}
+		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestOauthMultipleAPIs(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	spec := buildTestOAuthSpec(func(spec *APISpec) {
@@ -164,11 +211,11 @@ func TestOauthMultipleAPIs(t *testing.T) {
 
 	})
 
-	apis := LoadAPI(spec, spec2)
+	apis := ts.Gw.LoadAPI(spec, spec2)
 	spec = apis[0]
 	spec2 = apis[1]
 
-	pID := CreatePolicy(func(p *user.Policy) {
+	pID := ts.CreatePolicy(func(p *user.Policy) {
 		p.AccessRights = map[string]user.AccessDefinition{
 			"oauth2": {
 				APIID: "oauth2",
@@ -185,8 +232,8 @@ func TestOauthMultipleAPIs(t *testing.T) {
 		ClientRedirectURI: authRedirectUri,
 		PolicyID:          pID,
 	}
-	spec.OAuthManager.OsinServer.Storage.SetClient(testClient.ClientID, spec.OrgID, &testClient, false)
-	spec2.OAuthManager.OsinServer.Storage.SetClient(testClient.ClientID, spec2.OrgID, &testClient, false)
+	spec.OAuthManager.Storage().SetClient(testClient.ClientID, spec.OrgID, &testClient, false)
+	spec2.OAuthManager.Storage().SetClient(testClient.ClientID, spec2.OrgID, &testClient, false)
 
 	param := make(url.Values)
 	param.Set("response_type", "token")
@@ -234,13 +281,76 @@ func TestOauthMultipleAPIs(t *testing.T) {
 	)
 }
 
-func TestAuthCodeRedirect(t *testing.T) {
-	ts := StartTest()
+func TestOAuthTokenExpiration(t *testing.T) {
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	globalConf := ts.Gw.GetConfig()
+	globalConf.OauthTokenExpire = 1
+	globalConf.LocalSessionCache.DisableCacheSessionState = true // don't let cache to hide reality
+	ts.Gw.SetConfig(globalConf)
 
-	createTestOAuthClient(spec, authClientID)
+	spec := buildTestOAuthSpec(func(spec *APISpec) {
+		spec.APIID = "oauth2"
+		spec.UseOauth2 = true
+		spec.UseKeylessAccess = false
+		spec.Proxy.ListenPath = "/listen/"
+	})
+
+	apis := ts.Gw.LoadAPI(spec)
+	spec = apis[0]
+
+	pID := ts.CreatePolicy(func(p *user.Policy) {
+		p.AccessRights = map[string]user.AccessDefinition{
+			"oauth2": {
+				APIID: "oauth2",
+			},
+		}
+	})
+
+	testClient := OAuthClient{
+		ClientID:          authClientID,
+		ClientSecret:      authClientSecret,
+		ClientRedirectURI: authRedirectUri,
+		PolicyID:          pID,
+	}
+	err := spec.OAuthManager.Storage().SetClient(testClient.ClientID, spec.OrgID, &testClient, false)
+	assert.NoError(t, err)
+
+	param := make(url.Values)
+	param.Set("response_type", "token")
+	param.Set("redirect_uri", authRedirectUri)
+	param.Set("client_id", authClientID)
+	param.Set("key_rules", keyRules)
+
+	headers := map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	}
+	resp, err := ts.Run(t, test.TestCase{AdminAuth: true, Method: http.MethodPost, Path: "/listen/tyk/oauth/authorize-client/",
+		Data: param.Encode(), Headers: headers, BodyMatch: `"access_token"`, Code: http.StatusOK})
+	assert.NoError(t, err)
+
+	token := tokenData{}
+	json.NewDecoder(resp.Body).Decode(&token)
+	authHeader := map[string]string{
+		"Authorization": "Bearer " + token.AccessToken,
+	}
+
+	assert.True(t, globalConf.LocalSessionCache.DisableCacheSessionState) // to fixate that the cache is disabled
+	_, _ = ts.Run(t, []test.TestCase{
+		{Path: "/listen/get", Headers: authHeader, Method: http.MethodGet, Code: http.StatusOK, Delay: time.Second},
+		{Path: "/listen/get", Headers: authHeader, Method: http.MethodGet, BodyMatch: "Key has expired, please renew",
+			Code: http.StatusUnauthorized},
+	}...)
+}
+
+func TestAuthCodeRedirect(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	spec := ts.LoadTestOAuthSpec()
+
+	ts.createTestOAuthClient(spec, authClientID)
 
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -269,17 +379,15 @@ func TestAuthCodeRedirect(t *testing.T) {
 
 func TestAuthCodeRedirectMultipleURL(t *testing.T) {
 	// Enable multiple Redirect URIs
-	globalConf := config.Global()
-	globalConf.OauthRedirectUriSeparator = ","
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	ts := StartTest()
+	conf := func(globalConf *config.Config) {
+		globalConf.OauthRedirectUriSeparator = ","
+	}
+	ts := StartTest(conf)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -310,17 +418,15 @@ func TestAuthCodeRedirectMultipleURL(t *testing.T) {
 
 func TestAuthCodeRedirectInvalidMultipleURL(t *testing.T) {
 	// Disable multiple Redirect URIs
-	globalConf := config.Global()
-	globalConf.OauthRedirectUriSeparator = ""
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	ts := StartTest()
+	conf := func(globalConf *config.Config) {
+		globalConf.OauthRedirectUriSeparator = ""
+	}
+	ts := StartTest(conf)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	t.Run("Client authorize request with invalid redirect URI", func(t *testing.T) {
 		param := make(url.Values)
@@ -343,12 +449,12 @@ func TestAuthCodeRedirectInvalidMultipleURL(t *testing.T) {
 }
 
 func TestAPIClientAuthorizeAuthCode(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	t.Run("Client authorize code request", func(t *testing.T) {
 		param := make(url.Values)
@@ -374,12 +480,12 @@ func TestAPIClientAuthorizeAuthCode(t *testing.T) {
 }
 
 func TestAPIClientAuthorizeToken(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	t.Run("Client authorize token request", func(t *testing.T) {
 		param := make(url.Values)
@@ -436,7 +542,7 @@ func TestAPIClientAuthorizeToken(t *testing.T) {
 		if !ok {
 			t.Fatal("No access token found")
 		}
-		session, ok := spec.AuthManager.KeyAuthorised(token)
+		session, ok := spec.AuthManager.SessionDetail("", token, false)
 		if !ok {
 			t.Error("Key was not created (Can't find it)!")
 		}
@@ -454,12 +560,12 @@ func TestAPIClientAuthorizeToken(t *testing.T) {
 }
 
 func TestDeleteOauthClient(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	var resp *http.Response
 
@@ -547,12 +653,12 @@ func TestDeleteOauthClient(t *testing.T) {
 }
 
 func TestAPIClientAuthorizeTokenWithPolicy(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	t.Run("Client authorize token with policy request", func(t *testing.T) {
 		param := make(url.Values)
@@ -587,7 +693,7 @@ func TestAPIClientAuthorizeTokenWithPolicy(t *testing.T) {
 		}
 
 		// Verify the token is correct
-		session, ok := spec.AuthManager.KeyAuthorised(token)
+		session, ok := spec.AuthManager.SessionDetail("", token, false)
 		if !ok {
 			t.Error("Key was not created (Can't find it)!")
 		}
@@ -599,6 +705,7 @@ func TestAPIClientAuthorizeTokenWithPolicy(t *testing.T) {
 }
 
 func getAuthCode(t *testing.T, ts *Test) map[string]string {
+	t.Helper()
 	param := make(url.Values)
 	param.Set("response_type", "code")
 	param.Set("redirect_uri", authRedirectUri)
@@ -626,24 +733,21 @@ func getAuthCode(t *testing.T, ts *Test) map[string]string {
 }
 
 func TestGetPaginatedClientTokens(t *testing.T) {
-	testPagination := func(pageParam int, expectedPageNumber int, tokenRequestCount int, expectedRes int) {
-		globalConf := config.Global()
+	conf := func(globalConf *config.Config) {
 		// set tokens to be expired after 100 seconds
 		globalConf.OauthTokenExpire = 100
 		// cleanup tokens older than 300 seconds
 		globalConf.OauthTokenExpiredRetainPeriod = 300
-
-		config.SetGlobal(globalConf)
-
-		defer ResetTestConfig()
-
-		ts := StartTest()
+	}
+	testPagination := func(pageParam int, expectedPageNumber int, tokenRequestCount int, expectedRes int) {
+		ts := StartTest(conf)
 		defer ts.Close()
 
-		spec := loadTestOAuthSpec()
+		spec := ts.LoadTestOAuthSpec()
 
-		clientID := uuid.NewV4().String()
-		createTestOAuthClient(spec, clientID)
+		clientID := uuid.New()
+
+		ts.createTestOAuthClient(spec, clientID)
 
 		tokensID := map[string]bool{}
 		param := make(url.Values)
@@ -675,8 +779,17 @@ func TestGetPaginatedClientTokens(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// save tokens for future check
-			tokensID[response["access_token"].(string)] = true
+			if val, ok := response["access_token"]; !ok {
+				t.Fatal("response doesn't have access_token value")
+			} else {
+				if accessToken, ok := val.(string); !ok {
+					t.Fatal("access token is not a string value.")
+				} else {
+					// save tokens for future check
+					tokensID[accessToken] = true
+				}
+			}
+
 		}
 
 		resp, err := ts.Run(t, test.TestCase{
@@ -744,25 +857,24 @@ func TestGetClientTokens(t *testing.T) {
 }
 
 func testGetClientTokens(t *testing.T, hashed bool) {
-	globalConf := config.Global()
-	// set tokens to be expired after 1 second
-	globalConf.OauthTokenExpire = 1
-	// cleanup tokens older than 3 seconds
-	globalConf.OauthTokenExpiredRetainPeriod = 3
+	test.Flaky(t) // TODO: TT-5253
+	t.Helper()
+	conf := func(globalConf *config.Config) {
+		// set tokens to be expired after 1 second
+		globalConf.OauthTokenExpire = 1
+		// cleanup tokens older than 3 seconds
+		globalConf.OauthTokenExpiredRetainPeriod = 3
+		globalConf.HashKeys = hashed
+	}
 
-	globalConf.HashKeys = hashed
-
-	config.SetGlobal(globalConf)
-
-	defer ResetTestConfig()
-
-	ts := StartTest()
+	ts := StartTest(conf)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	clientID := uuid.NewV4().String()
-	createTestOAuthClient(spec, clientID)
+	clientID := uuid.New()
+
+	ts.createTestOAuthClient(spec, clientID)
 
 	// make three tokens
 	tokensID := map[string]bool{}
@@ -798,7 +910,7 @@ func testGetClientTokens(t *testing.T, hashed bool) {
 
 			if hashed {
 				// save tokens for future check
-				tokensID[storage.HashKey(response["access_token"].(string))] = true
+				tokensID[storage.HashKey(response["access_token"].(string), ts.Gw.GetConfig().HashKeys)] = true
 			} else {
 				tokensID[response["access_token"].(string)] = true
 			}
@@ -865,6 +977,7 @@ type tokenData struct {
 }
 
 func getToken(t *testing.T, ts *Test) tokenData {
+	t.Helper()
 	authData := getAuthCode(t, ts)
 
 	param := make(url.Values)
@@ -896,12 +1009,12 @@ func getToken(t *testing.T, ts *Test) tokenData {
 }
 
 func TestOAuthClientCredsGrant(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	t.Run("Client credentials grant token request", func(t *testing.T) {
 		param := make(url.Values)
@@ -935,12 +1048,12 @@ func TestOAuthClientCredsGrant(t *testing.T) {
 }
 
 func TestClientAccessRequest(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	authData := getAuthCode(t, ts)
 
@@ -967,12 +1080,12 @@ func TestClientAccessRequest(t *testing.T) {
 }
 
 func TestOAuthAPIRefreshInvalidate(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	// Step 1 create token
 	tokenData := getToken(t, ts)
@@ -995,7 +1108,7 @@ func TestOAuthAPIRefreshInvalidate(t *testing.T) {
 		json.NewDecoder(resp.Body).Decode(&newSuccess)
 		if newSuccess.Status != "ok" {
 			t.Errorf("key not deleted, status error: %s\n", newSuccess.Status)
-			t.Error(apisByID)
+			t.Error(ts.Gw.apisByID)
 		}
 		if newSuccess.Action != "deleted" {
 			t.Errorf("Response is incorrect - action is not 'deleted': %s\n", newSuccess.Action)
@@ -1024,12 +1137,12 @@ func TestOAuthAPIRefreshInvalidate(t *testing.T) {
 }
 
 func TestClientRefreshRequest(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	tokenData := getToken(t, ts)
 
@@ -1056,12 +1169,12 @@ func TestClientRefreshRequest(t *testing.T) {
 }
 
 func TestClientRefreshRequestDouble(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
+	spec := ts.LoadTestOAuthSpec()
 
-	createTestOAuthClient(spec, authClientID)
+	ts.createTestOAuthClient(spec, authClientID)
 
 	tokenData := getToken(t, ts)
 
@@ -1117,11 +1230,11 @@ func TestClientRefreshRequestDouble(t *testing.T) {
 }
 
 func TestTokenEndpointHeaders(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	spec := loadTestOAuthSpec()
-	createTestOAuthClient(spec, authClientID)
+	spec := ts.LoadTestOAuthSpec()
+	ts.createTestOAuthClient(spec, authClientID)
 
 	param := make(url.Values)
 	param.Set("grant_type", "client_credentials")
@@ -1169,7 +1282,7 @@ func TestJSONToFormValues(t *testing.T) {
 		"client_secret": "test-client-secret",
 		"grant_type":    "password",
 	}
-	b, _ := json.Marshal(o)
+	b := test.MarshalJSON(t)(o)
 	r, err := http.NewRequest(http.MethodPost, "/token", bytes.NewReader(b))
 	if err != nil {
 		t.Fatal(err)
@@ -1200,4 +1313,188 @@ func TestJSONToFormValues(t *testing.T) {
 			}
 		}
 	})
+}
+
+func assertTokensLen(t *testing.T, storageManager storage.Handler, storageKey string, expectedTokensLen int) {
+	t.Helper()
+	nowTs := time.Now().Unix()
+	startScore := strconv.FormatInt(nowTs, 10)
+	tokens, _, err := storageManager.GetSortedSetRange(storageKey, startScore, "+inf")
+	assert.NoError(t, err)
+	assert.Equal(t, expectedTokensLen, len(tokens))
+}
+
+func TestPurgeOAuthClientTokens(t *testing.T) {
+	t.Run("event", func(t *testing.T) {
+		conf := func(globalConf *config.Config) {
+			// set tokens to be expired after 1 second
+			globalConf.OauthTokenExpire = 1
+			// cleanup tokens older than 1 seconds
+			globalConf.OauthTokenExpiredRetainPeriod = 1
+		}
+
+		ts := StartTest(conf)
+		defer ts.Close()
+
+		spec := ts.LoadTestOAuthSpec()
+
+		clientID1, clientID2 := uuid.New(), uuid.New()
+
+		ts.createOAuthClientIDAndTokens(t, spec, clientID1)
+		ts.createOAuthClientIDAndTokens(t, spec, clientID2)
+		storageKey1, storageKey2 := fmt.Sprintf("%s%s", prefixClientTokens, clientID1),
+			fmt.Sprintf("%s%s", prefixClientTokens, clientID2)
+
+		storageManager := ts.Gw.getGlobalMDCBStorageHandler(generateOAuthPrefix(spec.APIID), false)
+		storageManager.Connect()
+
+		assertTokensLen(t, storageManager, storageKey1, 3)
+		assertTokensLen(t, storageManager, storageKey2, 3)
+
+		time.Sleep(time.Second * 2)
+
+		// emit event
+
+		n := Notification{
+			Command: OAuthPurgeLapsedTokens,
+			Gw:      ts.Gw,
+		}
+		ts.Gw.MainNotifier.Notify(n)
+
+		assertTokensLen(t, storageManager, storageKey1, 0)
+		assertTokensLen(t, storageManager, storageKey2, 0)
+	})
+
+	t.Run("background", func(t *testing.T) {
+
+		conf := func(globalConf *config.Config) {
+			// set tokens to be expired after 1 second
+			globalConf.OauthTokenExpire = 1
+			// cleanup tokens older than 2 seconds
+			globalConf.OauthTokenExpiredRetainPeriod = 1
+		}
+
+		ts := StartTest(conf)
+		defer ts.Close()
+
+		spec := ts.LoadTestOAuthSpec()
+
+		clientID1, clientID2 := uuid.New(), uuid.New()
+
+		ts.createOAuthClientIDAndTokens(t, spec, clientID1)
+		ts.createOAuthClientIDAndTokens(t, spec, clientID2)
+		storageKey1, storageKey2 := fmt.Sprintf("%s%s", prefixClientTokens, clientID1),
+			fmt.Sprintf("%s%s", prefixClientTokens, clientID2)
+
+		storageManager := ts.Gw.getGlobalMDCBStorageHandler(generateOAuthPrefix(spec.APIID), false)
+		storageManager.Connect()
+
+		assertTokensLen(t, storageManager, storageKey1, 3)
+		assertTokensLen(t, storageManager, storageKey2, 3)
+
+		time.Sleep(time.Second * 2)
+
+		assertTokensLen(t, storageManager, storageKey1, 0)
+		assertTokensLen(t, storageManager, storageKey2, 0)
+	})
+
+}
+
+func BenchmarkPurgeLapsedOAuthTokens(b *testing.B) {
+	b.Skip()
+
+	conf := func(globalConf *config.Config) {
+		// set tokens to be expired after 1 second
+		globalConf.OauthTokenExpire = 1
+		// cleanup tokens older than 2 seconds
+		globalConf.OauthTokenExpiredRetainPeriod = 2
+
+		globalConf.Private.OAuthTokensPurgeInterval = 1
+	}
+
+	ts := StartTest(conf)
+	defer ts.Close()
+
+	const (
+		apiCount     = 10
+		clientsCount = 50
+		tokensCount  = 1000
+	)
+
+	gwConf := ts.Gw.GetConfig()
+
+	cfg := gwConf.Storage
+	timeout := 5 * time.Second
+
+	opts := &redis.UniversalOptions{
+		Addrs:        cfg.HostAddrs(),
+		Username:     cfg.Username,
+		Password:     cfg.Password,
+		DB:           cfg.Database,
+		DialTimeout:  timeout,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
+		PoolSize:     500,
+	}
+
+	fillZSet := func(client redis.UniversalClient, key string, count int) {
+		ctx := context.Background()
+		now := time.Now()
+		nowTs := now.Unix()
+		var setMembers []redis.Z
+		for k := 0; k < count; k++ {
+			setMembers = append(setMembers, redis.Z{
+				Score:  float64(nowTs - int64(k)),
+				Member: fmt.Sprintf("dummy-value-%d", k),
+			})
+		}
+
+		// add 10 more tokens to be not expired
+		for k := 0; k < count/10; k++ {
+			setMembers = append(setMembers, redis.Z{
+				Score:  float64(nowTs + int64((k)*1000)),
+				Member: fmt.Sprintf("dummy-value-%d", k),
+			})
+		}
+		client.ZAdd(ctx, key, setMembers...)
+	}
+
+	copyZSet := func(client redis.UniversalClient, src, dst string) {
+		ctx := context.Background()
+		client.ZRangeStore(ctx, dst, redis.ZRangeArgs{
+			Key:   src,
+			Start: "0",
+			Stop:  "+inf",
+		})
+	}
+
+	setup := func(tb testing.TB, client redis.UniversalClient) {
+		tb.Helper()
+		now := time.Now()
+		for i := 0; i < apiCount; i++ {
+			for j := 0; j < clientsCount; j++ {
+				//now := time.Now()
+				dst := fmt.Sprintf("oauth-data.%doauth-client-tokens.%d", i, j)
+				copyZSet(client, "api", dst)
+				//tb.Logf("copy zet elapsed %f", time.Since(now).Seconds())
+			}
+
+		}
+		tb.Logf("setup time elapsed %f", time.Since(now).Seconds())
+	}
+
+	client := redis.NewClient(opts.Simple()) // no S1021
+	now := time.Now()
+	fillZSet(client, "api", tokensCount)
+	b.Logf("fill zet elapsed %f", time.Since(now).Seconds())
+
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		setup(b, client)
+		b.StartTimer()
+		require.NoError(b, ts.Gw.purgeLapsedOAuthTokens())
+		b.StopTimer()
+	}
 }

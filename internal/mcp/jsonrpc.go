@@ -1,0 +1,78 @@
+package mcp
+
+// JSON-RPC 2.0 Error Codes as defined in the JSON-RPC 2.0 specification.
+const (
+	// JSONRPCParseError indicates invalid JSON was received by the server.
+	JSONRPCParseError = -32700
+	// JSONRPCInvalidRequest indicates the JSON sent is not a valid Request object.
+	JSONRPCInvalidRequest = -32600
+	// JSONRPCMethodNotFound indicates the method does not exist or is not available.
+	JSONRPCMethodNotFound = -32601
+	// JSONRPCInvalidParams indicates invalid method parameter(s).
+	JSONRPCInvalidParams = -32602
+	// JSONRPCInternalError indicates an internal JSON-RPC error.
+	JSONRPCInternalError = -32603
+	// JSONRPCServerError is the base code for server errors (-32000 to -32099).
+)
+
+// MCP JSON-RPC method names as defined in the Model Context Protocol specification.
+const (
+	MethodInitialize          = "initialize"
+	MethodServerDiscover      = "server/discover"
+	MethodSubscriptionsListen = "subscriptions/listen"
+
+	// Tool methods
+	MethodToolsCall = "tools/call"
+	MethodToolsList = "tools/list"
+
+	// Resource methods
+	MethodResourcesRead          = "resources/read"
+	MethodResourcesList          = "resources/list"
+	MethodResourcesTemplatesList = "resources/templates/list"
+
+	// Prompt methods
+	MethodPromptsGet  = "prompts/get"
+	MethodPromptsList = "prompts/list"
+
+	// Client capability methods
+	MethodSamplingCreateMessage = "sampling/createMessage"
+)
+
+// JSON-RPC parameter keys used across MCP methods
+const (
+	ParamKeyName = "name" // Used by tools/call and prompts/get
+	ParamKeyURI  = "uri"  // Used by resources/* methods
+)
+
+// Primitive type identifiers — mirrors user.PrimitiveType* for gateway-internal use.
+// Gateway code always uses these constants; dashboard code uses user.PrimitiveType*.
+const (
+	PrimitiveTypeTool     = "tool"
+	PrimitiveTypeResource = "resource"
+	PrimitiveTypePrompt   = "prompt"
+)
+
+// Primitive type key prefixes for primitives map lookups
+const (
+	PrimitiveKeyTool      = "tool:"
+	PrimitiveKeyResource  = "resource:"
+	PrimitiveKeyPrompt    = "prompt:"
+	PrimitiveKeyOperation = "operation:"
+)
+
+// Error messages for JSON-RPC responses
+const (
+	ErrMsgParseError     = "parse error"
+	ErrMsgInvalidRequest = "invalid request"
+	ErrMsgInvalidParams  = "invalid params"
+)
+
+// Detailed error messages for invalid params scenarios
+const (
+	ErrMsgMissingParams     = "missing required params object"
+	ErrMsgMissingParamName  = "missing required parameter: name"
+	ErrMsgMissingParamURI   = "missing required parameter: uri"
+	ErrMsgEmptyParamName    = "parameter 'name' cannot be empty"
+	ErrMsgEmptyParamURI     = "parameter 'uri' cannot be empty"
+	ErrMsgInvalidParamsType = "invalid params: expected object"
+)

@@ -1,20 +1,27 @@
 package gateway
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
+	"syscall"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/TykTechnologies/tyk/internal/otel"
 	"github.com/TykTechnologies/tyk/request"
-
-	"github.com/TykTechnologies/tyk/config"
 )
 
 // identifies that field value was hidden before output to the log
 const logHiddenValue = "<hidden>"
 
-func obfuscateKey(keyName string) string {
-	if config.Global().EnableKeyLogging {
+func (gw *Gateway) obfuscateKey(keyName string) string {
+	if gw.GetConfig().EnableKeyLogging {
 		return keyName
 	}
 
@@ -24,9 +31,9 @@ func obfuscateKey(keyName string) string {
 	return "--"
 }
 
-func getLogEntryForRequest(logger *logrus.Entry, r *http.Request, key string, data map[string]interface{}) *logrus.Entry {
+func (gw *Gateway) getLogEntryForRequest(logger *logrus.Entry, r *http.Request, key string, data map[string]interface{}) *logrus.Entry {
 	if logger == nil {
-		logger = logrus.NewEntry(log)
+		logger = log.NewEntry()
 	}
 
 	// populate http request fields
@@ -34,11 +41,21 @@ func getLogEntryForRequest(logger *logrus.Entry, r *http.Request, key string, da
 		"path":   r.URL.Path,
 		"origin": request.RealIP(r),
 	}
+
+	// add trace_id and span_id when OpenTelemetry is enabled and trace context exists
+	if gw.GetConfig().OpenTelemetry.TracesEnabled() {
+		traceID, spanID := otel.ExtractTraceAndSpanID(r.Context())
+		if traceID != "" {
+			fields["trace_id"] = traceID
+			fields["span_id"] = spanID
+		}
+	}
+
 	// add key to log if configured to do so
 	if key != "" {
 		fields["key"] = key
-		if !config.Global().EnableKeyLogging {
-			fields["key"] = obfuscateKey(key)
+		if !gw.GetConfig().EnableKeyLogging {
+			fields["key"] = gw.obfuscateKey(key)
 		}
 	}
 	// add to log additional fields if any passed
@@ -48,7 +65,7 @@ func getLogEntryForRequest(logger *logrus.Entry, r *http.Request, key string, da
 	return logger.WithFields(fields)
 }
 
-func getExplicitLogEntryForRequest(logger *logrus.Entry, path string, IP string, key string, data map[string]interface{}) *logrus.Entry {
+func (gw *Gateway) getExplicitLogEntryForRequest(logger *logrus.Entry, path string, IP string, key string, data map[string]interface{}) *logrus.Entry {
 	// populate http request fields
 	fields := logrus.Fields{
 		"path":   path,
@@ -57,7 +74,7 @@ func getExplicitLogEntryForRequest(logger *logrus.Entry, path string, IP string,
 	// add key to log if configured to do so
 	if key != "" {
 		fields["key"] = key
-		if !config.Global().EnableKeyLogging {
+		if !gw.GetConfig().EnableKeyLogging {
 			fields["key"] = logHiddenValue
 		}
 	}
@@ -66,4 +83,45 @@ func getExplicitLogEntryForRequest(logger *logrus.Entry, path string, IP string,
 		fields[key] = val
 	}
 	return logger.WithFields(fields)
+}
+
+func (gw *Gateway) logJWKError(logger *logrus.Entry, jwkURL string, err error) {
+	if err == nil {
+		return
+	}
+
+	// typed check for content/JSON errors
+	var syntaxErr *json.SyntaxError
+	var unmarshalErr *json.UnmarshalTypeError
+	var b64Err base64.CorruptInputError
+
+	if errors.As(err, &syntaxErr) ||
+		errors.As(err, &unmarshalErr) ||
+		errors.As(err, &b64Err) ||
+		errors.Is(err, io.EOF) {
+
+		logger.WithError(err).Errorf("Invalid JWKS retrieved from endpoint: %s", jwkURL)
+		return
+	}
+
+	// string fallback check for content/JSON errors
+	errStr := err.Error()
+	if strings.Contains(errStr, "invalid JWK") || strings.Contains(errStr, "illegal base64") {
+		logger.WithError(err).Errorf("Invalid JWKS retrieved from endpoint: %s", jwkURL)
+		return
+	}
+
+	// network errors
+	var urlErr *url.Error
+	var netErr net.Error
+
+	// errors.As(err, &netErr) catches any error that implements the net.Error interface.
+	// This covers DNS errors, timeouts, connection refused, dial errors, etc.
+	// errors.Is(err, syscall.ECONNREFUSED) catches underlying system call errors specifically.
+	if errors.As(err, &urlErr) || errors.As(err, &netErr) || errors.Is(err, syscall.ECONNREFUSED) {
+		logger.WithError(err).Errorf("JWKS endpoint resolution failed: invalid or unreachable host %s", jwkURL)
+		return
+	}
+
+	logger.WithError(err).Errorf("Failed to fetch or decode JWKs from %s", jwkURL)
 }

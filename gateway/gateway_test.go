@@ -11,65 +11,29 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"runtime"
 	"strconv"
-
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis"
 	"github.com/gorilla/websocket"
 	proxyproto "github.com/pires/go-proxyproto"
+	"github.com/stretchr/testify/assert"
 	msgpack "gopkg.in/vmihailenco/msgpack.v2"
 
+	"github.com/TykTechnologies/tyk-pump/analytics"
 	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/cli"
+
+	"github.com/TykTechnologies/tyk/apidef/oas"
 	"github.com/TykTechnologies/tyk/config"
 	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
 
-const defaultListenPort = 8080
-
 func TestMain(m *testing.M) {
 	os.Exit(InitTestMain(context.Background(), m))
-}
-
-func createNonThrottledSession() *user.SessionState {
-	session := new(user.SessionState)
-	session.Rate = 100.0
-	session.Allowance = session.Rate
-	session.LastCheck = time.Now().Unix()
-	session.Per = 1.0
-	session.QuotaRenewalRate = 300 // 5 minutes
-	session.QuotaRenews = time.Now().Unix()
-	session.QuotaRemaining = 10
-	session.QuotaMax = 10
-	session.Alias = "TEST-ALIAS"
-	return session
-}
-
-func TestAA(t *testing.T) {
-	ts := StartTest()
-
-	ts.Start()
-	defer ts.Close()
-
-	BuildAndLoadAPI(func(spec *APISpec) {
-		spec.Proxy.ListenPath = "/"
-	})
-
-	ts.Run(t, []test.TestCase{
-		{Code: 200},
-	}...)
-
-}
-
-type tykErrorResponse struct {
-	Error string
 }
 
 func testKey(testName string, name string) string {
@@ -77,16 +41,16 @@ func testKey(testName string, name string) string {
 }
 
 func TestParambasedAuth(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Auth.UseParam = true
 		spec.UseKeylessAccess = false
 		spec.Proxy.ListenPath = "/"
 	})
 
-	key := CreateSession(func(s *user.SessionState) {
+	key := CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.AccessRights = map[string]user.AccessDefinition{"test": {
 			APIID: "test", Versions: []string{"v1"},
 		}}
@@ -99,7 +63,7 @@ func TestParambasedAuth(t *testing.T) {
 
 	expectedBody := `"Form":{"authorization":"` + key + `","bar":"swoggetty","baz":"swoogetty","foo":"swiggetty"}`
 
-	ts.Run(t, test.TestCase{
+	_, _ = ts.Run(t, test.TestCase{
 		Method:    "POST",
 		Path:      "/?authorization=" + key,
 		Headers:   map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
@@ -110,12 +74,11 @@ func TestParambasedAuth(t *testing.T) {
 }
 
 func TestStripPathWithURLRewrite(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	defer ResetTestConfig()
-
 	t.Run("rewrite URL containing listen path", func(t *testing.T) {
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts := StartTest(nil)
+		t.Cleanup(ts.Close)
+
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			version := spec.VersionData.Versions["v1"]
 			json.Unmarshal([]byte(`{
                 "use_extended_paths": true,
@@ -134,110 +97,248 @@ func TestStripPathWithURLRewrite(t *testing.T) {
 
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/myapi/anything/a/myapi/b/c", BodyMatch: `"Url":"/something/a/myapi/b/c"`},
 		}...)
 	})
+
+	buildAPI := func(ts *Test, rewritePath, matchPattern, rewriteTo string) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+			spec.Proxy.ListenPath = "/anything/"
+			spec.Proxy.StripListenPath = true
+			spec.UseKeylessAccess = true
+
+			if rewriteTo == "" {
+				return
+			}
+
+			UpdateAPIVersion(spec, "v1", func(version *apidef.VersionInfo) {
+				version.UseExtendedPaths = true
+				version.ExtendedPaths.URLRewrite = []apidef.URLRewriteMeta{{
+					Path:         rewritePath,
+					Method:       http.MethodGet,
+					MatchPattern: matchPattern,
+					RewriteTo:    rewriteTo,
+				}}
+			})
+		})
+	}
+
+	tests := []struct {
+		name                string
+		applyStripToRewrite bool
+		rewritePath         string
+		matchPattern        string
+		rewriteTo           string
+		want                string
+	}{
+		{
+			name:                "legacy flag: rewritten path beginning with listen path is stripped",
+			applyStripToRewrite: true,
+			rewritePath:         "/xml",
+			matchPattern:        "/(.*)$",
+			rewriteTo:           "/anything/bla/$1",
+			want:                `"Url":"/bla/anything/xml"`,
+		},
+		{
+			name:                "legacy flag: identity rewrite is stripped",
+			applyStripToRewrite: true,
+			rewritePath:         "/xml",
+			matchPattern:        "/(.*)$",
+			rewriteTo:           "/$1",
+			want:                `"Url":"/xml"`,
+		},
+		{
+			name:                "legacy flag: ordinary request strips listen path",
+			applyStripToRewrite: true,
+			want:                `"Url":"/xml"`,
+		},
+		{
+			name:                "legacy flag: non-matching rewrite strips listen path",
+			applyStripToRewrite: true,
+			rewritePath:         "/other",
+			matchPattern:        "/other/(.*)$",
+			rewriteTo:           "/anything/bla/$1",
+			want:                `"Url":"/xml"`,
+		},
+		{
+			name:         "default: rewritten path beginning with listen path is preserved",
+			rewritePath:  "/xml",
+			matchPattern: "/(.*)$",
+			rewriteTo:    "/anything/bla/$1",
+			want:         `"Url":"/anything/bla/anything/xml"`,
+		},
+		{
+			name:         "default: identity rewrite is authoritative",
+			rewritePath:  "/xml",
+			matchPattern: "/(.*)$",
+			rewriteTo:    "/$1",
+			want:         `"Url":"/anything/xml"`,
+		},
+		{
+			name: "default: ordinary request still strips listen path",
+			want: `"Url":"/xml"`,
+		},
+		{
+			name:         "default: non-matching rewrite still strips listen path",
+			rewritePath:  "/other",
+			matchPattern: "/other/(.*)$",
+			rewriteTo:    "/anything/bla/$1",
+			want:         `"Url":"/xml"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := StartTest(func(globalConf *config.Config) {
+				globalConf.ApplyStripListenPathToURLRewrite = tc.applyStripToRewrite
+			})
+			t.Cleanup(ts.Close)
+			buildAPI(ts, tc.rewritePath, tc.matchPattern, tc.rewriteTo)
+
+			_, _ = ts.Run(t, test.TestCase{
+				Path:      "/anything/xml",
+				Code:      http.StatusOK,
+				BodyMatch: tc.want,
+			})
+		})
+	}
+
+	hostRewriteTests := []struct {
+		name                string
+		applyStripToRewrite bool
+		want                string
+	}{
+		{
+			name:                "legacy flag: absolute host rewrite strips path beginning with listen path",
+			applyStripToRewrite: true,
+			want:                `^/bla/anything/xml$`,
+		},
+		{
+			name: "default: absolute host rewrite preserves path beginning with listen path",
+			want: `^/anything/bla/anything/xml$`,
+		},
+	}
+
+	for _, tc := range hostRewriteTests {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprint(w, r.URL.Path)
+			}))
+			t.Cleanup(upstream.Close)
+
+			ts := StartTest(func(globalConf *config.Config) {
+				globalConf.ApplyStripListenPathToURLRewrite = tc.applyStripToRewrite
+			})
+			t.Cleanup(ts.Close)
+			buildAPI(ts, "/xml", "/(.*)$", upstream.URL+"/anything/bla/$1")
+
+			_, _ = ts.Run(t, test.TestCase{
+				Path:      "/anything/xml",
+				Code:      http.StatusOK,
+				BodyMatch: tc.want,
+			})
+		})
+	}
 }
 
 func TestSkipTargetPassEscapingOff(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	defer ResetTestConfig()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
 	t.Run("With escaping, default", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/(abc,xyz)?arg=val", BodyMatch: `"Url":"/%28abc,xyz%29\?arg=val`},
 			{Path: "/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/%28abc,xyz%29\?arg=val`},
 		}...)
 	})
 
 	t.Run("Without escaping", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/(abc,xyz)?arg=val", BodyMatch: `"Url":"/\(abc,xyz\)\?arg=val"`},
 			{Path: "/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/%28abc,xyz%29\?arg=val"`},
 		}...)
 	})
 
 	t.Run("With escaping, listen path and target URL are set, StripListenPath is OFF", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = false
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/%28abc,xyz%29\?arg=val"`},
 		}...)
 	})
 
 	t.Run("Without escaping, listen path and target URL are set, StripListenPath is OFF", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = false
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/\(abc,xyz\)\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/%28abc,xyz%29\?arg=val"`},
 		}...)
 	})
 
 	t.Run("With escaping, listen path and target URL are set, StripListenPath is ON", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = true
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/%28abc,xyz%29\?arg=val"`},
 		}...)
 	})
 
 	t.Run("Without escaping, listen path and target URL are set, StripListenPath is ON", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = true
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/\(abc,xyz\)\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/%28abc,xyz%29\?arg=val"`},
 		}...)
@@ -245,62 +346,56 @@ func TestSkipTargetPassEscapingOff(t *testing.T) {
 }
 
 func TestSkipTargetPassEscapingOffWithSkipURLCleaningTrue(t *testing.T) {
-	globalConf := config.Global()
-	globalConf.HttpServerOptions.OverrideDefaults = true
-	globalConf.HttpServerOptions.SkipURLCleaning = true
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
 
-	// here we expect that test gateway will be sending to test upstream requests with not cleaned URI
-	// so test upstream shouldn't reply with 301 and process them as well
-	prevSkipClean := defaultTestConfig.HttpServerOptions.OverrideDefaults &&
-		defaultTestConfig.HttpServerOptions.SkipURLCleaning
-	testServerRouter.SkipClean(true)
-	defer testServerRouter.SkipClean(prevSkipClean)
+	conf := func(c *config.Config) {
+		c.HttpServerOptions.OverrideDefaults = true
+		c.HttpServerOptions.SkipURLCleaning = true
+	}
+	ts := StartTest(conf)
+	t.Cleanup(ts.Close)
 
-	ts := StartTest()
-	defer ts.Close()
+	ts.TestServerRouter.SkipClean(true)
 
 	t.Run("With escaping, default", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/abc/xyz/http%3A%2F%2Ftest.com?arg=val", BodyMatch: `"Url":"/abc/xyz/http%3A%2F%2Ftest.com\?arg=val`},
 		}...)
 	})
 
 	t.Run("Without escaping, default", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/abc/xyz/http%3A%2F%2Ftest.com?arg=val", BodyMatch: `"Url":"/abc/xyz/http%3A%2F%2Ftest.com\?arg=val`},
 		}...)
 	})
 
 	t.Run("With escaping, listen path and target URL are set, StripListenPath is OFF", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = false
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/http%3A%2F%2Ftest.com?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/http%3A%2F%2Ftest.com\?arg=val`},
@@ -308,17 +403,17 @@ func TestSkipTargetPassEscapingOffWithSkipURLCleaningTrue(t *testing.T) {
 	})
 
 	t.Run("Without escaping, listen path and target URL are set, StripListenPath is OFF", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = false
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/\(abc,xyz\)\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/http%3A%2F%2Ftest.com?arg=val", BodyMatch: `"Url":"/sent_to_me/listen_me/http%3A%2F%2Ftest.com\?arg=val`},
@@ -326,17 +421,19 @@ func TestSkipTargetPassEscapingOffWithSkipURLCleaningTrue(t *testing.T) {
 	})
 
 	t.Run("With escaping, listen path and target URL are set, StripListenPath is ON", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = true
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
+			// change name to change checksum and reload
+			spec.Name = t.Name()
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/http%3A%2F%2Ftest.com?arg=val", BodyMatch: `"Url":"/sent_to_me/http%3A%2F%2Ftest.com\?arg=val`},
@@ -344,17 +441,19 @@ func TestSkipTargetPassEscapingOffWithSkipURLCleaningTrue(t *testing.T) {
 	})
 
 	t.Run("Without escaping, listen path and target URL are set, StripListenPath is ON", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HttpServerOptions.SkipTargetPathEscaping = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.StripListenPath = true
 			spec.Proxy.ListenPath = "/listen_me"
 			spec.Proxy.TargetURL = TestHttpAny + "/sent_to_me"
+			// change name to change checksum and reload
+			spec.Name = t.Name()
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Path: "/listen_me/(abc,xyz)?arg=val", BodyMatch: `"Url":"/sent_to_me/\(abc,xyz\)\?arg=val"`},
 			{Path: "/listen_me/%28abc,xyz%29?arg=val", BodyMatch: `"Url":"/sent_to_me/%28abc,xyz%29\?arg=val"`},
 			{Path: "/listen_me/http%3A%2F%2Ftest.com?arg=val", BodyMatch: `"Url":"/sent_to_me/http%3A%2F%2Ftest.com\?arg=val`},
@@ -364,13 +463,17 @@ func TestSkipTargetPassEscapingOffWithSkipURLCleaningTrue(t *testing.T) {
 }
 
 func TestQuota(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+	t.Skip() // DeleteScanMatch interferes with other tests.
+
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
 	var keyID string
 
-	var webhookWG sync.WaitGroup
+	var requestCount int64
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&requestCount, 1)
+
 		if r.Header.Get("X-Tyk-Test-Header") != "Tyk v1.BANANA" {
 			t.Error("Custom webhook header not set", r.Header)
 		}
@@ -382,12 +485,10 @@ func TestQuota(t *testing.T) {
 		if data["event"] != "QuotaExceeded" || data["message"] != "Key Quota Limit Exceeded" || data["key"] != keyID {
 			t.Error("Webhook payload not match", data)
 		}
-
-		webhookWG.Done()
 	}))
 	defer webhook.Close()
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.UseKeylessAccess = false
 		spec.Proxy.ListenPath = "/"
 
@@ -425,7 +526,7 @@ func TestQuota(t *testing.T) {
 	})
 
 	// Create session with Quota = 2
-	keyID = CreateSession(func(s *user.SessionState) {
+	keyID = CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.QuotaMax = 2
 	})
 
@@ -433,8 +534,7 @@ func TestQuota(t *testing.T) {
 		"authorization": keyID,
 	}
 
-	webhookWG.Add(1)
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Path: "/", Headers: authHeaders, Code: 200},
 		// Ignored path should not affect quota
 		{Path: "/get", Headers: authHeaders, Code: 200},
@@ -443,337 +543,21 @@ func TestQuota(t *testing.T) {
 		// Ignored path works without auth
 		{Path: "/get", Code: 200},
 	}...)
-	webhookWG.Wait()
-}
 
-func TestAnalytics(t *testing.T) {
-	ts := StartTest(TestConfig{
-		Delay: 20 * time.Millisecond,
-	})
-	defer ts.Close()
-	base := config.Global()
-
-	BuildAndLoadAPI(func(spec *APISpec) {
-		spec.UseKeylessAccess = false
-		spec.Proxy.ListenPath = "/"
-	})
-
-	// Cleanup before test
-	// let records to to be sent
-	time.Sleep(recordsBufferFlushInterval + 50)
-	analytics.Store.GetAndDeleteSet(analyticsKeyName)
-
-	t.Run("Log errors", func(t *testing.T) {
-		ts.Run(t, []test.TestCase{
-			{Path: "/", Code: 401},
-			{Path: "/", Code: 401},
-		}...)
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 2 {
-			t.Error("Should return 2 record", len(results))
-		}
-
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[0].(string)), &record)
-		if record.ResponseCode != 401 {
-			t.Error("Analytics record do not match: ", record)
-		}
-	})
-
-	t.Run("Log success", func(t *testing.T) {
-		key := CreateSession()
-
-		authHeaders := map[string]string{
-			"authorization": key,
-		}
-
-		ts.Run(t, test.TestCase{
-			Path: "/", Headers: authHeaders, Code: 200,
-		})
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 1 {
-			t.Error("Should return 1 record: ", len(results))
-		}
-
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[0].(string)), &record)
-		if record.ResponseCode != 200 {
-			t.Error("Analytics record do not match", record)
-		}
-	})
-
-	t.Run("Detailed analytics with api spec config enabled", func(t *testing.T) {
-		defer func() {
-			config.SetGlobal(base)
-		}()
-		globalConf := config.Global()
-		globalConf.AnalyticsConfig.EnableDetailedRecording = false
-		config.SetGlobal(globalConf)
-
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.UseKeylessAccess = false
-			spec.Proxy.ListenPath = "/"
-			spec.EnableDetailedRecording = true
-		})
-
-		key := CreateSession()
-
-		authHeaders := map[string]string{
-			"authorization": key,
-		}
-
-		ts.Run(t, test.TestCase{
-			Path: "/", Headers: authHeaders, Code: 200,
-		})
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 1 {
-			t.Error("Should return 1 record: ", len(results))
-		}
-
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[0].(string)), &record)
-		if record.ResponseCode != 200 {
-			t.Error("Analytics record do not match", record)
-		}
-
-		if record.RawRequest == "" {
-			t.Error("Detailed request info not found", record)
-		}
-
-		if record.RawResponse == "" {
-			t.Error("Detailed response info not found", record)
-		}
-	})
-
-	t.Run("Detailed analytics with only key flag set", func(t *testing.T) {
-		defer func() {
-			config.SetGlobal(base)
-		}()
-		globalConf := config.Global()
-		globalConf.AnalyticsConfig.EnableDetailedRecording = false
-		config.SetGlobal(globalConf)
-
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.UseKeylessAccess = false
-			spec.Proxy.ListenPath = "/"
-			spec.EnableDetailedRecording = false
-		})
-
-		key := CreateSession(func(sess *user.SessionState) {
-			sess.EnableDetailRecording = true
-		})
-
-		authHeaders := map[string]string{
-			"authorization": key,
-		}
-
-		ts.Run(t, test.TestCase{
-			Path: "/", Headers: authHeaders, Code: 200,
-		})
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 1 {
-			t.Error("Should return 1 record: ", len(results))
-		}
-
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[0].(string)), &record)
-		if record.ResponseCode != 200 {
-			t.Error("Analytics record do not match", record)
-		}
-
-		if record.RawRequest == "" {
-			t.Error("Detailed request info not found", record)
-		}
-
-		if record.RawResponse == "" {
-			t.Error("Detailed response info not found", record)
-		}
-	})
-	t.Run("Detailed analytics", func(t *testing.T) {
-		defer func() {
-			config.SetGlobal(base)
-		}()
-		globalConf := config.Global()
-		globalConf.AnalyticsConfig.EnableDetailedRecording = true
-		config.SetGlobal(globalConf)
-
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.UseKeylessAccess = false
-			spec.Proxy.ListenPath = "/"
-		})
-
-		key := CreateSession()
-
-		authHeaders := map[string]string{
-			"authorization": key,
-		}
-
-		ts.Run(t, test.TestCase{
-			Path: "/", Headers: authHeaders, Code: 200,
-		})
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 1 {
-			t.Error("Should return 1 record: ", len(results))
-		}
-
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[0].(string)), &record)
-		if record.ResponseCode != 200 {
-			t.Error("Analytics record do not match", record)
-		}
-
-		if record.RawRequest == "" {
-			t.Error("Detailed request info not found", record)
-		}
-
-		if record.RawResponse == "" {
-			t.Error("Detailed response info not found", record)
-		}
-	})
-
-	t.Run("Detailed analytics with latency", func(t *testing.T) {
-		defer func() {
-			config.SetGlobal(base)
-		}()
-		globalConf := config.Global()
-		globalConf.AnalyticsConfig.EnableDetailedRecording = true
-		config.SetGlobal(globalConf)
-		ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// We are delaying the response by 2 ms. This is important because anytime
-			// less than 0 eg  0.2 ms will be round off to 0 which is not good to check if we have
-			// latency correctly set.
-			time.Sleep(2 * time.Millisecond)
-		}))
-		defer ls.Close()
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.UseKeylessAccess = false
-			spec.Proxy.ListenPath = "/"
-			spec.Proxy.TargetURL = ls.URL
-		})
-
-		key := CreateSession()
-
-		authHeaders := map[string]string{
-			"authorization": key,
-		}
-
-		ts.Run(t, test.TestCase{
-			Path: "/", Headers: authHeaders, Code: 200,
-		})
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 1 {
-			t.Error("Should return 1 record: ", len(results))
-		}
-
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[0].(string)), &record)
-		if record.ResponseCode != 200 {
-			t.Error("Analytics record do not match", record)
-		}
-
-		if record.RawRequest == "" {
-			t.Error("Detailed request info not found", record)
-		}
-
-		if record.RawResponse == "" {
-			t.Error("Detailed response info not found", record)
-		}
-		if record.Latency.Total == 0 {
-			t.Error("expected total latency to be set")
-		}
-		if record.Latency.Upstream == 0 {
-			t.Error("expected upstream latency to be set")
-		}
-		if record.Latency.Total != record.RequestTime {
-			t.Errorf("expected %d got %d", record.RequestTime, record.Latency.Total)
-		}
-	})
-
-	t.Run("Detailed analytics with cache", func(t *testing.T) {
-		defer func() {
-			config.SetGlobal(base)
-		}()
-		globalConf := config.Global()
-		globalConf.AnalyticsConfig.EnableDetailedRecording = true
-		config.SetGlobal(globalConf)
-
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.UseKeylessAccess = false
-			spec.Proxy.ListenPath = "/"
-			spec.CacheOptions = apidef.CacheOptions{
-				CacheTimeout:         120,
-				EnableCache:          true,
-				CacheAllSafeRequests: true,
-			}
-		})
-
-		key := CreateSession()
-
-		authHeaders := map[string]string{
-			"authorization": key,
-		}
-
-		ts.Run(t, []test.TestCase{
-			{Path: "/", Headers: authHeaders, Code: 200},
-			{Path: "/", Headers: authHeaders, Code: 200},
-		}...)
-
-		// let records to to be sent
-		time.Sleep(recordsBufferFlushInterval + 50)
-
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
-		if len(results) != 2 {
-			t.Fatal("Should return 1 record: ", len(results))
-		}
-
-		// Take second cached request
-		var record AnalyticsRecord
-		msgpack.Unmarshal([]byte(results[1].(string)), &record)
-		if record.ResponseCode != 200 {
-			t.Error("Analytics record do not match", record)
-		}
-
-		if record.RawRequest == "" {
-			t.Error("Detailed request info not found", record)
-		}
-
-		if record.RawResponse == "" {
-			t.Error("Detailed response info not found", record)
-		}
-	})
+	want := int64(1)
+	assert.Equal(t, want, atomic.LoadInt64(&requestCount))
 }
 
 func TestListener(t *testing.T) {
-	// Trick to get spec JSON, without loading API
-	// Specs will be reseted when we do `StartTest`
-	BuildAndLoadAPI()
+	ts := StartTest(nil)
+	ts.Gw.ReloadTestCase.Enable()
+	ts.Gw.ReloadTestCase.StartTicker()
 
-	ts := StartTest()
-	defer ts.Close()
+	t.Cleanup(func() {
+		ts.Gw.ReloadTestCase.StopTicker()
+		ts.Gw.ReloadTestCase.Disable()
+		ts.Close()
+	})
 
 	tests := []test.TestCase{
 		// Cleanup before tests
@@ -800,22 +584,54 @@ func TestListener(t *testing.T) {
 		{Method: "GET", Path: "/sample/foo", Code: 200},
 	}
 
-	// have all needed reload ticks ready
-	go func() {
-		for i := 0; i < 4*4; i++ {
-			ReloadTick <- time.Time{}
-		}
-	}()
+	ts.RunExt(t, tests...)
+}
+
+func TestListenerWithStrictRoutes(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+	})
+	t.Cleanup(ts.Close)
+
+	ts.Gw.ReloadTestCase.Enable()
+	defer ts.Gw.ReloadTestCase.Disable()
+
+	ts.Gw.ReloadTestCase.StartTicker()
+	defer ts.Gw.ReloadTestCase.StopTicker()
+	tests := []test.TestCase{
+		// Cleanup before tests
+		{Method: "DELETE", Path: "/tyk/apis/test", AdminAuth: true},
+		{Method: "GET", Path: "/tyk/reload/?block=true", AdminAuth: true, Code: 200},
+
+		{Method: "GET", Path: "/sample", Code: 404},
+		{Method: "GET", Path: "/tyk/apis/", Code: 403},
+		{Method: "GET", Path: "/tyk/apis/", AdminAuth: true, Code: 200, BodyMatch: `\[\]`},
+		{Method: "GET", Path: "/tyk/apis", Code: 403},
+		{Method: "GET", Path: "/tyk/apis", AdminAuth: true, Code: 200},
+		{Method: "POST", Path: "/tyk/apis", Data: sampleAPI, AdminAuth: true, Code: 200},
+		{Method: "GET", Path: "/tyk/apis/", AdminAuth: true, Code: 200, BodyMatch: `\[\]`},
+		{Method: "POST", Path: "/tyk/apis/mismatch", AdminAuth: true, Code: 400},
+		{Method: "GET", Path: "/tyk/apis/test", AdminAuth: true, Code: 404},
+		// API definitions not reloaded yet
+		{Method: "GET", Path: "/sample", Code: 404},
+		{Method: "GET", Path: "/tyk/reload/?block=true", AdminAuth: true, Code: 200},
+		{Method: "GET", Path: "/tyk/apis/test", AdminAuth: true, Code: 200, BodyMatch: `^{.*"api_id":"test".*}`},
+		{Method: "GET", Path: "/tyk/apis/", AdminAuth: true, Code: 200, BodyMatch: `^\[.*"api_id":"test".*\]`},
+		{Method: "GET", Path: "/sample", Code: 200},
+		{Method: "GET", Path: "/samplefoo", Code: 404},
+		{Method: "GET", Path: "/sample/", Code: 200},
+		{Method: "GET", Path: "/sample/foo", Code: 200},
+	}
 
 	ts.RunExt(t, tests...)
 }
 
 // Admin api located on separate port
 func TestControlListener(t *testing.T) {
-	ts := StartTest(TestConfig{
-		sepatateControlAPI: true,
+	ts := StartTest(nil, TestConfig{
+		SeparateControlAPI: true,
 	})
-	defer ts.Close()
+	t.Cleanup(ts.Close)
 
 	tests := []test.TestCase{
 		{Method: "GET", Path: "/", Code: 404},
@@ -828,11 +644,11 @@ func TestControlListener(t *testing.T) {
 	}
 
 	ts.RunExt(t, tests...)
-	DoReload()
+	ts.Gw.DoReload()
 	ts.RunExt(t, tests...)
 
-	// Moved here because DoReload overrides it
-	BuildAndLoadAPI(func(spec *APISpec) {
+	// Moved here because globalGateway.DoReload overrides it
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/user-api"
 		spec.UseKeylessAccess = true
 	})
@@ -844,39 +660,50 @@ func TestControlListener(t *testing.T) {
 }
 
 func TestHttpPprof(t *testing.T) {
-	old := cli.HTTPProfile
-	defer func() { cli.HTTPProfile = old }()
 
-	ts := StartTest(TestConfig{
-		sepatateControlAPI: true,
+	t.Run("HTTP Profile not active", func(t *testing.T) {
+		conf := func(globalConf *config.Config) {
+			globalConf.HTTPProfile = false
+		}
+		ts := StartTest(conf, TestConfig{
+			SeparateControlAPI: true,
+		})
+		t.Cleanup(ts.Close)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Path: "/debug/pprof/", Code: 404},
+			{Path: "/debug/pprof/", Code: 404, ControlRequest: true},
+		}...)
 	})
 
-	ts.Run(t, []test.TestCase{
-		{Path: "/debug/pprof/", Code: 404},
-		{Path: "/debug/pprof/", Code: 404, ControlRequest: true},
-	}...)
-	ts.Close()
+	t.Run("HTTP Profile active", func(t *testing.T) {
+		conf := func(globalConf *config.Config) {
+			globalConf.HTTPProfile = true
+		}
+		ts := StartTest(conf, TestConfig{
+			SeparateControlAPI: true,
+		})
+		t.Cleanup(ts.Close)
 
-	*cli.HTTPProfile = true
-
-	ts.Start()
-	ts.Run(t, []test.TestCase{
-		{Path: "/debug/pprof/", Code: 404},
-		{Path: "/debug/pprof/", Code: 200, ControlRequest: true},
-		{Path: "/debug/pprof/heap", Code: 200, ControlRequest: true},
-	}...)
-	ts.Close()
+		_, _ = ts.Run(t, []test.TestCase{
+			{Path: "/debug/pprof/", Code: 404},
+			{Path: "/debug/pprof/", Code: 200, ControlRequest: true},
+			{Path: "/debug/pprof/heap", Code: 200, ControlRequest: true},
+		}...)
+	})
 }
 
 func TestManagementNodeRedisEvents(t *testing.T) {
-	defer ResetTestConfig()
-	globalConf := config.Global()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	globalConf := ts.Gw.GetConfig()
 	globalConf.ManagementNode = false
-	config.SetGlobal(globalConf)
+	ts.Gw.SetConfig(globalConf)
 
 	t.Run("Without signing:", func(t *testing.T) {
-		msg := redis.Message{
-			Payload: `{"Command": "NoticeGatewayDRLNotification"}`,
+		msg := testMessageAdapter{
+			Msg: `{"Command": "NoticeGatewayDRLNotification"}`,
 		}
 
 		callbackRun := false
@@ -886,31 +713,32 @@ func TestManagementNodeRedisEvents(t *testing.T) {
 				t.Fatalf("want %q, got %q", want, got)
 			}
 		}
-		handleRedisEvent(&msg, shouldHandle, nil)
+		ts.Gw.handleRedisEvent(&msg, shouldHandle, nil)
 		if !callbackRun {
 			t.Fatalf("Should run callback")
 		}
 		globalConf.ManagementNode = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 		notHandle := func(got NotificationCommand) {
 			t.Fatalf("should have not handled redis event")
 		}
-		handleRedisEvent(msg, notHandle, nil)
+		ts.Gw.handleRedisEvent(msg, notHandle, nil)
 	})
 
 	t.Run("With signature", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.AllowInsecureConfigs = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
 		n := Notification{
 			Command: NoticeGroupReload,
 			Payload: string("test"),
+			Gw:      ts.Gw,
 		}
 		n.Sign()
-		msg := redis.Message{}
-		payload, _ := json.Marshal(n)
-		msg.Payload = string(payload)
+		msg := testMessageAdapter{}
+		payload := test.MarshalJSON(t)(n)
+		msg.Msg = string(payload)
 
 		callbackRun := false
 		shouldHandle := func(got NotificationCommand) {
@@ -920,104 +748,83 @@ func TestManagementNodeRedisEvents(t *testing.T) {
 			}
 		}
 
-		handleRedisEvent(&msg, shouldHandle, nil)
+		ts.Gw.handleRedisEvent(&msg, shouldHandle, nil)
 		if !callbackRun {
 			t.Fatalf("Should run callback")
 		}
 
 		n.Signature = "wrong"
 		payload, _ = json.Marshal(n)
-		msg.Payload = string(payload)
+		msg.Msg = string(payload)
 
 		valid := false
 		shouldFail := func(got NotificationCommand) {
 			valid = true
 		}
-		handleRedisEvent(&msg, shouldFail, nil)
+		ts.Gw.handleRedisEvent(&msg, shouldFail, nil)
 		if valid {
 			t.Fatalf("Should fail validation")
 		}
 	})
 }
 
-func TestListenPathTykPrefix(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+func TestDistributedRateLimiterDisabledRedisEvents(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	drlNotificationCommand := &testMessageAdapter{
+		Msg: `{"Command": "NoticeGatewayDRLNotification"}`,
+	}
+
+	shouldNotHandleNotification := func(NotificationCommand) {
+		assert.Fail(t, "should skip redis event")
+	}
+
+	globalConf := ts.Gw.GetConfig()
+
+	t.Run("enabled Sentinel Rate Limiter - should skip DRL updates", func(*testing.T) {
+		globalConf.EnableSentinelRateLimiter = true
+		ts.Gw.SetConfig(globalConf)
+
+		ts.Gw.handleRedisEvent(drlNotificationCommand, shouldNotHandleNotification, nil)
+
+		globalConf.EnableSentinelRateLimiter = false
+		ts.Gw.SetConfig(globalConf)
+	})
+
+	t.Run("enabled Redis Rolling Limiter - should skip DRL updates", func(*testing.T) {
+		globalConf.EnableRedisRollingLimiter = true
+		ts.Gw.SetConfig(globalConf)
+
+		ts.Gw.handleRedisEvent(drlNotificationCommand, shouldNotHandleNotification, nil)
+
+		globalConf.EnableRedisRollingLimiter = false
+		ts.Gw.SetConfig(globalConf)
+	})
+
+	t.Run("enabled Fixed Window Rate Limiter - should skip DRL updates", func(*testing.T) {
+		globalConf.EnableFixedWindowRateLimiter = true
+		ts.Gw.SetConfig(globalConf)
+
+		ts.Gw.handleRedisEvent(drlNotificationCommand, shouldNotHandleNotification, nil)
+
+		globalConf.EnableFixedWindowRateLimiter = false
+		ts.Gw.SetConfig(globalConf)
+	})
+}
+
+func TestListenPathTykPrefix(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/tyk-foo/"
 	})
 
-	ts.Run(t, test.TestCase{
+	_, _ = ts.Run(t, test.TestCase{
 		Path: "/tyk-foo/",
 		Code: 200,
 	})
-}
-
-func TestReloadGoroutineLeakWithAsyncWrites(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-
-	globalConf := config.Global()
-	globalConf.UseAsyncSessionWrite = true
-	globalConf.EnableJSVM = false
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	specs := BuildAndLoadAPI(func(spec *APISpec) {
-		spec.Proxy.ListenPath = "/"
-	})
-
-	before := runtime.NumGoroutine()
-
-	LoadAPI(specs...) // just doing DoReload() doesn't load anything as BuildAndLoadAPI cleans up folder with API specs
-
-	time.Sleep(100 * time.Millisecond)
-
-	after := runtime.NumGoroutine()
-
-	if before < after {
-		t.Errorf("Goroutine leak, was: %d, after reload: %d", before, after)
-	}
-}
-
-func TestReloadGoroutineLeakWithCircuitBreaker(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-
-	globalConf := config.Global()
-	globalConf.EnableJSVM = false
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	specs := BuildAndLoadAPI(func(spec *APISpec) {
-		spec.Proxy.ListenPath = "/"
-		UpdateAPIVersion(spec, "v1", func(version *apidef.VersionInfo) {
-			version.ExtendedPaths = apidef.ExtendedPathsSet{
-				CircuitBreaker: []apidef.CircuitBreakerMeta{
-					{
-						Path:                 "/",
-						Method:               http.MethodGet,
-						ThresholdPercent:     0.5,
-						Samples:              5,
-						ReturnToServiceAfter: 10,
-					},
-				},
-			}
-		})
-	})
-
-	before := runtime.NumGoroutine()
-
-	LoadAPI(specs...) // just doing DoReload() doesn't load anything as BuildAndLoadAPI cleans up folder with API specs
-
-	time.Sleep(100 * time.Millisecond)
-
-	after := runtime.NumGoroutine()
-
-	if before < after {
-		t.Errorf("Goroutine leak, was: %d, after reload: %d", before, after)
-	}
 }
 
 func listenProxyProto(ls net.Listener) error {
@@ -1045,8 +852,8 @@ func TestProxyProtocol(t *testing.T) {
 	}
 	defer l.Close()
 	go listenProxyProto(l)
-	ts := StartTest()
-	defer ts.Close()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 	rp, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1059,12 +866,11 @@ func TestProxyProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	EnablePort(p, "tcp")
-	defer ResetTestConfig()
+	ts.EnablePort(p, "tcp")
 
 	proxyAddr := rp.Addr().String()
 	rp.Close()
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 		spec.Protocol = "tcp"
 		spec.EnableProxyProtocol = true
@@ -1090,14 +896,14 @@ func TestProxyProtocol(t *testing.T) {
 }
 
 func TestProxyUserAgent(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 	})
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{
 			Headers:   map[string]string{"User-Agent": ""},
 			BodyMatch: fmt.Sprintf(`"User-Agent":"%s"`, defaultUserAgent),
@@ -1110,35 +916,34 @@ func TestProxyUserAgent(t *testing.T) {
 }
 
 func TestSkipUrlCleaning(t *testing.T) {
-	globalConf := config.Global()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	globalConf := ts.Gw.GetConfig()
 	globalConf.HttpServerOptions.OverrideDefaults = true
 	globalConf.HttpServerOptions.SkipURLCleaning = true
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	ts := StartTest()
-	defer ts.Close()
+	ts.Gw.SetConfig(globalConf)
 
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(r.URL.Path))
 	}))
 	defer s.Close()
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 		spec.Proxy.TargetURL = s.URL
 	})
 
-	ts.Run(t, test.TestCase{
+	_, _ = ts.Run(t, test.TestCase{
 		Path: "/http://example.com", BodyMatch: "/http://example.com", Code: 200,
 	})
 }
 
 func TestMultiTargetProxy(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.VersionData.NotVersioned = false
 		spec.VersionData.Versions = map[string]apidef.VersionInfo{
 			"vdef": {Name: "vdef"},
@@ -1150,7 +955,7 @@ func TestMultiTargetProxy(t *testing.T) {
 		spec.Proxy.ListenPath = "/"
 	})
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{
 			Headers:   map[string]string{"version": "vdef"},
 			JSONMatch: map[string]string{"Url": `"/"`},
@@ -1165,16 +970,15 @@ func TestMultiTargetProxy(t *testing.T) {
 }
 
 func TestCustomDomain(t *testing.T) {
+	localClient := test.NewClientLocal()
+
 	t.Run("With custom domain support", func(t *testing.T) {
-		globalConf := config.Global()
-		globalConf.EnableCustomDomains = true
-		config.SetGlobal(globalConf)
-		defer ResetTestConfig()
+		ts := StartTest(func(conf *config.Config) {
+			conf.EnableCustomDomains = true
+		})
+		t.Cleanup(ts.Close)
 
-		ts := StartTest()
-		defer ts.Close()
-
-		BuildAndLoadAPI(
+		ts.Gw.BuildAndLoadAPI(
 			func(spec *APISpec) {
 				spec.Domain = "host1"
 				spec.Proxy.ListenPath = "/with_domain"
@@ -1185,19 +989,19 @@ func TestCustomDomain(t *testing.T) {
 			},
 		)
 
-		ts.Run(t, []test.TestCase{
-			{Code: 200, Path: "/with_domain", Domain: "host1"},
-			{Code: 404, Path: "/with_domain"},
-			{Code: 200, Path: "/without_domain"},
-			{Code: 200, Path: "/tyk/keys", AdminAuth: true},
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/with_domain", Domain: "host1"},
+			{Client: localClient, Code: 404, Path: "/with_domain"},
+			{Client: localClient, Code: 200, Path: "/without_domain"},
+			{Client: localClient, Code: 200, Path: "/tyk/keys", AdminAuth: true},
 		}...)
 	})
 
 	t.Run("Without custom domain support", func(t *testing.T) {
-		ts := StartTest()
-		defer ts.Close()
+		ts := StartTest(nil)
+		t.Cleanup(ts.Close)
 
-		BuildAndLoadAPI(
+		ts.Gw.BuildAndLoadAPI(
 			func(spec *APISpec) {
 				spec.Domain = "host1.local."
 				spec.Proxy.ListenPath = "/"
@@ -1208,44 +1012,78 @@ func TestCustomDomain(t *testing.T) {
 			},
 		)
 
-		ts.Run(t, []test.TestCase{
-			{Code: 200, Path: "/with_domain", Domain: "host1"},
-			{Code: 200, Path: "/with_domain"},
-			{Code: 200, Path: "/without_domain"},
-			{Code: 200, Path: "/tyk/keys", AdminAuth: true},
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/with_domain", Domain: "host1"},
+			{Client: localClient, Code: 200, Path: "/with_domain"},
+			{Client: localClient, Code: 200, Path: "/without_domain"},
+			{Client: localClient, Code: 200, Path: "/tyk/keys", AdminAuth: true},
 		}...)
 	})
 }
 
-func TestHelloHealthcheck(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+func TestGatewayHealthCheck(t *testing.T) {
 
-	t.Run("Without APIs", func(t *testing.T) {
-		ts.Run(t, []test.TestCase{
-			{Method: "GET", Path: "/hello", Code: 200},
-		}...)
-	})
+	t.Run("control api port == listen port", func(t *testing.T) {
+		ts := StartTest(nil)
+		t.Cleanup(ts.Close)
 
-	t.Run("With APIs", func(t *testing.T) {
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.Proxy.ListenPath = "/sample"
+		t.Run("Without APIs", func(t *testing.T) {
+			_, _ = ts.Run(t, []test.TestCase{
+				{Path: "/hello", BodyMatch: `"status":"pass"`, Code: http.StatusOK},
+			}...)
 		})
 
-		ts.Run(t, []test.TestCase{
-			{Method: "GET", Path: "/hello", Code: 200},
-			{Method: "GET", Path: "/sample/hello", Code: 200},
-		}...)
+		t.Run("With API", func(t *testing.T) {
+			ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+				spec.Proxy.ListenPath = "/sample"
+			})
+
+			_, _ = ts.Run(t, []test.TestCase{
+				{Path: "/hello", BodyMatch: `"status":"pass"`, Code: http.StatusOK},
+			}...)
+		})
+	})
+
+	t.Run("control api port != listen port", func(t *testing.T) {
+		ts := StartTest(nil, TestConfig{
+			SeparateControlAPI: true,
+		})
+		t.Cleanup(ts.Close)
+
+		t.Run("Without APIs", func(t *testing.T) {
+			_, _ = ts.Run(t, []test.TestCase{
+				{Path: "/hello", Code: http.StatusNotFound},
+				{ControlRequest: true, Path: "/hello", BodyMatch: `"status":"pass"`, Code: http.StatusOK},
+			}...)
+		})
+
+		t.Run("With API", func(t *testing.T) {
+			ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+				spec.Proxy.ListenPath = "/sample"
+			})
+
+			_, _ = ts.Run(t, []test.TestCase{
+				{Path: "/hello", Code: http.StatusNotFound},
+				{ControlRequest: true, Path: "/hello", BodyMatch: `"status":"pass"`, Code: http.StatusOK},
+			}...)
+		})
 	})
 }
 
 func TestCacheAllSafeRequests(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.CacheOptions = apidef.CacheOptions{
 			CacheTimeout:         120,
 			EnableCache:          true,
@@ -1256,7 +1094,7 @@ func TestCacheAllSafeRequests(t *testing.T) {
 
 	headerCache := map[string]string{"x-tyk-cached-response": "1"}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: "GET", Path: "/", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: "GET", Path: "/", HeadersMatch: headerCache},
 		{Method: "POST", Path: "/", HeadersNotMatch: headerCache},
@@ -1266,14 +1104,22 @@ func TestCacheAllSafeRequests(t *testing.T) {
 }
 
 func TestCacheAllSafeRequestsWithCachedHeaders(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
+
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
 	authorization := "authorization"
 	tenant := "tenant-id"
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.CacheOptions = apidef.CacheOptions{
 			CacheTimeout:         120,
 			EnableCache:          true,
@@ -1285,16 +1131,16 @@ func TestCacheAllSafeRequestsWithCachedHeaders(t *testing.T) {
 	})
 
 	headerCache := map[string]string{"x-tyk-cached-response": "1"}
-	sess1token := CreateSession(func(s *user.SessionState) {
+	sess1token := CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.Rate = 1
 		s.Per = 60
 	})
-	sess2token := CreateSession(func(s *user.SessionState) {
+	sess2token := CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.Rate = 1
 		s.Per = 60
 	})
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: http.MethodGet, Path: "/", Headers: map[string]string{authorization: sess1token}, HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: http.MethodGet, Path: "/", Headers: map[string]string{authorization: sess1token}, HeadersMatch: headerCache},
 		{Method: http.MethodGet, Path: "/", Headers: map[string]string{authorization: sess2token}, HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
@@ -1307,12 +1153,19 @@ func TestCacheAllSafeRequestsWithCachedHeaders(t *testing.T) {
 }
 
 func TestCacheWithAdvanceUrlRewrite(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		version := spec.VersionData.Versions["v1"]
 		version.UseExtendedPaths = true
 		version.ExtendedPaths = apidef.ExtendedPathsSet{
@@ -1350,7 +1203,7 @@ func TestCacheWithAdvanceUrlRewrite(t *testing.T) {
 	matchHeaders := map[string]string{"rewritePath": "newpath"}
 	randomheaders := map[string]string{"something": "abcd"}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: http.MethodGet, Path: "/test", Headers: matchHeaders, HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: http.MethodGet, Path: "/test", Headers: matchHeaders, HeadersMatch: headerCache},
 		//Even if trigger condition failed, as response is cached
@@ -1362,13 +1215,21 @@ func TestCacheWithAdvanceUrlRewrite(t *testing.T) {
 }
 
 func TestCachePostRequest(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
+
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
 	tenant := "tenant-id"
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.CacheOptions = apidef.CacheOptions{
 			CacheTimeout:         120,
 			EnableCache:          true,
@@ -1391,7 +1252,7 @@ func TestCachePostRequest(t *testing.T) {
 
 	headerCache := map[string]string{"x-tyk-cached-response": "1"}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: http.MethodPost, Path: "/", Data: "{\"id\":\"1\",\"name\":\"test\"}", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: http.MethodPost, Path: "/", Data: "{\"id\":\"1\",\"name\":\"test\"}", HeadersMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: http.MethodPost, Path: "/", Data: "{\"id\":\"2\",\"name\":\"test\"}", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
@@ -1404,13 +1265,21 @@ func TestCachePostRequest(t *testing.T) {
 }
 
 func TestAdvanceCachePutRequest(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
+
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
 	tenant := "tenant-id"
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.CacheOptions = apidef.CacheOptions{
 			CacheTimeout:           120,
 			EnableCache:            true,
@@ -1421,7 +1290,7 @@ func TestAdvanceCachePutRequest(t *testing.T) {
 		spec.Proxy.ListenPath = "/"
 
 		UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
-			json.Unmarshal([]byte(`[{
+			err := json.Unmarshal([]byte(`[{
 						"method":"PUT",
 						"path":"/put/",
 						"cache_key_regex":"\"id\":[^,]*",
@@ -1442,13 +1311,14 @@ func TestAdvanceCachePutRequest(t *testing.T) {
 						"cache_key_regex":".*"
 					}
                                 ]`), &v.ExtendedPaths.AdvanceCacheConfig)
+			assert.NoError(t, err)
 		})
 		spec.Proxy.ListenPath = "/"
 	})
 
 	headerCache := map[string]string{"x-tyk-cached-response": "1"}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: http.MethodPut, Path: "/put/", Data: "{\"id\":\"1\",\"name\":\"test\"}", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond}, // 0
 		{Method: http.MethodPut, Path: "/put/", Data: "{\"id\":\"1\",\"name\":\"test\"}", HeadersMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: http.MethodPut, Path: "/put/", Data: "{\"id\":\"2\",\"name\":\"test\"}", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
@@ -1491,12 +1361,19 @@ func TestAdvanceCachePutRequest(t *testing.T) {
 }
 
 func TestCacheAllSafeRequestsWithAdvancedCacheEndpoint(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.CacheOptions = apidef.CacheOptions{
 			CacheTimeout:           120,
 			EnableCache:            true,
@@ -1518,7 +1395,7 @@ func TestCacheAllSafeRequestsWithAdvancedCacheEndpoint(t *testing.T) {
 
 	headerCache := map[string]string{"x-tyk-cached-response": "1"}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		// Make sure CacheAllSafeRequests is working
 		{Method: http.MethodGet, Path: "/", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
 		{Method: http.MethodGet, Path: "/", HeadersMatch: headerCache},
@@ -1526,17 +1403,24 @@ func TestCacheAllSafeRequestsWithAdvancedCacheEndpoint(t *testing.T) {
 }
 
 func TestCacheEtag(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	cache := storage.RedisCluster{KeyPrefix: "cache-"}
-	defer cache.DeleteScanMatch("*")
+	t.Skip() // DeleteScanMatch interferes with other tests.
+
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Etag", "12345")
 		w.Write([]byte("body"))
 	}))
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.CacheOptions = apidef.CacheOptions{
 			CacheTimeout:         120,
 			EnableCache:          true,
@@ -1550,7 +1434,7 @@ func TestCacheEtag(t *testing.T) {
 	invalidEtag := map[string]string{"If-None-Match": "invalid"}
 	validEtag := map[string]string{"If-None-Match": "12345"}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: "GET", Path: "/", HeadersNotMatch: headerCache, Delay: 100 * time.Millisecond},
 		{Method: "GET", Path: "/", HeadersMatch: headerCache, BodyMatch: "body"},
 		{Method: "GET", Path: "/", Headers: invalidEtag, HeadersMatch: headerCache, BodyMatch: "body"},
@@ -1558,42 +1442,117 @@ func TestCacheEtag(t *testing.T) {
 	}...)
 }
 
-// func TestWebsocketsUpstreamUpgradeRequest(t *testing.T) {
-// 	// setup spec and do test HTTP upgrade-request
-// 	globalConf := config.Global()
-// 	globalConf.HttpServerOptions.EnableWebSockets = true
-// 	config.SetGlobal(globalConf)
-// 	defer ResetTestConfig()
+func TestOldCachePlugin(t *testing.T) {
+	t.Skip() // DeleteScanMatch interferes with other tests.
 
-// 	ts := StartTest()
-// 	defer ts.Close()
+	api := BuildAPI(func(spec *APISpec) {
+		spec.Proxy.ListenPath = "/"
+		UpdateAPIVersion(spec, "v1", func(version *apidef.VersionInfo) {
+			version.UseExtendedPaths = true
+			version.ExtendedPaths.Cached = []string{"/test"}
+		})
+		spec.CacheOptions = apidef.CacheOptions{
+			EnableCache:  true,
+			CacheTimeout: 120,
+		}
+	})[0]
 
-// 	BuildAndLoadAPI(func(spec *APISpec) {
-// 		spec.Proxy.ListenPath = "/"
-// 	})
+	headerCache := map[string]string{"x-tyk-cached-response": "1"}
 
-// 	ts.Run(t, test.TestCase{
-// 		Path: "/ws",
-// 		Headers: map[string]string{
-// 			"Connection":            "Upgrade",
-// 			"Upgrade":               "websocket",
-// 			"Sec-Websocket-Version": "13",
-// 			"Sec-Websocket-Key":     "abc",
-// 		},
-// 		Code: http.StatusSwitchingProtocols,
-// 	})
-// }
+	check := func(t *testing.T) {
+		t.Helper()
+
+		ts := StartTest(nil)
+
+		cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+		cache.Connect()
+
+		t.Cleanup(func() {
+			ts.Close()
+			cache.DeleteScanMatch("*")
+		})
+
+		ts.Gw.LoadAPI(api)
+		_, _ = ts.Run(t, []test.TestCase{
+			{Path: "/test", HeadersNotMatch: headerCache, Code: http.StatusOK, Delay: 10 * time.Millisecond},
+			{Path: "/test", HeadersMatch: headerCache, Code: http.StatusOK},
+			{Path: "/anything", HeadersNotMatch: headerCache, Code: http.StatusOK, Delay: 10 * time.Millisecond},
+			{Path: "/anything", HeadersNotMatch: headerCache, Code: http.StatusOK},
+		}...)
+	}
+
+	check(t)
+
+	t.Run("migration", func(t *testing.T) {
+		_, err := api.Migrate()
+		assert.NoError(t, err)
+
+		check(t)
+	})
+}
+
+func TestAdvanceCacheTimeoutPerEndpoint(t *testing.T) {
+	t.Skip() // DeleteScanMatch interferes with other tests.
+
+	ts := StartTest(nil)
+
+	cache := storage.RedisCluster{KeyPrefix: "cache-", ConnectionHandler: ts.Gw.StorageConnectionHandler}
+	cache.Connect()
+
+	t.Cleanup(func() {
+		ts.Close()
+		cache.DeleteScanMatch("*")
+	})
+
+	extendedPaths := apidef.ExtendedPathsSet{
+		AdvanceCacheConfig: []apidef.CacheMeta{
+			{
+				Method: http.MethodGet,
+				Path:   "/my-cached-endpoint",
+			},
+		},
+	}
+
+	api := BuildAPI(func(spec *APISpec) {
+		spec.Proxy.ListenPath = "/"
+		spec.CacheOptions = apidef.CacheOptions{
+			CacheTimeout: 0,
+			EnableCache:  true,
+		}
+
+		UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
+			v.ExtendedPaths = extendedPaths
+		})
+	})[0]
+
+	ts.Gw.LoadAPI(api)
+
+	headerCache := map[string]string{"x-tyk-cached-response": "1"}
+
+	_, _ = ts.Run(t, []test.TestCase{
+		{Method: http.MethodGet, Path: "/my-cached-endpoint", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
+		{Method: http.MethodGet, Path: "/my-cached-endpoint", HeadersNotMatch: headerCache},
+	}...)
+
+	// endpoint level cache timeout should override
+	extendedPaths.AdvanceCacheConfig[0].Timeout = 120
+	ts.Gw.LoadAPI(api)
+
+	_, _ = ts.Run(t, []test.TestCase{
+		{Method: http.MethodGet, Path: "/my-cached-endpoint", HeadersNotMatch: headerCache, Delay: 10 * time.Millisecond},
+		{Method: http.MethodGet, Path: "/my-cached-endpoint", HeadersMatch: headerCache},
+	}...)
+}
 
 func TestWebsocketsSeveralOpenClose(t *testing.T) {
-	globalConf := config.Global()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	globalConf := ts.Gw.GetConfig()
 	globalConf.HttpServerOptions.EnableWebSockets = true
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
+	ts.Gw.SetConfig(globalConf)
 
-	ts := StartTest()
-	defer ts.Close()
-
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 	})
 
@@ -1683,15 +1642,14 @@ func TestWebsocketsSeveralOpenClose(t *testing.T) {
 }
 
 func TestWebsocketsAndHTTPEndpointMatch(t *testing.T) {
-	globalConf := config.Global()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	globalConf := ts.Gw.GetConfig()
 	globalConf.HttpServerOptions.EnableWebSockets = true
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
+	ts.Gw.SetConfig(globalConf)
 
-	ts := StartTest()
-	defer ts.Close()
-
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/"
 	})
 
@@ -1715,7 +1673,7 @@ func TestWebsocketsAndHTTPEndpointMatch(t *testing.T) {
 	}
 
 	// make 1st http request
-	ts.Run(t, test.TestCase{
+	_, _ = ts.Run(t, test.TestCase{
 		Method: "GET",
 		Path:   "/abc",
 		Code:   http.StatusOK,
@@ -1754,7 +1712,7 @@ func TestWebsocketsAndHTTPEndpointMatch(t *testing.T) {
 	}
 
 	// make 2nd http request
-	ts.Run(t, test.TestCase{
+	_, _ = ts.Run(t, test.TestCase{
 		Method: "GET",
 		Path:   "/abc",
 		Code:   http.StatusOK,
@@ -1763,7 +1721,7 @@ func TestWebsocketsAndHTTPEndpointMatch(t *testing.T) {
 	wsConn.Close()
 
 	// make 3d http request after closing WS connection
-	ts.Run(t, test.TestCase{
+	_, _ = ts.Run(t, test.TestCase{
 		Method: "GET",
 		Path:   "/abc",
 		Code:   http.StatusOK,
@@ -1783,7 +1741,7 @@ func createTestUptream(t *testing.T, allowedConns int, readsPerConn int) net.Lis
 			conns++
 
 			if conns > allowedConns {
-				t.Fatal("Too many connections")
+				t.Error("Too many connections")
 				conn.Close()
 				return
 			}
@@ -1817,26 +1775,25 @@ func createTestUptream(t *testing.T, allowedConns int, readsPerConn int) net.Lis
 }
 
 func TestKeepAliveConns(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	defer ResetTestConfig()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
 	t.Run("Should use same connection", func(t *testing.T) {
 		// set keep alive option
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.ProxyCloseConnections = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
 		// Allow 1 connection with 3 reads
 		upstream := createTestUptream(t, 1, 3)
 		defer upstream.Close()
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 			spec.Proxy.TargetURL = "http://" + upstream.Addr().String()
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Code: 200},
 			{Code: 200},
 			{Code: 200},
@@ -1844,20 +1801,20 @@ func TestKeepAliveConns(t *testing.T) {
 	})
 
 	t.Run("Should use separate connection", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.ProxyCloseConnections = true
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
 		// Allow 3 connections with 1 read
 		upstream := createTestUptream(t, 3, 1)
 		defer upstream.Close()
 
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 			spec.Proxy.TargetURL = "http://" + upstream.Addr().String()
 		})
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Code: 200},
 			{Code: 200},
 			{Code: 200},
@@ -1865,21 +1822,21 @@ func TestKeepAliveConns(t *testing.T) {
 	})
 
 	t.Run("Should respect max_conn_time", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.ProxyCloseConnections = false
 		globalConf.MaxConnTime = 1
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
 		// Allow 2 connection with 2 reads
 		upstream := createTestUptream(t, 2, 2)
 		defer upstream.Close()
 
-		spec := BuildAndLoadAPI(func(spec *APISpec) {
+		spec := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 			spec.Proxy.TargetURL = "http://" + upstream.Addr().String()
 		})[0]
 
-		ts.Run(t, []test.TestCase{
+		_, _ = ts.Run(t, []test.TestCase{
 			{Code: 200},
 			{Code: 200},
 		}...)
@@ -1889,7 +1846,7 @@ func TestKeepAliveConns(t *testing.T) {
 
 		// Should be called in new connection
 		// We already made 2 requests above, so 3th in same not allowed
-		ts.Run(t, test.TestCase{Code: 200})
+		_, _ = ts.Run(t, test.TestCase{Code: 200})
 	})
 }
 
@@ -1897,16 +1854,15 @@ func TestKeepAliveConns(t *testing.T) {
 // for the API. Meaning that a single token cannot reduce service availability for other tokens by simply going over the
 // API's global rate limit.
 func TestRateLimitForAPIAndRateLimitAndQuotaCheck(t *testing.T) {
-	defer ResetTestConfig()
-	ts := StartTest()
-	defer ts.Close()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
-	globalCfg := config.Global()
+	globalCfg := ts.Gw.GetConfig()
 	globalCfg.EnableNonTransactionalRateLimiter = false
 	globalCfg.EnableSentinelRateLimiter = true
-	config.SetGlobal(globalCfg)
+	ts.Gw.SetConfig(globalCfg)
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.APIID += "_" + time.Now().String()
 		spec.UseKeylessAccess = false
 		spec.DisableRateLimit = false
@@ -1918,19 +1874,19 @@ func TestRateLimitForAPIAndRateLimitAndQuotaCheck(t *testing.T) {
 		spec.Proxy.ListenPath = "/"
 	})
 
-	sess1token := CreateSession(func(s *user.SessionState) {
+	sess1token := CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.Rate = 1
 		s.Per = 60
 	})
-	defer GlobalSessionManager.RemoveSession("default", sess1token, false)
+	defer ts.Gw.GlobalSessionManager.RemoveSession("default", sess1token, false)
 
-	sess2token := CreateSession(func(s *user.SessionState) {
+	sess2token := CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.Rate = 1
 		s.Per = 60
 	})
-	defer GlobalSessionManager.RemoveSession("default", sess2token, false)
+	defer ts.Gw.GlobalSessionManager.RemoveSession("default", sess2token, false)
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Headers: map[string]string{"Authorization": sess1token}, Code: http.StatusOK, Path: "/", Delay: 100 * time.Millisecond},
 		{Headers: map[string]string{"Authorization": sess1token}, Code: http.StatusTooManyRequests, Path: "/"},
 		{Headers: map[string]string{"Authorization": sess2token}, Code: http.StatusOK, Path: "/", Delay: 100 * time.Millisecond},
@@ -1939,30 +1895,49 @@ func TestRateLimitForAPIAndRateLimitAndQuotaCheck(t *testing.T) {
 }
 
 func TestTracing(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
 
-	prepareStorage()
+	ts.Gw.prepareStorage()
+
+	{
+		conf := ts.Gw.GetConfig()
+		conf.EnableBundleDownloader = true
+		conf.BundleBaseURL = "http://some-invalid-path"
+		ts.Gw.SetConfig(conf)
+	}
+
 	spec := BuildAPI(func(spec *APISpec) {
 		spec.UseKeylessAccess = false
 	})[0]
 
-	keyID := CreateSession(func(s *user.SessionState) {})
+	oasSpec := BuildOASAPI(func(oasDef *oas.OAS) {
+		tykExt := oasDef.GetTykExtension()
+		tykExt.Info.State.Active = true
+	})[0]
+
+	apiDefWithBundle := &apidef.APIDefinition{
+		CustomMiddlewareBundle: "some-path",
+	}
+
+	keyID := CreateSession(ts.Gw)
 	authHeaders := map[string][]string{"Authorization": {keyID}}
 
-	ts.Run(t, []test.TestCase{
+	_, _ = ts.Run(t, []test.TestCase{
 		{Method: "GET", Path: "/tyk/debug", AdminAuth: true, Code: 405},
 		{Method: "POST", Path: "/tyk/debug", AdminAuth: true, Code: 400, BodyMatch: "Request malformed"},
 		{Method: "POST", Path: "/tyk/debug", Data: `{}`, AdminAuth: true, Code: 400, BodyMatch: "Spec field is missing"},
 		{Method: "POST", Path: "/tyk/debug", Data: `{"Spec": {}}`, AdminAuth: true, Code: 400, BodyMatch: "Request field is missing"},
 		{Method: "POST", Path: "/tyk/debug", Data: `{"Spec": {}, "Request": {}}`, AdminAuth: true, Code: 400, BodyMatch: "Spec not valid, skipped!"},
 		{Method: "POST", Path: "/tyk/debug", Data: traceRequest{Spec: spec.APIDefinition, Request: &traceHttpRequest{Method: "GET", Path: "/"}}, AdminAuth: true, Code: 200, BodyMatch: `401 Unauthorized`},
+		{Method: "POST", Path: "/tyk/debug", Data: traceRequest{Spec: apiDefWithBundle, Request: &traceHttpRequest{Method: "GET", Path: "/", Headers: authHeaders}}, AdminAuth: true, Code: http.StatusBadRequest, BodyMatch: `Couldn't load bundle`},
 		{Method: "POST", Path: "/tyk/debug", Data: traceRequest{Spec: spec.APIDefinition, Request: &traceHttpRequest{Path: "/", Headers: authHeaders}}, AdminAuth: true, Code: 200, BodyMatch: `200 OK`},
+		{Method: "POST", Path: "/tyk/debug", Data: traceRequest{OAS: &oasSpec.OAS, Request: &traceHttpRequest{Method: "GET", Path: "/"}}, AdminAuth: true, Code: http.StatusOK},
 	}...)
 
 	t.Run("Custom auth header", func(t *testing.T) {
 		spec.AuthConfigs = map[string]apidef.AuthConfig{
-			authTokenType: {
+			apidef.AuthTokenType: {
 				AuthHeaderName: "Custom-Auth-Header",
 			},
 		}
@@ -1979,15 +1954,14 @@ func TestTracing(t *testing.T) {
 }
 
 func TestBrokenClients(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	defer ResetTestConfig()
 
-	globalConf := config.Global()
-	globalConf.ProxyDefaultTimeout = 1
-	config.SetGlobal(globalConf)
+	conf := func(gwConf *config.Config) {
+		gwConf.ProxyDefaultTimeout = 1
+	}
+	ts := StartTest(conf)
+	t.Cleanup(ts.Close)
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.UseKeylessAccess = true
 		spec.Proxy.ListenPath = "/"
 		spec.EnforcedTimeoutEnabled = true
@@ -1996,7 +1970,7 @@ func TestBrokenClients(t *testing.T) {
 	buf := make([]byte, 1024)
 
 	t.Run("Valid client", func(t *testing.T) {
-		conn, _ := net.DialTimeout("tcp", mainProxy().listener.Addr().String(), 0)
+		conn, _ := net.DialTimeout("tcp", ts.mainProxy().listener.Addr().String(), 0)
 		conn.Write([]byte("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"))
 		conn.Read(buf)
 
@@ -2007,17 +1981,17 @@ func TestBrokenClients(t *testing.T) {
 
 	t.Run("Invalid client: close without read", func(t *testing.T) {
 		time.Sleep(recordsBufferFlushInterval + 50*time.Millisecond)
-		analytics.Store.GetAndDeleteSet(analyticsKeyName)
+		ts.Gw.Analytics.Store.GetAndDeleteSet(analyticsKeyName)
 
-		conn, _ := net.DialTimeout("tcp", mainProxy().listener.Addr().String(), 0)
+		conn, _ := net.DialTimeout("tcp", ts.mainProxy().listener.Addr().String(), 0)
 		conn.Write([]byte("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"))
 		conn.Close()
 		//conn.Read(buf)
 
 		time.Sleep(recordsBufferFlushInterval + 50*time.Millisecond)
-		results := analytics.Store.GetAndDeleteSet(analyticsKeyName)
+		results := ts.Gw.Analytics.Store.GetAndDeleteSet(analyticsKeyName)
 
-		var record AnalyticsRecord
+		var record analytics.AnalyticsRecord
 		msgpack.Unmarshal([]byte(results[0].(string)), &record)
 		if record.ResponseCode != 499 {
 			t.Fatal("Analytics record do not match:", record)
@@ -2025,50 +1999,15 @@ func TestBrokenClients(t *testing.T) {
 	})
 }
 
-func TestStripRegex(t *testing.T) {
-	sample := []struct {
-		strip  string
-		path   string
-		expect string
-		vars   map[string]string
-	}{
-		{
-			strip:  "/base",
-			path:   "/base/path",
-			expect: "/path",
-			vars:   map[string]string{},
-		},
-		{
-			strip:  "/base/{key}",
-			path:   "/base/path/path",
-			expect: "/path",
-			vars: map[string]string{
-				"key": "path",
-			},
-		},
-		{
-			strip:  "/taihoe-test/{test:[\\w\\d]+}/id/",
-			path:   "/taihoe-test/asdas234234dad/id/v1/get",
-			expect: "v1/get",
-			vars: map[string]string{
-				"test": "asdas234234dad",
-			},
-		},
-	}
-	for _, v := range sample {
-		got := stripListenPath(v.strip, v.path, v.vars)
-		if got != v.expect {
-			t.Errorf("expected %s got %s", v.expect, got)
-		}
-	}
-}
-
 func TestCache_singleErrorResponse(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
-	BuildAndLoadAPI(func(spec *APISpec) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("{}"))
+	}))
+
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.UseKeylessAccess = true
 		spec.Proxy.ListenPath = "/"
 		spec.Proxy.TargetURL = srv.URL
@@ -2076,21 +2015,31 @@ func TestCache_singleErrorResponse(t *testing.T) {
 		spec.CacheOptions.EnableCache = true
 		spec.CacheOptions.CacheAllSafeRequests = true
 	})
-	ts.Run(t,
+
+	_, _ = ts.Run(t,
 		test.TestCase{Method: http.MethodGet, Path: "/", Code: http.StatusOK},
 	)
-	time.Sleep(time.Second)
+
 	srv.Close()
+
+	_, _ = ts.Run(t,
+		test.TestCase{Method: http.MethodGet, Path: "/", Code: http.StatusOK},
+	)
+
+	time.Sleep(time.Second)
+
 	wantBody := `{
     "error": "There was a problem proxying the request"
 }`
-	ts.Run(t,
+	_, _ = ts.Run(t,
 		test.TestCase{Method: http.MethodGet, Path: "/", Code: http.StatusInternalServerError, BodyMatch: wantBody},
 	)
 }
 
 func TestOverrideErrors(t *testing.T) {
-	defer ResetTestConfig()
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
 	defer defaultTykErrors()
 
 	assert := func(expectedError string, expectedCode int, actualError error, actualCode int) {
@@ -2112,7 +2061,7 @@ func TestOverrideErrors(t *testing.T) {
 	const message6 = "Message6"
 	const code6 = 906
 
-	testConf := config.Global()
+	testConf := ts.Gw.GetConfig()
 
 	testConf.OverrideMessages = map[string]config.TykError{
 		ErrOAuthAuthorizationFieldMissing: {
@@ -2140,9 +2089,9 @@ func TestOverrideErrors(t *testing.T) {
 			Code:    code6,
 		},
 	}
-	config.SetGlobal(testConf)
+	ts.Gw.SetConfig(testConf)
 
-	overrideTykErrors()
+	overrideTykErrors(ts.Gw)
 
 	e, i := errorAndStatusCode(ErrOAuthAuthorizationFieldMissing)
 	assert(message1, code1, e, i)
@@ -2172,9 +2121,9 @@ func TestOverrideErrors(t *testing.T) {
 			},
 		}
 
-		config.SetGlobal(testConf)
+		ts.Gw.SetConfig(testConf)
 
-		overrideTykErrors()
+		overrideTykErrors(ts.Gw)
 
 		e, i := errorAndStatusCode(ErrOAuthAuthorizationFieldMissing)
 		assert(message1, code4, e, i)
@@ -2183,4 +2132,102 @@ func TestOverrideErrors(t *testing.T) {
 		assert(message4, code2, e, i)
 	})
 
+}
+
+func TestGateway_GetLoadedAPIIDs(t *testing.T) {
+	t.Run("returns empty slice when no APIs loaded", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		result := ts.Gw.GetLoadedAPIIDs()
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+
+	t.Run("returns loaded API IDs", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "test-api-1"
+				spec.Proxy.ListenPath = "/api1/"
+			},
+			func(spec *APISpec) {
+				spec.APIID = "test-api-2"
+				spec.Proxy.ListenPath = "/api2/"
+			},
+		)
+
+		result := ts.Gw.GetLoadedAPIIDs()
+		assert.Len(t, result, 2)
+
+		// Collect API IDs for comparison (order may vary due to map iteration)
+		apiIDs := make(map[string]bool)
+		for _, info := range result {
+			apiIDs[info.APIID] = true
+		}
+		assert.True(t, apiIDs["test-api-1"])
+		assert.True(t, apiIDs["test-api-2"])
+	})
+
+	t.Run("returns correct struct type", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+			spec.APIID = "struct-test-api"
+		})
+
+		result := ts.Gw.GetLoadedAPIIDs()
+		assert.Len(t, result, 1)
+		assert.Equal(t, "struct-test-api", result[0].APIID)
+	})
+}
+
+func TestGateway_GetLoadedPolicyIDs(t *testing.T) {
+	t.Run("returns empty slice when no policies loaded", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		result := ts.Gw.GetLoadedPolicyIDs()
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+
+	t.Run("returns loaded policy IDs", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		ts.CreatePolicy(func(p *user.Policy) {
+			p.ID = "test-policy-1"
+		})
+		ts.CreatePolicy(func(p *user.Policy) {
+			p.ID = "test-policy-2"
+		})
+
+		result := ts.Gw.GetLoadedPolicyIDs()
+		assert.Len(t, result, 2)
+
+		// Collect policy IDs for comparison (order may vary)
+		policyIDs := make(map[string]bool)
+		for _, info := range result {
+			policyIDs[info.PolicyID] = true
+		}
+		assert.True(t, policyIDs["test-policy-1"])
+		assert.True(t, policyIDs["test-policy-2"])
+	})
+
+	t.Run("returns correct struct type", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		ts.CreatePolicy(func(p *user.Policy) {
+			p.ID = "struct-test-policy"
+		})
+
+		result := ts.Gw.GetLoadedPolicyIDs()
+		assert.Len(t, result, 1)
+		assert.Equal(t, "struct-test-policy", result[0].PolicyID)
+	})
 }

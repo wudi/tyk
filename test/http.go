@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,28 +16,36 @@ import (
 	"time"
 )
 
+type TestCases []TestCase
 type TestCase struct {
-	Method          string            `json:",omitempty"`
-	Path            string            `json:",omitempty"`
-	BaseURL         string            `json:",omitempty"`
-	Domain          string            `json:",omitempty"`
-	Proto           string            `json:",omitempty"`
-	Code            int               `json:",omitempty"`
-	Data            interface{}       `json:",omitempty"`
-	Headers         map[string]string `json:",omitempty"`
-	PathParams      map[string]string `json:",omitempty"`
-	FormParams      map[string]string `json:",omitempty"`
-	Cookies         []*http.Cookie    `json:",omitempty"`
-	Delay           time.Duration     `json:",omitempty"`
-	BodyMatch       string            `json:",omitempty"` // regex
-	BodyMatchFunc   func([]byte) bool `json:",omitempty"`
-	BodyNotMatch    string            `json:",omitempty"`
-	HeadersMatch    map[string]string `json:",omitempty"`
-	HeadersNotMatch map[string]string `json:",omitempty"`
-	JSONMatch       map[string]string `json:",omitempty"`
-	ErrorMatch      string            `json:",omitempty"`
-	BeforeFn        func()            `json:"-"`
-	Client          *http.Client      `json:"-"`
+	Host    string `json:",omitempty"`
+	Method  string `json:",omitempty"`
+	Path    string `json:",omitempty"`
+	BaseURL string `json:",omitempty"`
+	Domain  string `json:",omitempty"`
+	Proto   string `json:",omitempty"`
+
+	// Code is the expected HTTP response status code.
+	Code int `json:",omitempty"`
+
+	Data            interface{}         `json:",omitempty"`
+	Headers         map[string]string   `json:",omitempty"`
+	HeadersArray    map[string][]string `json:",omitempty"`
+	PathParams      map[string]string   `json:",omitempty"`
+	FormParams      map[string]string   `json:",omitempty"`
+	QueryParams     map[string]string   `json:",omitempty"`
+	Cookies         []*http.Cookie      `json:",omitempty"`
+	Delay           time.Duration       `json:",omitempty"`
+	BodyMatch       string              `json:",omitempty"` // regex
+	BodyNotMatch    string              `json:",omitempty"`
+	HeadersMatch    map[string]string   `json:",omitempty"`
+	HeadersNotMatch map[string]string   `json:",omitempty"`
+	JSONMatch       map[string]string   `json:",omitempty"`
+	ErrorMatch      string              `json:",omitempty"`
+
+	BodyMatchFunc func([]byte) bool `json:"-"`
+	BeforeFn      func()            `json:"-"`
+	Client        *http.Client      `json:"-"`
 
 	AdminAuth      bool `json:",omitempty"`
 	ControlRequest bool `json:",omitempty"`
@@ -157,6 +166,19 @@ func NewRequest(tc *TestCase) (req *http.Request, err error) {
 		req.Header.Add(k, v)
 	}
 
+	for header, values := range tc.HeadersArray {
+		for _, v := range values {
+			req.Header.Add(header, v)
+		}
+	}
+
+	// Default to JSON without turning an explicitly supplied Content-Type into
+	// an accidental duplicate. Tests that need duplicate wire values use
+	// HeadersArray explicitly.
+	if len(req.Header.Values("Content-Type")) == 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
 	for _, c := range tc.Cookies {
 		req.AddCookie(c)
 	}
@@ -167,6 +189,14 @@ func NewRequest(tc *TestCase) (req *http.Request, err error) {
 	}
 	req.PostForm = formParams
 	req.Form = formParams
+
+	if tc.QueryParams != nil {
+		queryParams := req.URL.Query()
+		for k, v := range tc.QueryParams {
+			queryParams.Add(k, v)
+		}
+		req.URL.RawQuery = queryParams.Encode()
+	}
 
 	return req, nil
 }
@@ -181,8 +211,8 @@ type nopCloser struct {
 // to have it ready for next read-cycle
 func (n nopCloser) Read(p []byte) (int, error) {
 	num, err := n.ReadSeeker.Read(p)
-	if err == io.EOF { // move to start to have it ready for next read cycle
-		n.Seek(0, io.SeekStart)
+	if errors.Is(err, io.EOF) { // move to start to have it ready for next read cycle
+		_, _ = n.Seek(0, io.SeekStart)
 	}
 	return num, err
 }
@@ -226,7 +256,25 @@ type HTTPTestRunner struct {
 	RequestBuilder func(*TestCase) (*http.Request, error)
 }
 
+const maxRetryCount = 2
+
+var retryReasons = []string{
+	"broken pipe",
+	"protocol wrong type for socket",
+	"connection reset by peer",
+}
+
+func needRetry(errString string) bool {
+	for _, reason := range retryReasons {
+		if strings.Contains(errString, reason) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r HTTPTestRunner) Run(t testing.TB, testCases ...TestCase) (*http.Response, error) {
+	t.Helper()
 	var lastResponse *http.Response
 	var lastError error
 
@@ -243,15 +291,34 @@ func (r HTTPTestRunner) Run(t testing.TB, testCases ...TestCase) (*http.Response
 	}
 
 	for ti, tc := range testCases {
-		req, err := r.RequestBuilder(&tc)
+		var tc *TestCase = &tc
+
+		if tc.BeforeFn != nil {
+			tc.BeforeFn()
+		}
+
+		req, err := r.RequestBuilder(tc)
 		if err != nil {
 			t.Errorf("[%d] Request build error: %s", ti, err.Error())
 			continue
 		}
-		lastResponse, lastError = r.Do(req, &tc)
+
+		if tc.Host != "" {
+			req.Host = tc.Host
+		}
+
+		retryCount := 0
+	retry:
+
+		lastResponse, lastError = r.Do(req, tc)
 		tcJSON, _ := json.Marshal(tc)
 
 		if lastError != nil {
+			if retryCount < maxRetryCount && needRetry(lastError.Error()) {
+				retryCount++
+				goto retry
+			}
+
 			if tc.ErrorMatch != "" {
 				if !strings.Contains(lastError.Error(), tc.ErrorMatch) {
 					t.Errorf("[%d] Expect error `%s` to contain `%s`. %s", ti, lastError.Error(), tc.ErrorMatch, string(tcJSON))
@@ -266,13 +333,11 @@ func (r HTTPTestRunner) Run(t testing.TB, testCases ...TestCase) (*http.Response
 		}
 
 		respCopy := copyResponse(lastResponse)
-		if lastError = r.Assert(respCopy, &tc); lastError != nil {
+		if lastError = r.Assert(respCopy, tc); lastError != nil {
 			t.Errorf("[%d] %s. %s\n", ti, lastError.Error(), string(tcJSON))
 		}
 
-		delay := tc.Delay
-
-		if delay > 0 {
+		if delay := tc.Delay; delay > 0 {
 			time.Sleep(delay)
 		}
 	}

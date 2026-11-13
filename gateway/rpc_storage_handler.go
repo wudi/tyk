@@ -1,20 +1,24 @@
+//nolint:revive
 package gateway
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	cache "github.com/pmylund/go-cache"
-
-	"github.com/TykTechnologies/tyk/rpc"
-
-	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/storage"
-	"github.com/go-redis/redis"
-
 	"github.com/sirupsen/logrus"
+
+	temporalmodel "github.com/TykTechnologies/storage/temporal/model"
+
+	"github.com/TykTechnologies/tyk/certs"
+	"github.com/TykTechnologies/tyk/internal/cache"
+	"github.com/TykTechnologies/tyk/internal/model"
+	"github.com/TykTechnologies/tyk/pkg/errpack"
+	"github.com/TykTechnologies/tyk/rpc"
+	"github.com/TykTechnologies/tyk/storage"
 )
 
 var (
@@ -22,13 +26,13 @@ var (
 		"Login": func(clientAddr, userKey string) bool {
 			return false
 		},
-		"LoginWithGroup": func(clientAddr string, groupData *apidef.GroupLoginRequest) bool {
+		"LoginWithGroup": func(clientAddr string, groupData *model.GroupLoginRequest) bool {
 			return false
 		},
 		"GetKey": func(keyName string) (string, error) {
 			return "", nil
 		},
-		"SetKey": func(ibd *apidef.InboundData) error {
+		"SetKey": func(ibd *model.InboundData) error {
 			return nil
 		},
 		"GetExp": func(keyName string) (int64, error) {
@@ -43,28 +47,34 @@ var (
 		"DeleteRawKey": func(keyName string) (bool, error) {
 			return true, nil
 		},
-		"GetKeysAndValues": func(searchString string) (*apidef.KeysValuesPair, error) {
+		"GetKeysAndValues": func(searchString string) (*model.KeysValuesPair, error) {
 			return nil, nil
 		},
-		"GetKeysAndValuesWithFilter": func(searchString string) (*apidef.KeysValuesPair, error) {
+		"GetKeysAndValuesWithFilter": func(searchString string) (*model.KeysValuesPair, error) {
 			return nil, nil
 		},
 		"DeleteKeys": func(keys []string) (bool, error) {
 			return true, nil
 		},
+		"DeleteRawKeys": func(keys []string) (bool, error) {
+			return true, nil
+		},
 		"Decrement": func(keyName string) error {
 			return nil
 		},
-		"IncrememntWithExpire": func(ibd *apidef.InboundData) (int64, error) {
+		"IncrememntWithExpire": func(ibd *model.InboundData) (int64, error) {
 			return 0, nil
 		},
-		"AppendToSet": func(ibd *apidef.InboundData) error {
+		"AppendToSet": func(ibd *model.InboundData) error {
 			return nil
 		},
-		"SetRollingWindow": func(ibd *apidef.InboundData) (int, error) {
+		"SetRollingWindow": func(ibd *model.InboundData) (int, error) {
 			return 0, nil
 		},
-		"GetApiDefinitions": func(dr *apidef.DefRequest) (string, error) {
+		"GetApiDefinitions": func(dr *model.DefRequest) (string, error) {
+			return "", nil
+		},
+		"GetClientIdPs": func(dr *model.DefRequest) (string, error) {
 			return "", nil
 		},
 		"GetPolicies": func(orgId string) (string, error) {
@@ -76,16 +86,35 @@ var (
 		"CheckReload": func(clientAddr, orgId string) (bool, error) {
 			return false, nil
 		},
+		"CheckIdPReload": func(clientAddr, orgId string) ([]string, error) {
+			return nil, nil
+		},
 		"GetKeySpaceUpdate": func(clientAddr, orgId string) ([]string, error) {
 			return nil, nil
 		},
-		"GetGroupKeySpaceUpdate": func(clientAddr string, groupData *apidef.GroupKeySpaceRequest) ([]string, error) {
+		"GetGroupKeySpaceUpdate": func(clientAddr string, groupData *model.GroupKeySpaceRequest) ([]string, error) {
 			return nil, nil
 		},
 		"Ping": func() bool {
 			return false
 		},
+		"Disconnect": func(clientAddr string, groupData *model.GroupLoginRequest) error {
+			return nil
+		},
 	}
+)
+
+const (
+	ResetQuota              string = "resetQuota"
+	CertificateRemoved      string = "CertificateRemoved"
+	CertificateAdded        string = "CertificateAdded"
+	OAuthRevokeToken        string = "oAuthRevokeToken"
+	OAuthRevokeAccessToken  string = "oAuthRevokeAccessToken"
+	OAuthRevokeRefreshToken string = "oAuthRevokeRefreshToken"
+	OAuthRevokeAllTokens    string = "revoke_all_tokens"
+	OauthClientAdded        string = "OauthClientAdded"
+	OauthClientRemoved      string = "OauthClientRemoved"
+	OauthClientUpdated      string = "OauthClientUpdated"
 )
 
 // RPCStorageHandler is a storage manager that uses the redis database.
@@ -93,16 +122,30 @@ type RPCStorageHandler struct {
 	KeyPrefix        string
 	HashKeys         bool
 	SuppressRegister bool
+	DoReload         func()
+	Gw               *Gateway `json:"-"`
 }
 
-var RPCGlobalCache = cache.New(30*time.Second, 15*time.Second)
+//go:generate mockgen -typed -source=$FILE -destination=../internal/policy/store_mock.gen.go -package policy . RPCDataLoader
+type RPCDataLoader interface {
+	Connect() bool
+	GetApiDefinitions(orgId string, tags []string) string
+	GetPolicies(orgId string) string
+	// GetClientIdPs is the sibling of GetApiDefinitions for the client-IdP
+	// registry. The JSON-array envelope is identical to the dashboard's
+	// /system/clientidps payload — both decoded by unmarshalIdPs.
+	GetClientIdPs(orgId string, tags []string) string
+}
 
 // Connect will establish a connection to the RPC
 func (r *RPCStorageHandler) Connect() bool {
-	slaveOptions := config.Global().SlaveOptions
+	slaveOptions := r.Gw.GetConfig().SlaveOptions
+
 	rpcConfig := rpc.Config{
 		UseSSL:                slaveOptions.UseSSL,
 		SSLInsecureSkipVerify: slaveOptions.SSLInsecureSkipVerify,
+		SSLMinVersion:         r.Gw.GetConfig().HttpServerOptions.MinVersion,
+		SSLMaxVersion:         r.Gw.GetConfig().HttpServerOptions.MaxVersion,
 		ConnectionString:      slaveOptions.ConnectionString,
 		RPCKey:                slaveOptions.RPCKey,
 		APIKey:                slaveOptions.APIKey,
@@ -110,23 +153,84 @@ func (r *RPCStorageHandler) Connect() bool {
 		CallTimeout:           slaveOptions.CallTimeout,
 		PingTimeout:           slaveOptions.PingTimeout,
 		RPCPoolSize:           slaveOptions.RPCPoolSize,
+		DNSMonitorEnabled:     slaveOptions.DNSMonitor.Enabled,
+		DNSMonitorInterval:    slaveOptions.DNSMonitor.CheckInterval,
 	}
 
 	return rpc.Connect(
 		rpcConfig,
 		r.SuppressRegister,
 		dispatcherFuncs,
-		func(userKey string, groupID string) interface{} {
-			return apidef.GroupLoginRequest{
-				UserKey: userKey,
-				GroupID: groupID,
-			}
-		},
+		r.getGroupLoginCallback(r.Gw.GetConfig().SlaveOptions.SynchroniserEnabled),
 		func() {
-			reloadURLStructure(nil)
+			r.Gw.reloadURLStructure(nil)
 		},
-		DoReload,
+		r.DoReload,
 	)
+}
+
+func (r *RPCStorageHandler) buildNodeInfo() []byte {
+	config := r.Gw.GetConfig()
+	checkDuration := config.LivenessCheck.CheckDuration
+	var intCheckDuration int64 = 10
+	if checkDuration != 0 {
+		// NodeData.TTL expects an int64 value, so we're getting the number of seconds expressed in int64 instead of time.Second
+		intCheckDuration = int64(checkDuration / time.Second)
+	}
+
+	r.Gw.getHostDetails()
+	meta := r.Gw.nodeMetadata()
+	node := model.NodeData{
+		NodeID:          r.Gw.GetNodeID(),
+		GroupID:         config.SlaveOptions.GroupID,
+		APIKey:          config.SlaveOptions.APIKey,
+		NodeVersion:     meta.Version,
+		TTL:             intCheckDuration,
+		NodeIsSegmented: meta.IsSegmented,
+		Tags:            meta.Tags,
+		Health:          r.Gw.getHealthCheckInfo(),
+		Stats: model.GWStats{
+			APIsCount:      meta.APIsCount,
+			PoliciesCount:  meta.PoliciesCount,
+			LoadedAPIs:     r.Gw.GetLoadedAPIIDs(),
+			LoadedPolicies: r.Gw.GetLoadedPolicyIDs(),
+		},
+		HostDetails: meta.HostDetails,
+	}
+
+	data, err := json.Marshal(node)
+	if err != nil {
+		log.Error("Error marshalling node info", err)
+		return nil
+	}
+
+	return data
+}
+
+func (r *RPCStorageHandler) Disconnect() error {
+	request := model.GroupLoginRequest{
+		UserKey: r.Gw.GetConfig().SlaveOptions.APIKey,
+		GroupID: r.Gw.GetConfig().SlaveOptions.GroupID,
+		Node:    r.buildNodeInfo(),
+	}
+
+	_, err := rpc.FuncClientSingleton("Disconnect", request)
+	return err
+}
+
+func (r *RPCStorageHandler) getGroupLoginCallback(synchroniserEnabled bool) func(userKey string, groupID string) interface{} {
+	groupLoginCallbackFn := func(userKey string, groupID string) interface{} {
+		return model.GroupLoginRequest{
+			UserKey: userKey,
+			GroupID: groupID,
+			Node:    r.buildNodeInfo(),
+		}
+	}
+	if synchroniserEnabled {
+		forcer := rpc.NewSyncForcer(r.Gw.StorageConnectionHandler, r.buildNodeInfo)
+		groupLoginCallbackFn = forcer.GroupLoginCallback
+	}
+	return groupLoginCallbackFn
 }
 
 func (r *RPCStorageHandler) hashKey(in string) string {
@@ -140,7 +244,7 @@ func (r *RPCStorageHandler) hashKey(in string) string {
 func (r *RPCStorageHandler) fixKey(keyName string) string {
 	setKeyName := r.KeyPrefix + r.hashKey(keyName)
 
-	log.Debug("Input key was: ", setKeyName)
+	log.Debug("Input key was: ", r.Gw.obfuscateKey(setKeyName))
 
 	return setKeyName
 }
@@ -155,7 +259,6 @@ func (r *RPCStorageHandler) GetKey(keyName string) (string, error) {
 	start := time.Now() // get current time
 	//	log.Debug("[STORE] Getting WAS: ", keyName)
 	//  log.Debug("[STORE] Getting: ", r.fixKey(keyName))
-
 	value, err := r.GetRawKey(r.fixKey(keyName))
 
 	elapsed := time.Since(start)
@@ -165,14 +268,27 @@ func (r *RPCStorageHandler) GetKey(keyName string) (string, error) {
 }
 
 func (r *RPCStorageHandler) GetRawKey(keyName string) (string, error) {
-	// Check the cache first
-	if config.Global().SlaveOptions.EnableRPCCache {
-		log.Debug("Using cache for: ", keyName)
-		cachedVal, found := RPCGlobalCache.Get(keyName)
-		log.Debug("--> Found? ", found)
-		if found {
-			return cachedVal.(string), nil
+	cacheEnabled := r.Gw.GetConfig().SlaveOptions.EnableRPCCache
+
+	var cacheStore cache.Repository
+	if cacheEnabled {
+		cacheStore = r.Gw.RPCGlobalCache
+		if strings.Contains(keyName, "cert-") {
+			cacheStore = r.Gw.RPCCertCache
 		}
+
+		if cachedVal, found := cacheStore.Get(keyName); found {
+			switch typedVal := cachedVal.(type) {
+			case string:
+				return typedVal, nil
+			case error:
+				return "", typedVal
+			}
+		}
+	}
+
+	if rpc.IsEmergencyMode() {
+		return "", storage.ErrMDCBConnectionLost
 	}
 
 	value, err := rpc.FuncClientSingleton("GetKey", keyName)
@@ -181,23 +297,22 @@ func (r *RPCStorageHandler) GetRawKey(keyName string) (string, error) {
 			rpc.FuncClientSingletonCall,
 			"GetKey",
 			err,
-			map[string]string{
-				"keyName": keyName,
-			},
+			map[string]string{"keyName": keyName},
 		)
-		if r.IsAccessError(err) {
-			if rpc.Login() {
-				return r.GetRawKey(keyName)
-			}
+		if r.IsRetriableError(err) && rpc.Login() {
+			return r.GetRawKey(keyName)
 		}
-		log.Debug("Error trying to get value:", err)
+		if cacheEnabled {
+			// Errors, and key not found, should be cached for a small amount of time
+			cacheStore.Set(keyName, storage.ErrKeyNotFound, 1)
+		}
 		return "", storage.ErrKeyNotFound
 	}
-	if config.Global().SlaveOptions.EnableRPCCache {
-		// Cache key
-		RPCGlobalCache.Set(keyName, value, cache.DefaultExpiration)
+
+	if cacheEnabled {
+		cacheStore.Set(keyName, value, cache.DefaultExpiration)
 	}
-	//return hash key without prefix so it doesnt get double prefixed in redis
+
 	return value.(string), nil
 }
 
@@ -228,7 +343,7 @@ func (r *RPCStorageHandler) GetExp(keyName string) (int64, error) {
 				"fixedKeyName": r.fixKey(keyName),
 			},
 		)
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.GetExp(keyName)
 			}
@@ -247,7 +362,7 @@ func (r *RPCStorageHandler) SetExp(keyName string, timeout int64) error {
 // SetKey will create (or update) a key value in the store
 func (r *RPCStorageHandler) SetKey(keyName, session string, timeout int64) error {
 	start := time.Now() // get current time
-	ibd := apidef.InboundData{
+	ibd := model.InboundData{
 		KeyName:      r.fixKey(keyName),
 		SessionState: session,
 		Timeout:      timeout,
@@ -265,7 +380,7 @@ func (r *RPCStorageHandler) SetKey(keyName, session string, timeout int64) error
 			},
 		)
 
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.SetKey(keyName, session, timeout)
 			}
@@ -285,6 +400,16 @@ func (r *RPCStorageHandler) SetRawKey(keyName, session string, timeout int64) er
 	return nil
 }
 
+func (r *RPCStorageHandler) SetKeyEx(keyName, session string, timeout int64) error {
+	_, _, _ = keyName, session, timeout
+	return errpack.ErrNotImplemented
+}
+
+func (r *RPCStorageHandler) SetRawKeyEx(keyName, session string, timeout int64) error {
+	_, _, _ = keyName, session, timeout
+	return errpack.ErrNotImplemented
+}
+
 // Decrement will decrement a key in redis
 func (r *RPCStorageHandler) Decrement(keyName string) {
 	log.Warning("Decrement called")
@@ -299,7 +424,7 @@ func (r *RPCStorageHandler) Decrement(keyName string) {
 			},
 		)
 	}
-	if r.IsAccessError(err) {
+	if r.IsRetriableError(err) {
 		if rpc.Login() {
 			r.Decrement(keyName)
 			return
@@ -310,7 +435,7 @@ func (r *RPCStorageHandler) Decrement(keyName string) {
 // IncrementWithExpire will increment a key in redis
 func (r *RPCStorageHandler) IncrememntWithExpire(keyName string, expire int64) int64 {
 
-	ibd := apidef.InboundData{
+	ibd := model.InboundData{
 		KeyName: keyName,
 		Expire:  expire,
 	}
@@ -326,7 +451,7 @@ func (r *RPCStorageHandler) IncrememntWithExpire(keyName string, expire int64) i
 			},
 		)
 	}
-	if r.IsAccessError(err) {
+	if r.IsRetriableError(err) {
 		if rpc.Login() {
 			return r.IncrememntWithExpire(keyName, expire)
 		}
@@ -364,7 +489,7 @@ func (r *RPCStorageHandler) GetKeysAndValuesWithFilter(filter string) map[string
 			},
 		)
 
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.GetKeysAndValuesWithFilter(filter)
 			}
@@ -375,8 +500,8 @@ func (r *RPCStorageHandler) GetKeysAndValuesWithFilter(filter string) map[string
 
 	returnValues := make(map[string]string)
 
-	for i, v := range kvPair.(*apidef.KeysValuesPair).Keys {
-		returnValues[r.cleanKey(v)] = kvPair.(*apidef.KeysValuesPair).Values[i]
+	for i, v := range kvPair.(*model.KeysValuesPair).Keys {
+		returnValues[r.cleanKey(v)] = kvPair.(*model.KeysValuesPair).Values[i]
 	}
 
 	return returnValues
@@ -391,7 +516,7 @@ func (r *RPCStorageHandler) GetKeysAndValues() map[string]string {
 	if err != nil {
 		rpc.EmitErrorEvent(rpc.FuncClientSingletonCall, "GetKeysAndValues", err)
 
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.GetKeysAndValues()
 			}
@@ -401,8 +526,8 @@ func (r *RPCStorageHandler) GetKeysAndValues() map[string]string {
 	}
 
 	returnValues := make(map[string]string)
-	for i, v := range kvPair.(*apidef.KeysValuesPair).Keys {
-		returnValues[r.cleanKey(v)] = kvPair.(*apidef.KeysValuesPair).Values[i]
+	for i, v := range kvPair.(*model.KeysValuesPair).Keys {
+		returnValues[r.cleanKey(v)] = kvPair.(*model.KeysValuesPair).Values[i]
 	}
 
 	return returnValues
@@ -412,8 +537,8 @@ func (r *RPCStorageHandler) GetKeysAndValues() map[string]string {
 // DeleteKey will remove a key from the database
 func (r *RPCStorageHandler) DeleteKey(keyName string) bool {
 
-	log.Debug("DEL Key was: ", keyName)
-	log.Debug("DEL Key became: ", r.fixKey(keyName))
+	log.Debug("DEL Key was: ", r.Gw.obfuscateKey(keyName))
+	log.Debug("DEL Key became: ", r.Gw.obfuscateKey(r.fixKey(keyName)))
 	ok, err := rpc.FuncClientSingleton("DeleteKey", r.fixKey(keyName))
 	if err != nil {
 		rpc.EmitErrorEventKv(
@@ -426,7 +551,7 @@ func (r *RPCStorageHandler) DeleteKey(keyName string) bool {
 			},
 		)
 
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.DeleteKey(keyName)
 			}
@@ -434,6 +559,26 @@ func (r *RPCStorageHandler) DeleteKey(keyName string) bool {
 	}
 
 	return ok == true
+}
+
+func (r *RPCStorageHandler) DeleteRawKeys(keys []string) bool {
+	ret, err := rpc.FuncClientSingleton("DeleteRawKeys", keys)
+	if err != nil {
+		rpc.EmitErrorEventKv(
+			rpc.FuncClientSingletonCall,
+			"DeleteKey",
+			err,
+			nil,
+		)
+
+		if r.IsRetriableError(err) {
+			if rpc.Login() {
+				return r.DeleteRawKeys(keys)
+			}
+		}
+	}
+	success, ok := ret.(bool)
+	return success && ok
 }
 
 func (r *RPCStorageHandler) DeleteAllKeys() bool {
@@ -454,7 +599,7 @@ func (r *RPCStorageHandler) DeleteRawKey(keyName string) bool {
 			},
 		)
 
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.DeleteRawKey(keyName)
 			}
@@ -485,7 +630,7 @@ func (r *RPCStorageHandler) DeleteKeys(keys []string) bool {
 				},
 			)
 
-			if r.IsAccessError(err) {
+			if r.IsRetriableError(err) {
 				if rpc.Login() {
 					return r.DeleteKeys(keys)
 				}
@@ -499,7 +644,7 @@ func (r *RPCStorageHandler) DeleteKeys(keys []string) bool {
 }
 
 // StartPubSubHandler will listen for a signal and run the callback with the message
-func (r *RPCStorageHandler) StartPubSubHandler(channel string, callback func(*redis.Message)) error {
+func (r *RPCStorageHandler) StartPubSubHandler(_ string, _ func(*temporalmodel.Message)) error {
 	log.Warning("RPCStorageHandler.StartPubSubHandler - NO PUBSUB DEFINED")
 	return nil
 }
@@ -515,7 +660,7 @@ func (r *RPCStorageHandler) GetAndDeleteSet(keyName string) []interface{} {
 }
 
 func (r *RPCStorageHandler) AppendToSet(keyName, value string) {
-	ibd := apidef.InboundData{
+	ibd := model.InboundData{
 		KeyName: keyName,
 		Value:   value,
 	}
@@ -531,7 +676,7 @@ func (r *RPCStorageHandler) AppendToSet(keyName, value string) {
 			},
 		)
 	}
-	if r.IsAccessError(err) {
+	if r.IsRetriableError(err) {
 		if rpc.Login() {
 			r.AppendToSet(keyName, value)
 		}
@@ -541,7 +686,7 @@ func (r *RPCStorageHandler) AppendToSet(keyName, value string) {
 // SetScrollingWindow is used in the rate limiter to handle rate limits fairly.
 func (r *RPCStorageHandler) SetRollingWindow(keyName string, per int64, val string, pipeline bool) (int, []interface{}) {
 	start := time.Now() // get current time
-	ibd := apidef.InboundData{
+	ibd := model.InboundData{
 		KeyName: keyName,
 		Per:     per,
 		Expire:  -1,
@@ -559,7 +704,7 @@ func (r *RPCStorageHandler) SetRollingWindow(keyName string, per int64, val stri
 			},
 		)
 
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				return r.SetRollingWindow(keyName, per, val, false)
 			}
@@ -596,18 +741,27 @@ func (r RPCStorageHandler) RemoveFromSet(keyName, value string) {
 	log.Error("RPCStorageHandler.RemoveFromSet - Not implemented")
 }
 
-func (r RPCStorageHandler) IsAccessError(err error) bool {
+func (r RPCStorageHandler) IsRetriableError(err error) bool {
 	if err != nil {
-		return err.Error() == "Access Denied"
+		errMsg := err.Error()
+		// Access denied errors (authentication issues)
+		if errMsg == "Access Denied" {
+			return true
+		}
+		// Timeout errors from gorpc library
+		if strings.Contains(errMsg, "Cannot obtain response during timeout") {
+			return true
+		}
 	}
 	return false
 }
 
 // GetAPIDefinitions will pull API definitions from the RPC server
 func (r *RPCStorageHandler) GetApiDefinitions(orgId string, tags []string) string {
-	dr := apidef.DefRequest{
-		OrgId: orgId,
-		Tags:  tags,
+	dr := model.DefRequest{
+		OrgId:   orgId,
+		Tags:    tags,
+		LoadOAS: true,
 	}
 
 	defString, err := rpc.FuncClientSingleton("GetApiDefinitions", dr)
@@ -621,19 +775,42 @@ func (r *RPCStorageHandler) GetApiDefinitions(orgId string, tags []string) strin
 				"tags":  strings.Join(tags, ","),
 			},
 		)
-
-		if r.IsAccessError(err) {
-			if rpc.Login() {
-				return r.GetApiDefinitions(orgId, tags)
-			}
-		}
-
+		// FuncClientSingleton already tries to call GetApiDefinitions with backoff.
+		// Callers of the "RPCStorageHandler.GetApiDefinitions" method should switch to the fallback
+		// by enabling emergency mode. See syncResourcesWithReload in the server.go file.
+		log.Debugf("RPC Handler: GetApiDefinitions() returned %s, returning empty string", err)
 		return ""
 	}
 	log.Debug("API Definitions retrieved")
 
 	if defString == nil {
 		log.Warning("RPC Handler: GetApiDefinitions() returned nil, returning empty string")
+		return ""
+	}
+	return defString.(string)
+}
+
+// GetClientIdPs pulls the client-IdP registry from the RPC server. The payload
+// is already tag-filtered and api_mappings-pruned by MDCB; the segment backstop
+// in IdPRegistry.rebuild is defensive safety.
+func (r *RPCStorageHandler) GetClientIdPs(orgId string, tags []string) string {
+	dr := model.DefRequest{OrgId: orgId, Tags: tags}
+	defString, err := rpc.FuncClientSingleton("GetClientIdPs", dr)
+	if err != nil {
+		rpc.EmitErrorEventKv(
+			rpc.FuncClientSingletonCall,
+			"GetClientIdPs",
+			err,
+			map[string]string{
+				"orgId": orgId,
+				"tags":  strings.Join(tags, ","),
+			},
+		)
+		// FuncClientSingleton already retries with backoff; on hard failure the
+		// registry refresh logs and leaves the previous index in place.
+		return ""
+	}
+	if defString == nil {
 		return ""
 	}
 	return defString.(string)
@@ -652,12 +829,10 @@ func (r *RPCStorageHandler) GetPolicies(orgId string) string {
 			},
 		)
 
-		if r.IsAccessError(err) {
-			if rpc.Login() {
-				return r.GetPolicies(orgId)
-			}
-		}
-
+		// FuncClientSingleton already tries to call GetPolicies with backoff.
+		// Callers of the "RPCStorageHandler.GetPolicies" method should switch to the fallback
+		// by enabling emergency mode. See syncResourcesWithReload in the server.go file.
+		log.Debugf("RPC Handler: GetPolicies() returned %s, returning empty string", err)
 		return ""
 	}
 
@@ -668,7 +843,13 @@ func (r *RPCStorageHandler) GetPolicies(orgId string) string {
 }
 
 // CheckForReload will start a long poll
-func (r *RPCStorageHandler) CheckForReload(orgId string) {
+func (r *RPCStorageHandler) CheckForReload(orgId string) bool {
+	select {
+	case <-r.Gw.ctx.Done():
+		return false
+	default:
+	}
+
 	log.Debug("[RPC STORE] Check Reload called...")
 	reload, err := rpc.FuncClientSingleton("CheckReload", orgId)
 	if err != nil {
@@ -680,12 +861,14 @@ func (r *RPCStorageHandler) CheckForReload(orgId string) {
 				"orgId": orgId,
 			},
 		)
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			log.Warning("[RPC STORE] CheckReload: Not logged in")
 			if rpc.Login() {
 				r.CheckForReload(orgId)
 			}
 		} else if !strings.Contains(err.Error(), "Cannot obtain response during") {
+			forcer := rpc.NewSyncForcer(r.Gw.StorageConnectionHandler, r.buildNodeInfo)
+			forcer.SetFirstConnection(true)
 			log.Warning("[RPC STORE] RPC Reload Checker encountered unexpected error: ", err)
 		}
 
@@ -694,20 +877,61 @@ func (r *RPCStorageHandler) CheckForReload(orgId string) {
 		// Do the reload!
 		log.Warning("[RPC STORE] Received Reload instruction!")
 		go func() {
-			MainNotifier.Notify(Notification{Command: NoticeGroupReload})
+			r.Gw.MainNotifier.Notify(Notification{Command: NoticeGroupReload, Gw: r.Gw})
 		}()
 	}
+	return true
+}
+
+// CheckForIdPReload is the client-IdP sibling of CheckForReload: a long poll on
+// the dedicated CheckIdPReload RPC. MDCB returns the list of client_idp_id values
+// that changed for this node's group (empty when nothing pending); the list is
+// used purely as a "something changed" signal — on a non-empty result we refresh
+// the whole registry once via doRefresh (a single GetClientIdPs RPC), which also
+// handles deletes for free. This is deliberately NOT a full API/policy resync.
+// Errors are logged and the loop continues; the registry keeps its previous
+// snapshot. Returns false only on shutdown to stop the loop.
+func (r *RPCStorageHandler) CheckForIdPReload(orgId string) bool {
+	select {
+	case <-r.Gw.ctx.Done():
+		return false
+	default:
+	}
+
+	changed, err := rpc.FuncClientSingleton("CheckIdPReload", orgId)
+	if err != nil {
+		rpc.EmitErrorEventKv(
+			rpc.FuncClientSingletonCall,
+			"CheckIdPReload",
+			err,
+			map[string]string{"orgId": orgId},
+		)
+		// Unlike CheckForReload we do not force a re-sync here: an IdP reload
+		// check is auxiliary and must not disturb the main RPC sync state. The
+		// main reload loop owns re-login/recovery.
+		time.Sleep(1 * time.Second)
+		return true
+	}
+
+	changedIDs, ok := changed.([]string)
+	if ok && len(changedIDs) > 0 && r.Gw.idpRegistry != nil {
+		log.Infof("[RPC STORE] %d client-IdP change(s) signalled; refreshing registry", len(changedIDs))
+		if refreshErr := r.Gw.idpRegistry.doRefresh(); refreshErr != nil {
+			log.WithError(refreshErr).Error("client-IdP registry refresh failed; keeping previous snapshot")
+		}
+	}
+	return true
 }
 
 func (r *RPCStorageHandler) StartRPCLoopCheck(orgId string) {
-	if config.Global().SlaveOptions.DisableKeySpaceSync {
+	if r.Gw.GetConfig().SlaveOptions.DisableKeySpaceSync {
 		return
 	}
 
 	log.Info("[RPC] Starting keyspace poller")
 
 	for {
-		seconds := config.Global().SlaveOptions.KeySpaceSyncInterval
+		seconds := r.Gw.GetConfig().SlaveOptions.KeySpaceSyncInterval
 		r.CheckForKeyspaceChanges(orgId)
 		time.Sleep(time.Duration(seconds) * time.Second)
 	}
@@ -719,12 +943,18 @@ func (r *RPCStorageHandler) StartRPCKeepaliveWatcher() {
 	}).Info("[RPC Conn Mgr] Starting keepalive watcher...")
 	for {
 
+		select {
+		case <-r.Gw.ctx.Done():
+			return
+		default:
+		}
+
 		if err := r.SetKey("0000", "0000", 10); err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				"prefix": "RPC Conn Mgr",
 			}).Warning("Can't connect to RPC layer")
 
-			if r.IsAccessError(err) {
+			if r.IsRetriableError(err) {
 				if rpc.Login() {
 					continue
 				}
@@ -749,13 +979,13 @@ func (r *RPCStorageHandler) CheckForKeyspaceChanges(orgId string) {
 	var req interface{}
 
 	reqData := map[string]string{}
-	if groupID := config.Global().SlaveOptions.GroupID; groupID == "" {
+	if groupID := r.Gw.GetConfig().SlaveOptions.GroupID; groupID == "" {
 		funcName = "GetKeySpaceUpdate"
 		req = orgId
 		reqData["orgId"] = orgId
 	} else {
 		funcName = "GetGroupKeySpaceUpdate"
-		req = apidef.GroupKeySpaceRequest{
+		req = model.GroupKeySpaceRequest{
 			OrgID:   orgId,
 			GroupID: groupID,
 		}
@@ -771,7 +1001,7 @@ func (r *RPCStorageHandler) CheckForKeyspaceChanges(orgId string) {
 			err,
 			reqData,
 		)
-		if r.IsAccessError(err) {
+		if r.IsRetriableError(err) {
 			if rpc.Login() {
 				r.CheckForKeyspaceChanges(orgId)
 			}
@@ -787,47 +1017,189 @@ func (r *RPCStorageHandler) CheckForKeyspaceChanges(orgId string) {
 
 	if len(keys.([]string)) > 0 {
 		log.Info("Keyspace changes detected, updating local cache")
-		go r.ProcessKeySpaceChanges(keys.([]string))
+		go r.ProcessKeySpaceChanges(keys.([]string), orgId)
 	}
 }
 
-func getSessionAndCreate(keyName string, r *RPCStorageHandler) {
-	newKeyName := "apikey-" + storage.HashStr(keyName)
-	sessionString, err := r.GetRawKey(keyName)
+func (gw *Gateway) getSessionAndCreate(keyName string, r *RPCStorageHandler, isHashed bool, orgId string) {
+
+	key := keyName
+	// avoid double hashing
+	if !isHashed {
+		key = storage.HashKey(keyName, gw.GetConfig().HashKeys)
+	}
+
+	sessionString, err := r.GetRawKey("apikey-" + key)
 	if err != nil {
 		log.Error("Key not found in master - skipping")
 	} else {
-		handleAddKey(keyName, newKeyName[7:], sessionString, "-1")
+		gw.handleAddKey(key, sessionString, orgId)
 	}
 }
 
-func (r *RPCStorageHandler) ProcessKeySpaceChanges(keys []string) {
+func (gw *Gateway) ProcessSingleOauthClientEvent(apiId, oauthClientId, orgID, event string) {
+	store, _, err := gw.GetStorageForApi(apiId)
+	if err != nil {
+		log.Error("Could not get oauth storage for api")
+		return
+	}
+
+	switch event {
+	case OauthClientAdded:
+		// on add: pull from rpc and save it in local redis
+		client, err := store.GetClient(oauthClientId)
+		if err != nil {
+			log.WithError(err).Error("Could not retrieve new oauth client information")
+			return
+		}
+
+		err = store.SetClient(oauthClientId, orgID, client, false)
+		if err != nil {
+			log.WithError(err).Error("Could not save oauth client.")
+			return
+		}
+
+		log.Info("oauth client created successfully")
+	case OauthClientRemoved:
+		// on remove: remove from local redis
+		err := store.DeleteClient(oauthClientId, orgID, false)
+		if err != nil {
+			log.Errorf("Could not delete oauth client with id: %v", oauthClientId)
+			return
+		}
+		log.Infof("Oauth Client deleted successfully")
+	case OauthClientUpdated:
+		// on update: delete from local redis and pull again from rpc
+		_, err := store.GetClient(oauthClientId)
+		if err != nil {
+			log.WithError(err).Error("Could not retrieve oauth client information")
+			return
+		}
+
+		err = store.DeleteClient(oauthClientId, orgID, false)
+		if err != nil {
+			log.WithError(err).Error("Could not delete oauth client")
+			return
+		}
+
+		client, err := store.GetClient(oauthClientId)
+		if err != nil {
+			log.WithError(err).Error("Could not retrieve oauth client information")
+			return
+		}
+
+		err = store.SetClient(oauthClientId, orgID, client, false)
+		if err != nil {
+			log.WithError(err).Error("Could not save oauth client.")
+			return
+		}
+		log.Info("oauth client updated successfully")
+	default:
+		log.Warningf("Oauth client event not supported:%v", event)
+	}
+}
+
+// ProcessOauthClientsOps performs the appropriate action for the received clients
+// it can be any of the Create,Update and Delete operations
+func (gw *Gateway) ProcessOauthClientsOps(clients map[string]string) {
+	for clientInfo, action := range clients {
+		// clientInfo is: APIID.ClientID.OrgID
+		eventValues := strings.Split(clientInfo, ".")
+		apiId := eventValues[0]
+		oauthClientId := eventValues[1]
+		orgID := eventValues[2]
+
+		gw.ProcessSingleOauthClientEvent(apiId, oauthClientId, orgID, action)
+	}
+}
+
+// ProcessKeySpaceChanges receives an array of keys to be processed, those keys are considered changes in the keyspace in the
+// management layer, they could be: regular keys (hashed, unhashed), revoke oauth client, revoke single oauth token,
+// certificates (added, removed), oauth client (added, updated, removed), user key events (reset)
+func (r *RPCStorageHandler) ProcessKeySpaceChanges(keys []string, orgId string) {
 	keysToReset := map[string]bool{}
 	TokensToBeRevoked := map[string]string{}
 	ClientsToBeRevoked := map[string]string{}
-	oauthTokenKeys := map[string]bool{}
+	notRegularKeys := map[string]bool{}
+	CertificatesToRemove := map[string]string{}
+	CertificatesToAdd := map[string]string{}
+	OauthClients := map[string]string{}
+	apiIDsToDeleteCache := make([]string, 0)
+	userKeyResets := make(map[string]string)
+	apiIDsToInvalidateJWKSCache := make([]string, 0)
 
 	for _, key := range keys {
 		splitKeys := strings.Split(key, ":")
-		if len(splitKeys) > 1 && splitKeys[1] == "resetQuota" {
-			keysToReset[splitKeys[0]] = true
-		} else if len(splitKeys) > 2 {
+		if len(splitKeys) > 1 {
 			action := splitKeys[len(splitKeys)-1]
-			if action == "oAuthRevokeToken" || action == "oAuthRevokeAccessToken" || action == "oAuthRevokeRefreshToken" {
+			switch action {
+			case ResetQuota:
+				keysToReset[splitKeys[0]] = true
+			case CertificateRemoved:
+				CertificatesToRemove[key] = splitKeys[0]
+				notRegularKeys[key] = true
+			case CertificateAdded:
+				CertificatesToAdd[key] = splitKeys[0]
+				notRegularKeys[key] = true
+			case OAuthRevokeToken, OAuthRevokeAccessToken, OAuthRevokeRefreshToken:
 				TokensToBeRevoked[splitKeys[0]] = key
-				oauthTokenKeys[key] = true
-			} else if action == "revoke_all_tokens" {
+				notRegularKeys[key] = true
+			case OAuthRevokeAllTokens:
 				ClientsToBeRevoked[splitKeys[1]] = key
-				oauthTokenKeys[key] = true
+				notRegularKeys[key] = true
+			case OauthClientAdded, OauthClientUpdated, OauthClientRemoved:
+				OauthClients[splitKeys[0]] = action
+				notRegularKeys[key] = true
+			case NoticeDeleteAPICache.String():
+				apiIDsToDeleteCache = append(apiIDsToDeleteCache, splitKeys[0])
+				notRegularKeys[key] = true
+			case NoticeInvalidateJWKSCacheForAPI.String():
+				apiIDsToInvalidateJWKSCache = append(apiIDsToInvalidateJWKSCache, splitKeys[0])
+				notRegularKeys[key] = true
+			case NoticeUserKeyReset.String():
+				keyParts := strings.Split(splitKeys[0], ".")
+				if len(keyParts) != 2 {
+					log.Error("Invalid user key reset format")
+					continue
+				}
+				userKeyResets[keyParts[0]] = keyParts[1]
+			default:
+				log.Debug("ignoring processing of action:", action)
 			}
 		}
 	}
+	for oldKey, newKey := range userKeyResets {
+		if r.Gw.GetConfig().SlaveOptions.APIKey == oldKey {
+			config := r.Gw.GetConfig()
+
+			// Updating the key in the KV store if we are using one
+			r.Gw.updateKeyInStore(config.Private.EdgeOriginalAPIKeyPath, newKey)
+
+			config.SlaveOptions.APIKey = newKey
+			r.Gw.SetConfig(config)
+			connected := r.Connect()
+			if !connected {
+				log.Error("Failed to reconnect to RPC storage")
+				continue
+			}
+		}
+		ok := r.Gw.MainNotifier.Notify(Notification{
+			Command: NoticeUserKeyReset,
+			Payload: fmt.Sprintf("%s.%s:%s", oldKey, newKey, NoticeUserKeyReset),
+			Gw:      r.Gw,
+		})
+		if !ok {
+			log.Error("Failed to notify other gateways about user key reset")
+		}
+	}
+	// Process OAuth clients
+	r.Gw.ProcessOauthClientsOps(OauthClients)
 
 	for clientId, key := range ClientsToBeRevoked {
 		splitKeys := strings.Split(key, ":")
 		apiId := splitKeys[0]
 		clientSecret := splitKeys[2]
-		storage, _, err := GetStorageForApi(apiId)
+		storage, _, err := r.Gw.GetStorageForApi(apiId)
 		if err != nil {
 			continue
 		}
@@ -844,51 +1216,143 @@ func (r *RPCStorageHandler) ProcessKeySpaceChanges(keys []string) {
 		tokenActionTypeHint := splitKeys[2]
 		hashedKey := strings.Contains(token, "#hashed")
 		if !hashedKey {
-			storage, _, err := GetStorageForApi(apiId)
+			storage, _, err := r.Gw.GetStorageForApi(apiId)
 			if err != nil {
 				continue
 			}
 			var tokenTypeHint string
 			switch tokenActionTypeHint {
-			case "oAuthRevokeAccessToken":
+			case OAuthRevokeAccessToken:
 				tokenTypeHint = "access_token"
-			case "oAuthRevokeRefreshToken":
+			case OAuthRevokeRefreshToken:
 				tokenTypeHint = "refresh_token"
 			}
 			RevokeToken(storage, token, tokenTypeHint)
 		} else {
 			token = strings.Split(token, "#")[0]
-			handleDeleteHashedKey(token, apiId, false)
+			r.Gw.handleDeleteHashedKey(token, orgId, apiId, false)
 		}
-		SessionCache.Delete(token)
-		RPCGlobalCache.Delete(r.KeyPrefix + token)
+		r.Gw.SessionCache.Delete(token)
+		r.Gw.RPCGlobalCache.Delete(r.KeyPrefix + token)
 	}
 
+	// remove certs
+	for _, certId := range CertificatesToRemove {
+		log.Debugf("Removing certificate: %v", certId)
+		r.Gw.CertificateManager.Delete(certId, orgId)
+		r.Gw.RPCCertCache.Delete("cert-raw-" + certId)
+	}
+
+	for _, certId := range CertificatesToAdd {
+		// Only filter if feature enabled in RPC mode (backward compatible)
+		if r.Gw.GetConfig().SlaveOptions.UseRPC &&
+			r.Gw.GetConfig().SlaveOptions.SyncUsedCertsOnly {
+			if r.Gw.certUsageTracker != nil && !r.Gw.certUsageTracker.Required(certId) {
+				log.WithField("cert_id", certs.MaskCertID(certId)).
+					Debug("skipping certificate - not used by loaded APIs, queuing for re-check after reload")
+				r.Gw.pendingCerts.Store(certId, struct{}{})
+				continue
+			}
+
+			if r.Gw.certUsageTracker != nil {
+				apis := r.Gw.certUsageTracker.APIs(certId)
+				log.WithFields(logrus.Fields{
+					"cert_id": certs.MaskCertID(certId),
+					"apis":    apis,
+				}).Info("syncing required certificate")
+			}
+		} else {
+			log.Debugf("Adding certificate: %v", certId)
+		}
+
+		//If we are in a slave node, MDCB Storage GetRaw should get the certificate from MDCB and cache it locally
+		content, err := r.Gw.CertificateManager.GetRaw(certId)
+		if content == "" && err != nil {
+			log.Debugf("Error getting certificate content")
+		}
+	}
+
+	synchronizerEnabled := r.Gw.GetConfig().SlaveOptions.SynchroniserEnabled
 	for _, key := range keys {
-		_, isOauthTokenKey := oauthTokenKeys[key]
+		// Skip keys that are user keys to be reset
+		splitKeys := strings.Split(key, ":")
+		if len(splitKeys) > 1 {
+			userKeys := strings.Split(splitKeys[0], ".")
+			if len(userKeys) == 2 {
+				_, ok := userKeyResets[userKeys[0]]
+				if ok {
+					continue
+				}
+			}
+		}
+		_, isOauthTokenKey := notRegularKeys[key]
 		if !isOauthTokenKey {
 			splitKeys := strings.Split(key, ":")
 			_, resetQuota := keysToReset[splitKeys[0]]
-			if len(splitKeys) > 1 && splitKeys[1] == "hashed" {
-				key = splitKeys[0]
+
+			isHashed := len(splitKeys) > 1 && splitKeys[1] == "hashed"
+			var status int
+			var err error
+			if isHashed {
 				log.Info("--> removing cached (hashed) key: ", splitKeys[0])
-				handleDeleteHashedKey(splitKeys[0], "", resetQuota)
-				getSessionAndCreate(splitKeys[0], r)
+				key = splitKeys[0]
+				_, status = r.Gw.handleDeleteHashedKey(key, orgId, "", resetQuota)
 			} else {
-				log.Info("--> removing cached key: ", key)
-				handleDeleteKey(key, "-1", resetQuota)
-				getSessionAndCreate(splitKeys[0], r)
+				log.Info("--> removing cached key: ", r.Gw.obfuscateKey(key))
+				// in case it's a username (basic auth) or custom-key then generate the token
+				if storage.TokenOrg(key) == "" {
+					key = r.Gw.generateToken(orgId, key)
+				}
+				_, status = r.Gw.handleDeleteKey(key, orgId, "-1", resetQuota)
+				// check if we must remove the key by custom key id
+				status, err = r.deleteUsingTokenID(key, orgId, resetQuota, status)
+				if err != nil {
+					log.Debugf("cannot remove key:%v status: %v", key, status)
+				}
 			}
-			SessionCache.Delete(key)
-			RPCGlobalCache.Delete(r.KeyPrefix + key)
+
+			// if key not found locally and synchroniser disabled then we should not pull it from management layer
+			if status == http.StatusNotFound && !synchronizerEnabled {
+				continue
+			}
+			r.Gw.getSessionAndCreate(key, r, isHashed, orgId)
+			r.Gw.SessionCache.Delete(key)
+			r.Gw.RPCGlobalCache.Delete(r.KeyPrefix + key)
 		}
 	}
+
+	for _, apiID := range apiIDsToDeleteCache {
+		if r.Gw.invalidateAPICache(apiID) {
+			log.WithField("apiID", apiID).Info("cache invalidated")
+			continue
+		}
+
+		log.WithField("apiID", apiID).Error("cache invalidation failed")
+	}
+
+	for _, apiID := range apiIDsToInvalidateJWKSCache {
+		log.WithField("apiID", apiID).Debug("Received request to flush JWKS cache")
+		r.Gw.invalidateJWKSCacheByAPIID(apiID)
+	}
+
 	// Notify rest of gateways in cluster to flush cache
 	n := Notification{
 		Command: KeySpaceUpdateNotification,
 		Payload: strings.Join(keys, ","),
+		Gw:      r.Gw,
 	}
-	MainNotifier.Notify(n)
+	r.Gw.MainNotifier.Notify(n)
+}
+
+// Function to handle fallback deletion using token ID
+func (r *RPCStorageHandler) deleteUsingTokenID(key, orgId string, resetQuota bool, status int) (int, error) {
+	if status == http.StatusNotFound {
+		id, err := storage.TokenID(key)
+		if err == nil {
+			_, status = r.Gw.handleDeleteKey(id, orgId, "-1", resetQuota)
+		}
+	}
+	return status, nil
 }
 
 func (r *RPCStorageHandler) DeleteScanMatch(pattern string) bool {
@@ -902,15 +1366,15 @@ func (r *RPCStorageHandler) GetKeyPrefix() string {
 }
 
 func (r *RPCStorageHandler) AddToSortedSet(keyName, value string, score float64) {
-	handleGlobalAddToSortedSet(keyName, value, score)
+	r.Gw.handleGlobalAddToSortedSet(keyName, value, score)
 }
 
 func (r *RPCStorageHandler) GetSortedSetRange(keyName, scoreFrom, scoreTo string) ([]string, []float64, error) {
-	return handleGetSortedSetRange(keyName, scoreFrom, scoreTo)
+	return r.Gw.handleGetSortedSetRange(keyName, scoreFrom, scoreTo)
 }
 
 func (r *RPCStorageHandler) RemoveSortedSetRange(keyName, scoreFrom, scoreTo string) error {
-	return handleRemoveSortedSetRange(keyName, scoreFrom, scoreTo)
+	return r.Gw.handleRemoveSortedSetRange(keyName, scoreFrom, scoreTo)
 }
 
 func (r *RPCStorageHandler) RemoveFromList(keyName, value string) error {

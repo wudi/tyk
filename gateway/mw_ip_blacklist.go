@@ -5,12 +5,14 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/TykTechnologies/tyk/ctx"
+	tykerrors "github.com/TykTechnologies/tyk/internal/errors"
 	"github.com/TykTechnologies/tyk/request"
 )
 
 // IPBlackListMiddleware lets you define a list of IPs to block from upstream
 type IPBlackListMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (i *IPBlackListMiddleware) Name() string {
@@ -18,7 +20,9 @@ func (i *IPBlackListMiddleware) Name() string {
 }
 
 func (i *IPBlackListMiddleware) EnabledForSpec() bool {
-	return i.Spec.EnableIpBlacklisting && len(i.Spec.BlacklistedIPs) > 0
+	enabled := !i.Spec.APIDefinition.IPAccessControlDisabled || i.Spec.APIDefinition.EnableIpBlacklisting
+
+	return enabled && len(i.Spec.APIDefinition.BlacklistedIPs) > 0
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
@@ -41,7 +45,6 @@ func (i *IPBlackListMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Re
 
 		// We parse the IP to manage IPv4 and IPv6 easily
 		if blockedIP.Equal(remoteIP) {
-
 			return i.handleError(r, remoteIP.String())
 		}
 	}
@@ -50,6 +53,7 @@ func (i *IPBlackListMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Re
 }
 
 func (i *IPBlackListMiddleware) handleError(r *http.Request, blacklistedIP string) (error, int) {
+	ctx.SetErrorClassification(r, tykerrors.NewErrorClassification(tykerrors.IPB, "ip_blocked").WithSource(i.Name()))
 
 	// Fire Authfailed Event
 	AuthFailed(i, r, blacklistedIP)

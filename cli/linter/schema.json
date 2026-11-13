@@ -4,11 +4,8 @@
   "additionalProperties": false,
   "definitions": {
     "StorageOptions": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "additionalProperties": false,
+      "type": ["object", "null"],
+      "additionalProperties": true,
       "properties": {
         "database": {
           "type": "integer"
@@ -27,18 +24,15 @@
           "format": "host-no-port"
         },
         "hosts": {
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": ["array", "null"]
         },
         "addrs": {
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": ["array", "null"]
         },
         "master_name": {
+          "type": "string"
+        },
+        "sentinel_password": {
           "type": "string"
         },
         "optimisation_max_active": {
@@ -58,20 +52,33 @@
         },
         "type": {
           "type": "string",
-          "enum": [
-            "",
-            "redis"
-          ]
+          "enum": ["", "redis"]
         },
         "username": {
           "type": "string"
+        },
+        "ca_file": {
+          "type": "string"
+        },
+        "cert_file": {
+          "type": "string"
+        },
+        "key_file": {
+          "type": "string"
+        },
+        "max_version": {
+          "type": "string"
+        },
+        "min_version": {
+          "type": "string"
+        },
+        "compress_policies": {
+          "type": "boolean"
         }
       }
     },
     "PortWhiteList": {
-      "type": [
-        "object"
-      ],
+      "type": ["object"],
       "additionalProperties": false,
       "properties": {
         "ranges": {
@@ -93,9 +100,469 @@
           }
         }
       }
+    },
+    "OpenTelemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "exporter": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "connection_timeout": {
+          "type": "integer"
+        },
+        "resource_name": {
+          "type": "string"
+        },
+        "span_processor_type": {
+          "type": "string"
+        },
+        "span_batch_config": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_queue_size": {
+              "type": "integer"
+            },
+            "max_export_batch_size": {
+              "type": "integer"
+            },
+            "batch_timeout": {
+              "type": "integer"
+            }
+          }
+        },
+        "context_propagation": {
+          "type": "string"
+        },
+        "custom_trace_header": {
+          "type": "string"
+        },
+        "headers": {
+          "type": ["array", "null"]
+        },
+        "sampling": {
+          "type": "object",
+          "sampling_type": {
+            "type": "string"
+          },
+          "rate": {
+            "type": "integer"
+          },
+          "parent_based": {
+            "type": "bool"
+          }
+        },
+        "tls": {
+          "type": "object",
+          "enable": {
+            "type": "bool"
+          },
+          "insecure_skip_verify": {
+            "type": "bool"
+          },
+          "ca_file": {
+            "type": "string"
+          },
+          "cert_file": {
+            "type": "string"
+          },
+          "key_file": {
+            "type": "string"
+          },
+          "max_version": {
+            "type": "string"
+          },
+          "min_version": {
+            "type": "string"
+          }
+        },
+        "traces": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "exporter": {
+              "type": "string"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "connection_timeout": {
+              "type": "integer"
+            },
+            "resource_name": {
+              "type": "string"
+            },
+            "span_processor_type": {
+              "type": "string"
+            },
+            "span_batch_config": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max_queue_size": {
+                  "type": "integer"
+                },
+                "max_export_batch_size": {
+                  "type": "integer"
+                },
+                "batch_timeout": {
+                  "type": "integer"
+                }
+              }
+            },
+            "context_propagation": {
+              "type": "string"
+            },
+            "custom_trace_header": {
+              "type": "string"
+            },
+            "headers": {
+              "type": ["array", "null"]
+            },
+            "sampling": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "rate": {
+                  "type": "number"
+                },
+                "parent_based": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "tls": {
+              "type": "object",
+              "properties": {
+                "enable": {
+                  "type": "boolean"
+                },
+                "insecure_skip_verify": {
+                  "type": "boolean"
+                },
+                "ca_file": {
+                  "type": "string"
+                },
+                "cert_file": {
+                  "type": "string"
+                },
+                "key_file": {
+                  "type": "string"
+                },
+                "max_version": {
+                  "type": "string"
+                },
+                "min_version": {
+                  "type": "string"
+                }
+              }
+            },
+            "mcp": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "read_sources": {
+                  "type": ["array", "null"],
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "channel": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "exporter": {
+              "type": "string"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "headers": {
+              "type": ["object", "null"]
+            },
+            "connection_timeout": {
+              "type": "integer"
+            },
+            "resource_name": {
+              "type": "string"
+            },
+            "tls": {
+              "type": "object",
+              "properties": {
+                "enable": {
+                  "type": "boolean"
+                },
+                "insecure_skip_verify": {
+                  "type": "boolean"
+                },
+                "ca_file": {
+                  "type": "string"
+                },
+                "cert_file": {
+                  "type": "string"
+                },
+                "key_file": {
+                  "type": "string"
+                },
+                "max_version": {
+                  "type": "string"
+                },
+                "min_version": {
+                  "type": "string"
+                }
+              }
+            },
+            "export_interval": {
+              "type": "integer"
+            },
+            "temporality": {
+              "type": "string"
+            },
+            "shutdown_timeout": {
+              "type": "integer"
+            },
+            "cardinality_limit": {
+              "type": "integer"
+            },
+            "retry": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "initial_interval": {
+                  "type": "integer"
+                },
+                "max_interval": {
+                  "type": "integer"
+                },
+                "max_elapsed_time": {
+                  "type": "integer"
+                }
+              }
+            },
+            "runtime_metrics": {
+              "type": ["boolean", "null"]
+            },
+            "api_metrics": {
+              "type": ["array", "null"]
+            }
+          }
+        }
+      }
+    },
+    "Streaming": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "allow_unsafe": {
+          "type": "array"
+        }
+      }
+    },
+    "ServiceConfig": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "proxy": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "http_proxy": {
+              "type": "string"
+            },
+            "https_proxy": {
+              "type": "string"
+            },
+            "bypass_proxy": {
+              "type": "string"
+            }
+          }
+        },
+        "mtls": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "cert_file": {
+              "type": "string"
+            },
+            "key_file": {
+              "type": "string"
+            },
+            "ca_file": {
+              "type": "string"
+            },
+            "cert_id": {
+              "type": "string"
+            },
+            "ca_cert_ids": {
+              "type": ["array", "null"],
+              "items": {
+                "type": "string"
+              }
+            },
+            "insecure_skip_verify": {
+              "type": "boolean"
+            },
+            "tls_max_version": {
+              "type": "string"
+            },
+            "tls_min_version": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "ErrorOverrides": {
+      "type": ["object", "null"],
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "match": {
+              "type": "object",
+              "properties": {
+                "flag": { "type": "string" },
+                "message_pattern": { "type": "string" },
+                "body_field": { "type": "string" },
+                "body_value": { "type": "string" }
+              }
+            },
+            "response": {
+              "type": "object",
+              "properties": {
+                "status_code": { "type": "integer" },
+                "body": { "type": "string" },
+                "message": { "type": "string" },
+                "template": { "type": "string" },
+                "headers": {
+                  "type": "object",
+                  "additionalProperties": { "type": "string" }
+                }
+              }
+            }
+          },
+          "required": ["response"]
+        }
+      }
+    },
+    "SinkConfig": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "description": "Specifies the minimum severity level (e.g., debug, info, warn) an event must have to be processed by this sink."
+        },
+        "high_level": {
+          "type": "string",
+          "description": "Specifies the maximum severity level (e.g., debug, info, warn). Default value: panic"
+        },
+        "format": {
+          "type": "string",
+          "description": "Defines the identifier of the used formatter (e.g., \"json\", \"text\")."
+        },
+        "format_options": {
+          "description": "Raw JSON payload with parameters specific to the chosen Format.",
+          "anyOf": [
+            { "$ref": "#/definitions/TextFormatterOptions" },
+            { "$ref": "#/definitions/JsonFormatterOptions" }
+          ]
+        },
+        "output": {
+          "type": "string",
+          "description": "Defines the identifier of the target destination (e.g., \"file\", \"http\", \"stdout\")."
+        },
+        "output_options": {
+          "type": "object",
+          "description": "Raw JSON payload with parameters specific to the chosen Output."
+        }
+      },
+      "additionalProperties": false
+    },
+    "TextFormatterOptions": {
+      "type": "object",
+      "description": "Configuration options mapped directly to logrus.TextFormatter. For exact field semantics, see: https://pkg.go.dev/github.com/sirupsen/logrus#TextFormatter",
+      "properties": {
+        "force_colors": { "type": "boolean" },
+        "disable_colors": { "type": "boolean" },
+        "force_quote": { "type": "boolean" },
+        "disable_quote": { "type": "boolean" },
+        "environment_override_colors": { "type": "boolean" },
+        "disable_timestamp": { "type": "boolean" },
+        "full_timestamp": { "type": "boolean" },
+        "timestamp_format": { "type": "string" },
+        "disable_sorting": { "type": "boolean" },
+        "disable_level_truncation": { "type": "boolean" },
+        "pad_level_text": { "type": "boolean" },
+        "quote_empty_fields": { "type": "boolean" },
+        "field_map": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "JsonFormatterOptions": {
+      "type": "object",
+      "description": "Configuration options mapped directly to log.JsonFormatter from tyk repository.",
+      "properties": {
+        "timestamp_format": { "type": "string" },
+        "disable_timestamp": { "type": "boolean" },
+        "data_key": { "type": "string" },
+        "field_map": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "properties": {
+    "streaming": {
+      "$ref": "#/definitions/Streaming"
+    },
+    "graceful_shutdown_delay_seconds": {
+      "type": "integer"
+    },
     "allow_insecure_configs": {
       "type": "boolean"
     },
@@ -106,14 +573,17 @@
       "type": "boolean"
     },
     "analytics_config": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "enable_detailed_recording": {
           "type": "boolean"
+        },
+        "allow_unsafe_detailed_logs": {
+          "type": "boolean"
+        },
+        "purge_interval": {
+          "type": "number"
         },
         "enable_geo_ip": {
           "type": "boolean"
@@ -123,23 +593,14 @@
           "format": "path"
         },
         "ignored_ips": {
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": ["array", "null"]
         },
         "normalise_urls": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "custom_patterns": {
-              "type": [
-                "array",
-                "null"
-              ]
+              "type": ["array", "null"]
             },
             "enabled": {
               "type": "boolean"
@@ -148,6 +609,9 @@
               "type": "boolean"
             },
             "normalise_uuids": {
+              "type": "boolean"
+            },
+            "normalise_ulids": {
               "type": "boolean"
             }
           }
@@ -158,10 +622,16 @@
         "records_buffer_size": {
           "type": "integer"
         },
+        "enable_multiple_analytics_keys": {
+          "type": "boolean"
+        },
         "storage_expiration_time": {
           "type": "integer"
         },
         "type": {
+          "type": "string"
+        },
+        "serializer_type": {
           "type": "string"
         }
       }
@@ -171,24 +641,15 @@
       "format": "path"
     },
     "auth_override": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "auth_provider": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "meta": {
-              "type": [
-                "array",
-                "null"
-              ]
+              "type": ["array", "null"]
             },
             "name": {
               "type": "string"
@@ -205,17 +666,11 @@
           "type": "boolean"
         },
         "session_provider": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "meta": {
-              "type": [
-                "array",
-                "null"
-              ]
+              "type": ["array", "null"]
             },
             "name": {
               "type": "string"
@@ -239,6 +694,10 @@
     "proxy_close_connections": {
       "type": "boolean"
     },
+    "apply_strip_listen_path_to_url_rewrite": {
+      "type": "boolean",
+      "default": false
+    },
     "close_idle_connections": {
       "type": "boolean"
     },
@@ -249,14 +708,17 @@
       "type": "integer"
     },
     "coprocess_options": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "coprocess_grpc_server": {
           "type": "string"
+        },
+        "grpc_authority": {
+          "type": "string"
+        },
+        "grpc_round_robin_load_balancing": {
+          "type": "boolean"
         },
         "enable_coprocess": {
           "type": "boolean"
@@ -278,24 +740,24 @@
     "ignore_endpoint_case": {
       "type": "boolean"
     },
+    "ignore_canonical_mime_header_key": {
+      "type": "boolean"
+    },
     "db_app_conf_options": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "connection_string": {
           "type": "string"
         },
+        "connection_timeout": {
+          "type": "integer"
+        },
         "node_is_segmented": {
           "type": "boolean"
         },
         "tags": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
@@ -308,17 +770,29 @@
     "disable_dashboard_zeroconf": {
       "type": "boolean"
     },
+    "jwt_ssl_insecure_skip_verify": {
+      "type": "boolean"
+    },
     "disable_virtual_path_blobs": {
       "type": "boolean"
     },
     "drl_notification_frequency": {
       "type": "integer"
     },
+    "drl_enable_sentinel_rate_limiter": {
+      "type": "boolean"
+    },
     "drl_threshold": {
       "type": "number"
     },
     "enable_analytics": {
       "type": "boolean"
+    },
+    "enable_separate_analytics_store": {
+      "type": "boolean"
+    },
+    "analytics_storage": {
+      "$ref": "#/definitions/StorageOptions"
     },
     "enable_api_segregation": {
       "type": "boolean"
@@ -327,6 +801,12 @@
       "type": "boolean"
     },
     "bundle_insecure_skip_verify": {
+      "type": "boolean"
+    },
+    "skip_verify_existing_plugin_bundle": {
+      "type": "boolean"
+    },
+    "enable_config_inspection": {
       "type": "boolean"
     },
     "enable_custom_domains": {
@@ -342,6 +822,12 @@
       "type": "boolean"
     },
     "enable_redis_rolling_limiter": {
+      "type": "boolean"
+    },
+    "enable_fixed_window_rate_limiter": {
+      "type": "boolean"
+    },
+    "enable_rate_limit_smoothing": {
       "type": "boolean"
     },
     "enable_sentinel_rate_limiter": {
@@ -360,32 +846,20 @@
       "type": "boolean"
     },
     "event_handlers": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "events": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false
         }
       }
     },
     "event_trigers_defunct": {
-      "type": [
-        "array",
-        "null"
-      ]
+      "type": ["array", "null"]
     },
     "event_triggers_defunct": {
-      "type": [
-        "array",
-        "null"
-      ]
+      "type": ["array", "null"]
     },
     "experimental_process_org_off_thread": {
       "type": "boolean"
@@ -396,27 +870,38 @@
     "global_session_lifetime": {
       "type": "integer"
     },
+    "session_lifetime_respects_key_expiration": {
+      "type": "boolean"
+    },
     "graylog_network_addr": {
       "type": "string"
     },
     "hash_keys": {
       "type": "boolean"
     },
+    "reload_interval": {
+      "type": "integer"
+    },
+    "disable_key_actions_by_username": {
+      "type": "boolean"
+    },
     "hash_key_function": {
       "type": "string",
-      "enum": [
-        "",
-        "murmur32",
-        "murmur64",
-        "murmur128",
-        "sha256"
-      ]
+      "enum": ["", "murmur32", "murmur64", "murmur128", "sha256"]
+    },
+    "hash_key_function_fallback": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "string",
+        "enum": ["", "murmur32", "murmur64", "murmur128", "sha256"]
+      }
+    },
+    "basic_auth_hash_key_function": {
+      "type": "string",
+      "enum": ["", "bcrypt", "murmur32", "murmur64", "murmur128", "sha256"]
     },
     "health_check": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "enable_health_checks": {
@@ -428,10 +913,7 @@
       }
     },
     "dns_cache": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "enabled": {
@@ -443,11 +925,7 @@
         },
         "multiple_ips_handle_strategy": {
           "type": "string",
-          "enum": [
-            "pick_first",
-            "random",
-            "no_cache"
-          ]
+          "enum": ["pick_first", "random", "no_cache"]
         }
       }
     },
@@ -458,22 +936,13 @@
       "type": "string"
     },
     "http_server_options": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "certificates": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": ["object", "null"],
             "additionalProperties": false,
             "properties": {
               "domain_name": {
@@ -491,13 +960,28 @@
         "enable_websockets": {
           "type": "boolean"
         },
+        "enable_strict_routes": {
+          "type": "boolean"
+        },
+        "enable_path_prefix_matching": {
+          "type": "boolean"
+        },
+        "enable_path_suffix_matching": {
+          "type": "boolean"
+        },
         "flush_interval": {
           "type": "integer"
         },
         "min_version": {
           "type": "integer"
         },
+        "max_version": {
+          "type": "integer"
+        },
         "override_defaults": {
+          "type": "boolean"
+        },
+        "skip_client_ca_announcement": {
           "type": "boolean"
         },
         "read_timeout": {
@@ -528,19 +1012,28 @@
           "type": "integer"
         },
         "ssl_certificates": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
         },
         "ssl_ciphers": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_request_body_size": {
+          "type": "integer"
+        },
+        "max_response_body_size": {
+          "type": "integer"
+        },
+        "xff_depth": {
+          "type": "integer"
+        },
+        "trusted_proxy_cidrs": {
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
@@ -558,10 +1051,7 @@
       "type": "integer"
     },
     "local_session_cache": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "cached_session_eviction": {
@@ -577,13 +1067,36 @@
     },
     "log_level": {
       "type": "string",
-      "enum": [
-        "",
-        "debug",
-        "info",
-        "warn",
-        "error"
+      "enum": ["", "debug", "info", "warn", "error"]
+    },
+    "log_format": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["", "text", "json", "legacy"]
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SinkConfig"
+          }
+        },
+        {
+          "type": "null"
+        }
       ]
+    },
+    "access_logs": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "template": {
+          "type": ["object", "null"]
+        }
+      }
     },
     "enable_http_profiler": {
       "type": "boolean"
@@ -599,12 +1112,12 @@
           "type": "boolean"
         },
         "options": {
-          "type": [
-            "object",
-            "null"
-          ]
+          "type": ["object", "null"]
         }
       }
+    },
+    "opentelemetry": {
+      "$ref": "#/definitions/OpenTelemetry"
     },
     "logstash_network_addr": {
       "type": "string"
@@ -629,10 +1142,7 @@
       "format": "path"
     },
     "override_messages": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "code": {
@@ -644,27 +1154,18 @@
       }
     },
     "monitor": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "configuration": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "event_timeout": {
               "type": "integer"
             },
             "header_map": {
-              "type": [
-                "array",
-                "null"
-              ]
+              "type": ["array", "null"]
             },
             "method": {
               "type": "string"
@@ -710,23 +1211,11 @@
     "oauth_error_status_code": {
       "type": "integer"
     },
-    "optimisations_use_async_session_write": {
-      "type": "boolean"
-    },
-    "session_update_pool_size": {
-      "type": "integer"
-    },
-    "session_update_buffer_size": {
-      "type": "integer"
-    },
     "pid_file_location": {
       "type": "string"
     },
     "policies": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "allow_explicit_policy_id": {
@@ -740,11 +1229,10 @@
         },
         "policy_source": {
           "type": "string",
-          "enum": [
-            "",
-            "service",
-            "rpc"
-          ]
+          "enum": ["", "service", "rpc"]
+        },
+        "policy_path": {
+          "type": "string"
         }
       }
     },
@@ -752,10 +1240,7 @@
       "type": "boolean"
     },
     "ports_whitelist": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "http": {
@@ -784,11 +1269,11 @@
     "proxy_ssl_min_version": {
       "type": "integer"
     },
+    "proxy_ssl_max_version": {
+      "type": "integer"
+    },
     "proxy_ssl_ciphers": {
-      "type": [
-        "array",
-        "null"
-      ],
+      "type": ["array", "null"],
       "items": {
         "type": "string"
       }
@@ -810,10 +1295,7 @@
       "type": "string"
     },
     "service_discovery": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "default_cache_timeout": {
@@ -822,10 +1304,7 @@
       }
     },
     "slave_options": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "api_key": {
@@ -869,6 +1348,45 @@
         },
         "key_space_sync_interval": {
           "type": "number"
+        },
+        "rpc_cert_cache_expiration": {
+          "type": "number"
+        },
+        "rpc_global_cache_expiration": {
+          "type": "number"
+        },
+        "rpc_cert_fetch_max_elapsed_time": {
+          "type": "number"
+        },
+        "rpc_cert_fetch_initial_interval": {
+          "type": "number"
+        },
+        "rpc_cert_fetch_max_interval": {
+          "type": "number"
+        },
+        "rpc_cert_fetch_retry_enabled": {
+          "type": ["boolean", "null"]
+        },
+        "rpc_cert_fetch_max_retries": {
+          "type": ["integer", "null"]
+        },
+        "synchroniser_enabled": {
+          "type": "boolean"
+        },
+        "dns_monitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "check_interval": {
+              "type": "integer"
+            }
+          }
+        },
+        "sync_used_certs_only": {
+          "type": "boolean"
         }
       }
     },
@@ -902,17 +1420,11 @@
       "format": "path"
     },
     "uptime_tests": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "config": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "checker_pool_size": {
@@ -931,6 +1443,9 @@
         },
         "disable": {
           "type": "boolean"
+        },
+        "poller_group": {
+          "type": "string"
         }
       }
     },
@@ -956,10 +1471,7 @@
       "type": "boolean"
     },
     "security": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "private_certificate_encoding_secret": {
@@ -969,64 +1481,109 @@
           "type": "boolean"
         },
         "pinned_public_keys": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "object"
           }
         },
+        "allow_unsafe_dynamic_mtls_token": {
+          "type": "boolean"
+        },
         "certificates": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "upstream": {
-              "type": [
-                "object",
-                "null"
-              ]
+              "type": ["object", "null"]
             },
             "apis": {
-              "type": [
-                "array",
-                "null"
-              ],
+              "type": ["array", "null"],
               "items": {
                 "type": "string"
               }
             },
             "control_api": {
-              "type": [
-                "array",
-                "null"
-              ],
+              "type": ["array", "null"],
               "items": {
                 "type": "string"
               }
             },
             "dashboard_api": {
-              "type": [
-                "array",
-                "null"
-              ],
+              "type": ["array", "null"],
               "items": {
                 "type": "string"
               }
             },
             "mdcb_api": {
-              "type": [
-                "array",
-                "null"
-              ],
+              "type": ["array", "null"],
               "items": {
                 "type": "string"
               }
             }
           }
+        },
+        "certificate_expiry_monitor": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "warning_threshold_days": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 30
+            },
+            "check_cooldown_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3600
+            },
+            "event_cooldown_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 86400
+            }
+          }
+        }
+      }
+    },
+    "external_services": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "global": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "http_proxy": {
+              "type": "string"
+            },
+            "https_proxy": {
+              "type": "string"
+            },
+            "bypass_proxy": {
+              "type": "string"
+            }
+          }
+        },
+        "oauth": {
+          "$ref": "#/definitions/ServiceConfig"
+        },
+        "analytics": {
+          "$ref": "#/definitions/ServiceConfig"
+        },
+        "storage": {
+          "$ref": "#/definitions/ServiceConfig"
+        },
+        "webhooks": {
+          "$ref": "#/definitions/ServiceConfig"
+        },
+        "health": {
+          "$ref": "#/definitions/ServiceConfig"
+        },
+        "discovery": {
+          "$ref": "#/definitions/ServiceConfig"
         }
       }
     },
@@ -1034,10 +1591,7 @@
       "type": "boolean"
     },
     "newrelic": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "app_name": {
@@ -1045,6 +1599,9 @@
         },
         "license_key": {
           "type": "string"
+        },
+        "enable_distributed_tracing": {
+          "type": "boolean"
         }
       }
     },
@@ -1060,27 +1617,36 @@
     "regexp_cache_expire": {
       "type": "integer"
     },
+    "regexp_cache_max_entries": {
+      "type": "integer"
+    },
+    "disable_regexp_cache_bound": {
+      "type": "boolean"
+    },
+    "disable_auto_max_procs": {
+      "type": "boolean"
+    },
     "proxy_ssl_disable_renegotiation": {
       "type": "boolean"
     },
     "health_check_endpoint_name": {
       "type": "string"
     },
+    "readiness_check_endpoint_name": {
+      "type": "string"
+    },
+    "graceful_shutdown_timeout_duration": {
+      "type": "integer"
+    },
     "ssl_force_common_name_check": {
       "type": "boolean"
     },
     "kv": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "consul": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "properties": {
             "address": {
               "type": "string"
@@ -1092,10 +1658,7 @@
               "type": "string"
             },
             "http_auth": {
-              "type": [
-                "object",
-                "null"
-              ],
+              "type": ["object", "null"],
               "properties": {
                 "username": {
                   "type": "string"
@@ -1112,10 +1675,7 @@
               "type": "string"
             },
             "tls_config": {
-              "type": [
-                "object",
-                "null"
-              ],
+              "type": ["object", "null"],
               "properties": {
                 "address": {
                   "type": "string"
@@ -1137,10 +1697,7 @@
           }
         },
         "vault": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "properties": {
             "address": {
               "type": "string"
@@ -1161,23 +1718,40 @@
               "type": "integer"
             }
           }
+        },
+        "file": {
+          "type": ["object", "null"],
+          "properties": {
+            "base_path": {
+              "type": "string"
+            }
+          }
+        },
+        "stores": {
+          "type": ["object", "null"],
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "config": {
+                "type": ["object", "null"]
+              }
+            }
+          }
         }
       }
     },
     "secrets": {
-      "type": [
-        "array",
-        "null"
-      ]
-    },
-    "enable_http_profiler": {
-      "type": "boolean"
+      "type": ["array", "null"]
     },
     "liveness_check": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "check_duration": {
@@ -1187,6 +1761,71 @@
     },
     "cloud": {
       "type": "boolean"
+    },
+    "resource_sync": {
+      "type": "object",
+      "properties": {
+        "retry_attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "interval": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "oas_config": {
+      "validate_examples": false,
+      "validate_schema_defaults": false
+    },
+    "labs": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {}
+    },
+    "jwks": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "cache": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "timeout": {
+              "type": ["integer"],
+              "description": "Cache timeout in seconds",
+              "minimum": 0,
+              "default": 240
+            }
+          }
+        }
+      }
+    },
+    "rate_limit_response_headers": {
+      "description": "Determines the type of data that will be returned in the rate limit headers",
+      "type": ["string"],
+      "enum": ["", "quotas", "rate_limits"],
+      "default": "quotas"
+    },
+    "allow_unsafe_policy_ids": {
+      "type": ["boolean", "null"],
+      "additionalProperties": false
+    },
+    "allow_unsafe_webhook_template_paths": {
+      "type": ["boolean", "null"],
+      "additionalProperties": false
+    },
+    "allow_unsafe_api_ids": {
+      "type": ["boolean", "null"],
+      "additionalProperties": false
+    },
+    "allow_unsafe_body_transform_template_paths": {
+      "type": ["boolean", "null"],
+      "additionalProperties": false
+    },
+    "error_overrides": {
+      "$ref": "#/definitions/ErrorOverrides"
     }
   }
 }

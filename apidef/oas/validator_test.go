@@ -1,0 +1,835 @@
+package oas
+
+import (
+	"embed"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/buger/jsonparser"
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/TykTechnologies/tyk/internal/service/gojsonschema"
+	"github.com/TykTechnologies/tyk/internal/time"
+)
+
+//go:embed testdata/*-oas-template.json
+var oasTemplateFS embed.FS
+
+func getStrPointer(str string) *string {
+	return &str
+}
+
+func getBoolPointer(b bool) *bool {
+	return &b
+}
+
+func TestValidateOASObject(t *testing.T) {
+	t.Parallel()
+	validOASObject := OAS{
+		openapi3.T{
+			OpenAPI: "3.0.3",
+			Info:    &openapi3.Info{},
+			Paths: func() *openapi3.Paths {
+				paths := openapi3.NewPaths()
+				paths.Set("/pets", &openapi3.PathItem{
+					Get: &openapi3.Operation{
+						Responses: func() *openapi3.Responses {
+							responses := openapi3.NewResponses()
+							responses.Set("200", &openapi3.ResponseRef{
+								Value: &openapi3.Response{
+									Description: getStrPointer("A paged array of pets"),
+								},
+							})
+							return responses
+						}(),
+					},
+				})
+				return paths
+			}(),
+		},
+	}
+
+	validXTykAPIGateway := XTykAPIGateway{
+		Info: Info{
+			Name: "oas-api",
+			State: State{
+				Active: true,
+			},
+		},
+		Server: Server{
+			ListenPath: ListenPath{
+				Value: "/oas-api",
+			},
+		},
+		Upstream: Upstream{
+			URL: "http://upstream.url",
+		},
+	}
+
+	validOASObject.SetTykExtension(&validXTykAPIGateway)
+
+	validOAS3Definition, _ := validOASObject.MarshalJSON()
+
+	t.Run("valid OAS object", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(validOAS3Definition, "3.0.3")
+		assert.Nil(t, err)
+	})
+
+	invalidOASObject := validOASObject
+	invalidXTykAPIGateway := validXTykAPIGateway
+	invalidXTykAPIGateway.Info = Info{}
+	invalidXTykAPIGateway.Server.GatewayTags = &GatewayTags{Enabled: true, Tags: []string{}}
+	invalidOASObject.SetTykExtension(&invalidXTykAPIGateway)
+	pathsMap := invalidOASObject.Paths.Map()
+	pathsMap["/pets"].Get.Responses.Map()["200"].Value.Description = nil
+	invalidOAS3Definition, _ := invalidOASObject.MarshalJSON()
+
+	t.Run("invalid OAS object", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(invalidOAS3Definition, "3.0.3")
+		expectedErrs := []string{
+			`x-tyk-api-gateway.info.name: Does not match pattern '\S+'`,
+			"paths./pets.get.responses.200: Must validate one and only one schema (oneOf)",
+			"paths./pets.get.responses.200: description is required",
+		}
+		actualErrs := strings.Split(err.Error(), "\n")
+		assert.ElementsMatch(t, expectedErrs, actualErrs)
+	})
+
+	var wrongTypedOASDefinition = []byte(`{
+	"openapi": "3.0.0",
+	"info": {
+	"version": "1.0.0",
+	"title": "Swagger Petstore",
+	"license": {
+	  "name": "MIT"
+	}
+	},
+	"servers": [
+	{
+	  "url": "http://petstore.swagger.io/v1"
+	}
+	],
+	"paths": {
+	"/pets": {
+	  "get": {
+		"summary": "List all pets",
+		"operationId": "listPets",
+		"tags": "pets",
+		"parameters": [
+		  {
+			"name": "limit",
+			"in": "query",
+			"description": "How many items to return at one time (max 100)",
+			"required": false,
+			"schema": {
+			  "type": "integer",
+			  "format": "int32"
+			}
+		  }
+		]
+	  }
+	}
+	},
+	"components": {
+	"schemas": {
+	  "Pet": {
+		"type": "object",
+		"required": [
+		  "id",
+		  "name"
+		],
+		"properties": {
+		  "id": {
+			"type": "integer",
+			"format": "int64"
+		  },
+		  "name": {
+			"type": "string"
+		  },
+		  "tag": {
+			"type": "string"
+		  }
+		}
+	  },
+	  "Pets": {
+		"type": "array",
+		"items": {
+		  "$ref": "#/components/schemas/Pet"
+		}
+	  },
+	  "Error": {
+		"type": "object",
+		"required": [
+		  "code",
+		  "message"
+		],
+		"properties": {
+		  "code": {
+			"type": "integer",
+			"format": "int32"
+		  },
+		  "message": {
+			"type": "string"
+		  }
+		}
+	  }
+	}
+	}
+	}`)
+
+	t.Run("wrong typed OAS object", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(wrongTypedOASDefinition, "3.0.3")
+		expectedErr := fmt.Sprintf("%s\n%s",
+			"paths./pets.get: responses is required",
+			"paths./pets.get.tags: Invalid type. Expected: array, given: string")
+		assert.Equal(t, expectedErr, err.Error())
+	})
+
+	t.Run("should error when requested oas schema not found", func(t *testing.T) {
+		t.Parallel()
+		reqOASVersion := "4.0.3"
+		err := ValidateOASObject(validOAS3Definition, reqOASVersion)
+		expectedErr := fmt.Errorf(oasSchemaVersionNotFoundFmt, reqOASVersion)
+		assert.Equal(t, expectedErr, err)
+	})
+}
+
+func TestValidateOASObject_3_1(t *testing.T) {
+	t.Parallel()
+
+	// Create minimal valid OAS 3.1 document programmatically
+	validOAS31Doc := []byte(`{
+		"openapi": "3.1.0",
+		"info": {
+			"title": "Test API 3.1",
+			"version": "1.0.0"
+		},
+		"paths": {
+			"/test": {
+				"get": {
+					"responses": {
+						"200": {
+							"description": "Success"
+						}
+					}
+				}
+			}
+		},
+		"x-tyk-api-gateway": {
+			"info": {
+				"name": "test-api-3.1",
+				"state": {
+					"active": true
+				}
+			},
+			"upstream": {
+				"url": "http://localhost:8080"
+			},
+			"server": {
+				"listenPath": {
+					"value": "/test-api-3.1/"
+				}
+			}
+		}
+	}`)
+
+	t.Run("valid OAS 3.1 document with version 3.1.0", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(validOAS31Doc, "3.1.0")
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid OAS 3.1 document with version 3.1", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(validOAS31Doc, "3.1")
+		assert.NoError(t, err)
+	})
+}
+
+func TestValidateOASTemplate(t *testing.T) {
+	t.Run("empty x-tyk ext", func(t *testing.T) {
+		body, err := oasTemplateFS.ReadFile("testdata/empty-x-tyk-ext-oas-template.json")
+		require.NoError(t, err)
+		err = ValidateOASTemplate(body, "")
+		assert.NoError(t, err)
+	})
+
+	t.Run("non-empty x-tyk-ext", func(t *testing.T) {
+		body, err := oasTemplateFS.ReadFile("testdata/non-empty-x-tyk-ext-oas-template.json")
+		require.NoError(t, err)
+		err = ValidateOASTemplate(body, "")
+		assert.NoError(t, err)
+	})
+}
+
+func TestValidateOASTemplate_3_1(t *testing.T) {
+	t.Parallel()
+
+	// Minimal OAS 3.1 template (missing required x-tyk fields)
+	template31 := []byte(`{
+		"openapi": "3.1.0",
+		"info": {
+			"title": "Template API 3.1",
+			"version": "1.0.0"
+		},
+		"paths": {},
+		"x-tyk-api-gateway": {}
+	}`)
+
+	t.Run("valid OAS 3.1 template", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASTemplate(template31, "3.1")
+		assert.NoError(t, err)
+	})
+}
+
+func Test_loadOASSchema(t *testing.T) {
+	t.Parallel()
+	t.Run("load OAS schemas", func(t *testing.T) {
+		t.Parallel()
+		err := loadOASSchema()
+		assert.Nil(t, err)
+		assert.NotNil(t, oasJSONSchemas)
+
+		// Verify we have at least 3.0 and 3.1 schemas
+		assert.Contains(t, oasJSONSchemas, "3.0", "Should load OAS 3.0 schema")
+		assert.Contains(t, oasJSONSchemas, "3.1", "Should load OAS 3.1 schema")
+
+		for oasVersion, schemaData := range oasJSONSchemas {
+			// Check x-tyk-api-gateway extension is in properties
+			var xTykAPIGateway []byte
+			xTykAPIGateway, _, _, err = jsonparser.Get(schemaData, keyProperties, ExtensionTykAPIGateway)
+			assert.NoError(t, err, "x-tyk-api-gateway should exist in properties for version %s", oasVersion)
+			assert.NotNil(t, xTykAPIGateway, "x-tyk-api-gateway should not be nil for version %s", oasVersion)
+
+			// Detect which definitions key this version uses
+			defsKey := GetDefinitionsKey(schemaData)
+
+			// Check X-Tyk-Server is in the correct definitions location
+			var xTykServer []byte
+			xTykServer, _, _, err = jsonparser.Get(schemaData, defsKey, "X-Tyk-Server")
+			assert.NoError(t, err, "X-Tyk-Server should exist in %s for version %s", defsKey, oasVersion)
+			assert.NotNil(t, xTykServer, "X-Tyk-Server should not be nil for version %s", oasVersion)
+
+			// Verify the correct key is used based on version
+			if strings.HasPrefix(oasVersion, "3.0") {
+				assert.Equal(t, "definitions", defsKey, "OAS 3.0 should use 'definitions'")
+			} else if strings.HasPrefix(oasVersion, "3.1") {
+				assert.Equal(t, "$defs", defsKey, "OAS 3.1 should use '$defs'")
+			}
+		}
+	})
+}
+
+func TestGetDefinitionsKey(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns $defs for OAS 3.1 schema", func(t *testing.T) {
+		t.Parallel()
+		schema31 := []byte(`{"$defs": {}, "properties": {}}`)
+		key := GetDefinitionsKey(schema31)
+		assert.Equal(t, "$defs", key)
+	})
+
+	t.Run("returns definitions for OAS 3.0 schema", func(t *testing.T) {
+		t.Parallel()
+		schema30 := []byte(`{"definitions": {}, "properties": {}}`)
+		key := GetDefinitionsKey(schema30)
+		assert.Equal(t, "definitions", key)
+	})
+
+	t.Run("falls back to definitions when neither key exists", func(t *testing.T) {
+		t.Parallel()
+		schemaUnknown := []byte(`{"properties": {}}`)
+		key := GetDefinitionsKey(schemaUnknown)
+		assert.Equal(t, "definitions", key)
+	})
+
+	t.Run("prefers $defs when both keys exist", func(t *testing.T) {
+		t.Parallel()
+		schemaBoth := []byte(`{"$defs": {}, "definitions": {}, "properties": {}}`)
+		key := GetDefinitionsKey(schemaBoth)
+		assert.Equal(t, "$defs", key)
+	})
+}
+
+func Test_findDefaultVersion(t *testing.T) {
+	t.Parallel()
+	t.Run("single version", func(t *testing.T) {
+		rawVersions := []string{"3.0"}
+
+		assert.Equal(t, "3.0", findDefaultVersion(rawVersions))
+	})
+
+	t.Run("multiple versions", func(t *testing.T) {
+		rawVersions := []string{"3.0", "2.0", "3.1.0"}
+
+		assert.Equal(t, "3.1", findDefaultVersion(rawVersions))
+	})
+}
+
+func Test_setDefaultVersion(t *testing.T) {
+	err := loadOASSchema()
+	assert.NoError(t, err)
+
+	setDefaultVersion()
+	assert.Equal(t, "3.0", defaultVersion)
+}
+
+func TestUpstreamEnforceTimeoutSchema(t *testing.T) {
+	t.Parallel()
+
+	base := func(enforceTimeout string) []byte {
+		upstream := `"url": "http://upstream"`
+		if enforceTimeout != "" {
+			upstream += `,` + enforceTimeout
+		}
+		return []byte(`{
+			"openapi": "3.0.3",
+			"info": {"title": "t", "version": "1"},
+			"paths": {},
+			"x-tyk-api-gateway": {
+				"info": {"name": "t", "state": {"active": true}},
+				"server": {"listenPath": {"value": "/t"}},
+				"upstream": {` + upstream + `}
+			}
+		}`)
+	}
+
+	t.Run("valid: enabled true with duration", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"enabled": true, "duration": "5s"}`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid: enabled false with duration", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"enabled": false, "duration": "500ms"}`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid: enabled with sub-second duration", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"enabled": true, "duration": "100ms"}`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid: enabled with minute duration", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"enabled": true, "duration": "2m"}`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid: no enforceTimeout field", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(""), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid: enforceTimeout missing required enabled field", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"duration": "5s"}`), "3.0.3")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "enabled")
+	})
+
+	t.Run("invalid: duration with bad format", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"enabled": true, "duration": "5x"}`), "3.0.3")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duration")
+	})
+
+	t.Run("invalid: duration is a number not a string", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(base(`"enforceTimeout": {"enabled": true, "duration": 5}`), "3.0.3")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duration")
+	})
+}
+
+func TestGetOASSchema(t *testing.T) {
+	err := loadOASSchema()
+	assert.NoError(t, err)
+
+	t.Run("return default version when req version is empty", func(t *testing.T) {
+		_, err = GetOASSchema("")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, oasJSONSchemas["3.0"])
+	})
+
+	t.Run("return minor version schema when req version is including patch version", func(t *testing.T) {
+		_, err = GetOASSchema("3.0.8")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, oasJSONSchemas["3.0"])
+	})
+
+	t.Run("return minor version 0 when only major version is requested", func(t *testing.T) {
+		_, err = GetOASSchema("3")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, oasJSONSchemas["3.0"])
+	})
+
+	t.Run("return error when non existing oas schema is requested", func(t *testing.T) {
+		reqOASVersion := "4.0.3"
+		_, err = GetOASSchema(reqOASVersion)
+		expectedErr := fmt.Errorf(oasSchemaVersionNotFoundFmt, reqOASVersion)
+		assert.Equal(t, expectedErr, err)
+	})
+
+	t.Run("return error when requested version is not of semver", func(t *testing.T) {
+		reqOASVersion := "a.0.3"
+		_, err = GetOASSchema(reqOASVersion)
+		expectedErr := fmt.Errorf("malformed version: %s", reqOASVersion)
+		assert.Equal(t, expectedErr, err)
+	})
+
+	t.Run("return 3.1 schema when version 3.1 is requested", func(t *testing.T) {
+		schema, err := GetOASSchema("3.1")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, schema)
+
+		// Verify it's the 3.1 schema by checking it uses $defs
+		defsKey := GetDefinitionsKey(schema)
+		assert.Equal(t, "$defs", defsKey, "OAS 3.1 schema should use $defs")
+	})
+
+	t.Run("return 3.1 schema when version 3.1.0 is requested", func(t *testing.T) {
+		schema, err := GetOASSchema("3.1.0")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, schema)
+
+		// Verify it's the 3.1 schema
+		defsKey := GetDefinitionsKey(schema)
+		assert.Equal(t, "$defs", defsKey)
+	})
+}
+
+func TestUpstreamURL_KVReferences(t *testing.T) {
+	base := func(url string) []byte {
+		return []byte(`{
+			"openapi": "3.0.3",
+			"info": {"title": "t", "version": "1"},
+			"paths": {},
+			"x-tyk-api-gateway": {
+				"info": {"name": "t", "state": {"active": true}},
+				"server": {"listenPath": {"value": "/t"}},
+				"upstream": {"url": "` + url + `"}
+			}
+		}`)
+	}
+
+	t.Run("inline kv reference in host position", func(t *testing.T) {
+		err := ValidateOASObject(base(`http://$kv{random-consul:target_url_host}:8888`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("inline kv reference as the whole host", func(t *testing.T) {
+		err := ValidateOASObject(base(`http://$kv{consul:host}`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("inline kv reference in the path", func(t *testing.T) {
+		err := ValidateOASObject(base(`https://example.com/$kv{consul:path}`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("whole-value kv reference", func(t *testing.T) {
+		err := ValidateOASObject(base(`kv://consul/services/redis`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("whole-value kv reference with fragment", func(t *testing.T) {
+		err := ValidateOASObject(base(`kv://consul/services/redis#host`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("rejects malformed url around an inline kv token", func(t *testing.T) {
+		err := ValidateOASObject(base(`http://$kv{consul:host}:8888 broken`), "3.0.3")
+		require.Error(t, err)
+	})
+
+	t.Run("rejects a plain invalid url with no kv reference", func(t *testing.T) {
+		err := ValidateOASObject(base(`http://exa mple.com`), "3.0.3")
+		require.Error(t, err)
+	})
+
+	t.Run("accepts an ordinary url with no kv reference", func(t *testing.T) {
+		err := ValidateOASObject(base(`https://example.com/api`), "3.0.3")
+		assert.NoError(t, err)
+	})
+}
+
+func TestUpstreamURL_KVReferences_RejectsMalformed(t *testing.T) {
+	base := func(url string) []byte {
+		return []byte(`{
+			"openapi": "3.0.3",
+			"info": {"title": "t", "version": "1"},
+			"paths": {},
+			"x-tyk-api-gateway": {
+				"info": {"name": "t", "state": {"active": true}},
+				"server": {"listenPath": {"value": "/t"}},
+				"upstream": {"url": "` + url + `"}
+			}
+		}`)
+	}
+
+	tests := map[string]string{
+		"inline unclosed token in path (reviewer point 1)": `https://example.com/$kv{unclosed`,
+		"inline token missing store separator":             `https://example.com/$kv{missingcolon}`,
+		"inline token empty store":                         `https://$kv{:onlypath}/x`,
+		"inline token empty path":                          `https://$kv{store:}/x`,
+		"whole-value kv reference without path separator":  `kv://no-path-separator`,
+		"whole-value kv reference empty path":              `kv://vault/`,
+	}
+
+	for name, url := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateOASObject(base(url), "3.0.3")
+			require.Error(t, err, "malformed KV reference %q must be rejected by validation", url)
+		})
+	}
+}
+
+func TestValidateOASObject_KVSyntaxInNonURLField(t *testing.T) {
+	doc := func(headerValue string) []byte {
+		return []byte(`{
+			"openapi": "3.0.3",
+			"info": {"title": "t", "version": "1"},
+			"paths": {},
+			"x-tyk-api-gateway": {
+				"info": {"name": "t", "state": {"active": true}},
+				"server": {"listenPath": {"value": "/t"}},
+				"upstream": {"url": "http://upstream.url"},
+				"middleware": {
+					"operations": {
+						"getOp": {
+							"transformRequestHeaders": {
+								"enabled": true,
+								"add": [{"name": "X-KV", "value": "` + headerValue + `"}]
+							}
+						}
+					}
+				}
+			}
+		}`)
+	}
+
+	t.Run("accepts a well-formed kv reference in a header value", func(t *testing.T) {
+		err := ValidateOASObject(doc(`kv://vault/db/password`), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("rejects a malformed kv reference in a header value", func(t *testing.T) {
+		err := ValidateOASObject(doc(`kv://random-gcpdb-password`), "3.0.3")
+		require.Error(t, err)
+	})
+}
+
+func TestKVAwareFormatChecker(t *testing.T) {
+	c := kvAwareFormatChecker{base: gojsonschema.URIReferenceFormatChecker{}}
+
+	tests := []struct {
+		name  string
+		input any
+		valid bool
+	}{
+		{"inline token in host", "http://$kv{consul:host}:8888", true},
+		{"inline token as the whole host", "http://$kv{consul:host}", true},
+		{"inline token in path", "https://example.com/$kv{consul:path}", true},
+		{"inline token in query", "https://example.com/api?h=$kv{consul:host}", true},
+		{"inline token with #fragment", "http://$kv{consul:host#field}:8888", true},
+		{"multiple inline tokens", "https://example.com/$kv{a:b}/$kv{c:d}", true},
+
+		{"whole-value kv reference", "kv://consul/services/redis", true},
+		{"whole-value kv reference with fragment", "kv://consul/services/redis#host", true},
+
+		{"ordinary url without a kv reference", "https://example.com/api", true},
+		{"invalid url with a space", "http://exa mple.com", false},
+		{"backslash rejected even alongside a token", `http://$kv{a:b}\x`, false},
+		{"backslash rejected without a token", `http://a\b`, false},
+		{"non-string input", 123, false},
+
+		// Known limitation: a token standing in for the whole port becomes the
+		// non-numeric placeholder "kvref", which url.Parse rejects as a port.
+		{"token as the whole port is not supported", "http://host:$kv{consul:port}", false},
+
+		{"inline unclosed token in path", "https://example.com/$kv{unclosed", false},
+		{"inline token missing store separator", "https://example.com/$kv{missingcolon}", false},
+		{"inline token empty store", "https://$kv{:onlypath}/x", false},
+		{"inline token empty path", "https://$kv{store:}/x", false},
+		{"whole-value kv reference without path separator", "kv://no-path-separator", false},
+		{"whole-value kv reference empty path", "kv://vault/", false},
+		{"whole-value kv reference empty everything", "kv://", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.valid, c.IsFormat(tt.input))
+		})
+	}
+}
+
+func TestKVAwareFormatChecker_URIBase(t *testing.T) {
+	c := kvAwareFormatChecker{base: gojsonschema.URIFormatChecker{}}
+
+	tests := []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		// valid: a scheme is present (either the URL's own or kv://)
+		{"inline token in host with scheme", "http://$kv{consul:host}:8888", true},
+		{"inline token in path with scheme", "https://example.com/$kv{consul:path}", true},
+		{"ordinary absolute url", "https://example.com/api", true},
+		{"whole-value kv reference has kv scheme", "kv://consul/services/redis", true},
+		{"whole-value kv reference with fragment", "kv://consul/services/redis#host", true},
+
+		// invalid: no scheme (the uri-vs-uri-reference distinction)
+		{"bare inline token as whole value has no scheme", "$kv{consul:host}/path", false},
+		{"bare inline token only has no scheme", "$kv{consul:host}", false},
+		{"scheme-relative reference has no scheme", "example.com/api", false},
+
+		// invalid: malformed KV reference, rejected before the scheme check
+		{"inline unclosed token", "https://example.com/$kv{unclosed", false},
+		{"inline token missing store separator", "https://example.com/$kv{missingcolon}", false},
+		{"inline token empty path", "https://$kv{store:}/x", false},
+		{"whole-value kv reference without path separator", "kv://no-path-separator", false},
+		{"whole-value kv reference empty path", "kv://vault/", false},
+
+		// invalid: plain bad url, no KV involved
+		{"invalid url with a space", "http://exa mple.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.valid, c.IsFormat(tt.input))
+		})
+	}
+}
+
+// TestValidateOASObject_DNSDiscovery covers the rules about where an API's
+// target list comes from. They are checked in Go rather than by the schema,
+// which declares draft-04 and has no if/then.
+func TestValidateOASObject_DNSDiscovery(t *testing.T) {
+	t.Parallel()
+
+	build := func(upstream Upstream) []byte {
+		oasObject := OAS{
+			openapi3.T{
+				OpenAPI: "3.0.3",
+				Info:    &openapi3.Info{},
+				Paths:   openapi3.NewPaths(),
+			},
+		}
+		oasObject.SetTykExtension(&XTykAPIGateway{
+			Info:     Info{Name: "oas-api", State: State{Active: true}},
+			Server:   Server{ListenPath: ListenPath{Value: "/oas-api"}},
+			Upstream: upstream,
+		})
+
+		definition, err := oasObject.MarshalJSON()
+		require.NoError(t, err)
+		return definition
+	}
+
+	t.Run("DNS discovery supplies the targets load balancing would require", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:           "h2c://my-grpc-svc:9002",
+			LoadBalancing: &LoadBalancing{Enabled: true},
+			DNSDiscovery:  &DNSDiscovery{Enabled: true, RefreshInterval: ReadableDuration(10 * time.Second)},
+		}), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("DNS discovery needs load balancing to distribute what it supplies", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:          "h2c://my-grpc-svc:9002",
+			DNSDiscovery: &DNSDiscovery{Enabled: true},
+		}), "3.0.3")
+		assert.Error(t, err)
+	})
+
+	t.Run("two sources for one target list are refused", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:              "h2c://my-grpc-svc:9002",
+			LoadBalancing:    &LoadBalancing{Enabled: true},
+			DNSDiscovery:     &DNSDiscovery{Enabled: true},
+			ServiceDiscovery: &ServiceDiscovery{Enabled: true, QueryEndpoint: "http://consul:8500/v1/catalog/service/svc"},
+		}), "3.0.3")
+		assert.Error(t, err)
+	})
+
+	t.Run("refresh interval under the minimum names the OAS field", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:           "h2c://my-grpc-svc:9002",
+			LoadBalancing: &LoadBalancing{Enabled: true},
+			DNSDiscovery:  &DNSDiscovery{Enabled: true, RefreshInterval: ReadableDuration(time.Second)},
+		}), "3.0.3")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "upstream.dnsDiscovery.refreshInterval must be empty for the 30s default, or at least 5s")
+		assert.NotContains(t, err.Error(), "proxy.dns_discovery")
+	})
+
+	t.Run("refresh interval at the minimum is accepted", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:           "h2c://my-grpc-svc:9002",
+			LoadBalancing: &LoadBalancing{Enabled: true},
+			DNSDiscovery:  &DNSDiscovery{Enabled: true, RefreshInterval: ReadableDuration(5 * time.Second)},
+		}), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	t.Run("refresh interval under the minimum is ignored while disabled", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:          "h2c://my-grpc-svc:9002",
+			DNSDiscovery: &DNSDiscovery{Enabled: false, RefreshInterval: ReadableDuration(time.Second)},
+		}), "3.0.3")
+		assert.NoError(t, err)
+	})
+
+	malformed := map[string]string{
+		"refreshInterval":            `{"enabled": true, "refreshInterval": "invalid"}`,
+		"staleTTL":                   `{"enabled": true, "staleTTL": "-10s"}`,
+		"connectionDraining.timeout": `{"enabled": true, "connectionDraining": {"enabled": true, "timeout": "30sec"}}`,
+	}
+
+	for field, dnsDiscovery := range malformed {
+		t.Run("malformed "+field+" is refused by the schema", func(t *testing.T) {
+			t.Parallel()
+			definition := build(Upstream{
+				URL:           "h2c://my-grpc-svc:9002",
+				LoadBalancing: &LoadBalancing{Enabled: true},
+			})
+			definition, err := jsonparser.Set(definition, []byte(dnsDiscovery), ExtensionTykAPIGateway, "upstream", "dnsDiscovery")
+			require.NoError(t, err)
+
+			err = ValidateOASObject(definition, "3.0.3")
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "dnsDiscovery")
+			assert.ErrorContains(t, err, "Does not match pattern")
+		})
+	}
+
+	t.Run("service discovery on its own is untouched", func(t *testing.T) {
+		t.Parallel()
+		err := ValidateOASObject(build(Upstream{
+			URL:              "h2c://my-grpc-svc:9002",
+			LoadBalancing:    &LoadBalancing{Enabled: true, Targets: []LoadBalancingTarget{{URL: "h2c://a:9002", Weight: 1}}},
+			ServiceDiscovery: &ServiceDiscovery{Enabled: true, QueryEndpoint: "http://consul:8500/v1/catalog/service/svc"},
+		}), "3.0.3")
+		assert.NoError(t, err)
+	})
+}

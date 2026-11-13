@@ -1,74 +1,205 @@
 package log
 
 import (
-	"os"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
-	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 )
+
+const (
+	EnvTykLogformat   = "TYK_LOGFORMAT"
+	EnvTykGwLogformat = "TYK_GW_LOGFORMAT"
+	EnvTykLoglevel    = "TYK_LOGLEVEL"
+	EnvTykGwLoglevel  = "TYK_GW_LOGLEVEL"
+)
+
+const (
+	LegacyTimestampFormat = "Jan 02 15:04:05"
+)
+
+type Format string
+
+const (
+	FormatText   Format = "text"
+	FormatJson   Format = "json"
+	FormatLegacy Format = "legacy"
+)
+
+func (f *Format) Parse(str string) bool {
+	s := Format(strings.ToLower(str))
+
+	if s.Valid() {
+		*f = s
+		return true
+	}
+
+	return false
+}
+
+func (f *Format) Valid() bool {
+	switch *f {
+	case FormatText, FormatJson, FormatLegacy:
+		return true
+	}
+	return false
+}
 
 var (
-	log          = logrus.New()
-	rawLog       = logrus.New()
-	translations = make(map[string]string)
+	log               = New()
+	translations      = make(map[string]string)
+	formatterRegistry = map[Format]func() logrus.Formatter{
+		FormatText:   newFormatterText,
+		FormatJson:   newFormatterJson,
+		FormatLegacy: newFormatterLegacy,
+	}
 )
 
-// LoadTranslations takes a map[string]interface and flattens it to map[string]string
-// Because translations have been loaded - we internally override log the formatter
-// Nested entries are accessible using dot notation.
-// example:   `{"foo": {"bar": "baz"}}`
-// flattened: `foo.bar: baz`
-func LoadTranslations(thing map[string]interface{}) {
-	formatter := new(prefixed.TextFormatter)
-	formatter.TimestampFormat = `Jan 02 15:04:05`
-	formatter.FullTimestamp = true
-	log.Formatter = &TranslationFormatter{formatter}
-	translations, _ = Flatten(thing)
-}
-
-type TranslationFormatter struct {
-	*prefixed.TextFormatter
-}
-
-func (t *TranslationFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	if code, ok := entry.Data["code"]; ok {
-		if translation, ok := translations[code.(string)]; ok {
-			entry.Message = translation
-		}
-	}
-	return t.TextFormatter.Format(entry)
-}
-
-type RawFormatter struct{}
-
-func (f *RawFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	return []byte(entry.Message), nil
-}
-
-func init() {
-	formatter := new(prefixed.TextFormatter)
-	formatter.TimestampFormat = `Jan 02 15:04:05`
-	formatter.FullTimestamp = true
-
-	log.Formatter = formatter
-	rawLog.Formatter = new(RawFormatter)
-}
-
-func Get() *logrus.Logger {
-	switch strings.ToLower(os.Getenv("TYK_LOGLEVEL")) {
-	case "error":
-		log.Level = logrus.ErrorLevel
-	case "warn":
-		log.Level = logrus.WarnLevel
-	case "debug":
-		log.Level = logrus.DebugLevel
-	default:
-		log.Level = logrus.InfoLevel
-	}
+// Get returns the default configured logger.
+func Get() *Logger {
 	return log
 }
 
-func GetRaw() *logrus.Logger {
-	return rawLog
+// NewFormatter builds formatter
+func NewFormatter(format Format) logrus.Formatter {
+	switch format {
+	case FormatLegacy:
+		return newFormatterLegacy()
+	case FormatJson:
+		return newFormatterJson()
+	case FormatText:
+		return newFormatterText()
+	default:
+		return newFormatterText()
+	}
+}
+
+func MakeFormatter(format Format, opts json.RawMessage) (logrus.Formatter, error) {
+	formatterFactory, ok := formatterRegistry[format]
+	if !ok {
+		return nil, fmt.Errorf("unknown formatter %q", format)
+	}
+
+	formatter := formatterFactory()
+
+	if err := applySnakeCaseOptions(opts, formatter); err != nil {
+		return nil, fmt.Errorf("failed to apply options to %s formatter: %w", format, err)
+	}
+
+	return formatter, nil
+}
+
+func newFormatterText() logrus.Formatter {
+	return &logrus.TextFormatter{
+		FieldMap:        defaultFieldMap(),
+		TimestampFormat: time.RFC3339,
+		FullTimestamp:   true,
+		DisableColors:   true,
+	}
+}
+
+func newFormatterJson() logrus.Formatter {
+	return &JSONFormatter{
+		FieldMap:        NewFieldMap(defaultFieldMap()),
+		TimestampFormat: time.RFC3339,
+	}
+}
+
+func newFormatterLogrusJson() logrus.Formatter {
+	return &logrus.JSONFormatter{
+		FieldMap:        defaultFieldMap(),
+		TimestampFormat: time.RFC3339,
+	}
+}
+
+func newFormatterLegacy() logrus.Formatter {
+	return &logrus.TextFormatter{
+		FieldMap:        logrus.FieldMap{},
+		TimestampFormat: LegacyTimestampFormat,
+		FullTimestamp:   true,
+		DisableColors:   true,
+	}
+}
+
+func defaultFieldMap() logrus.FieldMap {
+	return logrus.FieldMap{
+		logrus.FieldKeyMsg: "message",
+	}
+}
+
+// applySnakeCaseOptions maps snake_case JSON keys onto the target's CamelCase fields.
+// Keys that match no field are reported as given.
+func applySnakeCaseOptions(data json.RawMessage, target any) error {
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		return err
+	}
+
+	known := optionFieldNames(target)
+	normalizedMap := make(map[string]json.RawMessage, len(rawMap))
+	var unknown []string
+
+	for key, val := range rawMap {
+		normalizedKey := normalizeOptionKey(key)
+		if _, ok := known[normalizedKey]; !ok {
+			unknown = append(unknown, strconv.Quote(key))
+			continue
+		}
+		normalizedMap[normalizedKey] = val
+	}
+
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("unknown option(s): %s", strings.Join(unknown, ", "))
+	}
+
+	transformedData, err := json.Marshal(normalizedMap)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(transformedData, target)
+}
+
+func normalizeOptionKey(key string) string {
+	return strings.ToLower(strings.ReplaceAll(key, "_", ""))
+}
+
+// optionFieldNames lists the target struct's settable fields, normalized like the option keys.
+func optionFieldNames(target any) map[string]struct{} {
+	names := make(map[string]struct{})
+
+	t := reflect.TypeOf(target)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return names
+	}
+
+	for field := range t.Fields() {
+		if !field.IsExported() {
+			continue
+		}
+
+		name := field.Name
+		if tag, _, _ := strings.Cut(field.Tag.Get("json"), ","); tag == "-" {
+			continue
+		} else if tag != "" {
+			name = tag
+		}
+
+		names[normalizeOptionKey(name)] = struct{}{}
+	}
+
+	return names
 }

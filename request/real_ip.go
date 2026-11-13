@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/TykTechnologies/tyk/headers"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/header"
 )
+
+var Global func() config.Config
 
 // RealIP takes a request object, and returns the real Client IP address.
 func RealIP(r *http.Request) string {
@@ -15,18 +18,44 @@ func RealIP(r *http.Request) string {
 		return contextIp.(string)
 	}
 
-	if realIP := r.Header.Get(headers.XRealIP); realIP != "" {
-		return realIP
+	if realIPVal := r.Header.Get(header.XRealIP); realIPVal != "" {
+		if realIP := net.ParseIP(realIPVal); realIP != nil {
+			return realIP.String()
+		}
 	}
 
-	if fw := r.Header.Get(headers.XForwardFor); fw != "" {
-		// X-Forwarded-For has no port
-		if i := strings.IndexByte(fw, ','); i >= 0 {
+	if fw := r.Header.Get(header.XForwardFor); fw != "" {
+		xffs := strings.Split(fw, ",")
 
-			return fw[:i]
+		// Get depth from config, default to 0 (first IP in chain)
+		var depth int
+		if Global != nil {
+			depth = Global().HttpServerOptions.XFFDepth
 		}
 
-		return fw
+		// The following check for invalid depth configs.
+		// It's more secure to return empty if depth is invalid.
+		// Defaulting to an IP from the request would be
+		// burying a configuration failure.
+		if depth < 0 || depth > len(xffs) {
+			return ""
+		}
+
+		// Choose the appropriate IP based on depth
+		// depth=0 means first IP (leftmost), depth=1 means last IP, depth=2 means second to last, etc.
+		// Negative depth is invalid and treated same as 0/unset.
+		var ip string
+		if depth == 0 {
+			ip = strings.TrimSpace(xffs[0])
+		} else {
+			ip = strings.TrimSpace(xffs[len(xffs)-depth])
+		}
+
+		// Validate that the IP is properly formatted before returning it
+		if parsedIP := net.ParseIP(ip); parsedIP != nil {
+			return parsedIP.String()
+		}
+		// If IP is invalid, fall through to use RemoteAddr
 	}
 
 	// From net/http.Request.RemoteAddr:

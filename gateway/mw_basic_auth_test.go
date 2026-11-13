@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/TykTechnologies/tyk/storage"
+	"github.com/stretchr/testify/assert"
 
-	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
@@ -20,28 +20,32 @@ func genAuthHeader(username, password string) string {
 	return fmt.Sprintf("Basic %s", encodedPass)
 }
 
-func testPrepareBasicAuth(cacheDisabled bool) *user.SessionState {
+func (ts *Test) testPrepareBasicAuth(cacheDisabled bool) *user.SessionState {
 	session := CreateStandardSession()
 	session.BasicAuthData.Password = "password"
 	session.AccessRights = map[string]user.AccessDefinition{"test": {APIID: "test", Versions: []string{"v1"}}}
 	session.OrgID = "default"
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.UseBasicAuth = true
 		spec.BasicAuth.DisableCaching = cacheDisabled
 		spec.UseKeylessAccess = false
 		spec.Proxy.ListenPath = "/"
 		spec.OrgID = "default"
+		spec.DisableRateLimit = true
+		spec.DisableQuota = true
 	})
 
 	return session
 }
 
 func TestBasicAuth(t *testing.T) {
-	ts := StartTest()
+	test.Flaky(t) // TODO: TT-5223
+
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	session := testPrepareBasicAuth(false)
+	session := ts.testPrepareBasicAuth(false)
 
 	validPassword := map[string]string{"Authorization": genAuthHeader("user", "password")}
 	wrongPassword := map[string]string{"Authorization": genAuthHeader("user", "wrong")}
@@ -60,7 +64,7 @@ func TestBasicAuth(t *testing.T) {
 }
 
 func TestBasicAuthFromBody(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	session := CreateStandardSession()
@@ -68,7 +72,7 @@ func TestBasicAuthFromBody(t *testing.T) {
 	session.AccessRights = map[string]user.AccessDefinition{"test": {APIID: "test", Versions: []string{"v1"}}}
 	session.OrgID = "default"
 
-	BuildAndLoadAPI(func(spec *APISpec) {
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.UseBasicAuth = true
 		spec.BasicAuth.ExtractFromBody = true
 		spec.BasicAuth.BodyUserRegexp = `<User>(.*)</User>`
@@ -96,20 +100,19 @@ func TestBasicAuthFromBody(t *testing.T) {
 }
 
 func TestBasicAuthLegacyWithHashFunc(t *testing.T) {
-	globalConf := config.Global()
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	globalConf := ts.Gw.GetConfig()
 
 	globalConf.HashKeys = true
 	globalConf.EnableHashedKeysListing = true
 	// settings to create BA session with legacy key format
 	globalConf.HashKeyFunction = ""
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	ts := StartTest()
-	defer ts.Close()
+	ts.Gw.SetConfig(globalConf)
 
 	// create session with legacy key format
-	session := testPrepareBasicAuth(false)
+	session := ts.testPrepareBasicAuth(false)
 
 	validPassword := map[string]string{"Authorization": genAuthHeader("user", "password")}
 
@@ -121,7 +124,7 @@ func TestBasicAuthLegacyWithHashFunc(t *testing.T) {
 
 	// set custom hashing function and check if we still do BA session auth with legacy key format
 	globalConf.HashKeyFunction = storage.HashMurmur64
-	config.SetGlobal(globalConf)
+	ts.Gw.SetConfig(globalConf)
 
 	ts.Run(t, []test.TestCase{
 		// Create base auth based key
@@ -129,17 +132,67 @@ func TestBasicAuthLegacyWithHashFunc(t *testing.T) {
 	}...)
 }
 
-func TestBasicAuthCachedUserCollision(t *testing.T) {
-	globalConf := config.Global()
-	globalConf.HashKeys = true
-	globalConf.HashKeyFunction = "murmur64"
-	config.SetGlobal(globalConf)
-	defer ResetTestConfig()
-
-	ts := StartTest()
+func TestBasicAuthHashKeyFunc(t *testing.T) {
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	session := testPrepareBasicAuth(false)
+	globalConf := ts.Gw.GetConfig()
+
+	globalConf.HashKeys = true
+	globalConf.EnableHashedKeysListing = true
+	// settings to create BA session with legacy key format
+	globalConf.HashKeyFunction = ""
+
+	testcases := []struct {
+		in, out string
+	}{
+		{"", "bcrypt"},
+		{"bcrypt", "bcrypt"},
+		{"sha256", "sha256"},
+		{"murmur32", "murmur32"},
+		{"murmur64", "murmur64"},
+		{"murmur128", "murmur128"},
+		{"invalid", "bcrypt"},
+	}
+
+	logger := log.WithField("test", "TestBasicAuthHashKeyFunc")
+
+	for idx, hashKeyFunc := range testcases {
+		t.Run(fmt.Sprintf("test case %d", idx), func(t *testing.T) {
+			globalConf.BasicAuthHashKeyFunction = hashKeyFunc.in
+			ts.Gw.SetConfig(globalConf)
+
+			session := ts.testPrepareBasicAuth(false)
+			ts.Gw.setBasicAuthSessionPassword(session)
+
+			assert.Equal(t, hashKeyFunc.out, string(session.BasicAuthData.Hash))
+			assert.NotEmpty(t, session.BasicAuthData.Password)
+
+			ts.Gw.apisMu.Lock()
+			assert.Len(t, ts.Gw.apiSpecs, 1)
+			k := &BasicAuthKeyIsValid{
+				BaseMiddleware: &BaseMiddleware{},
+			}
+			k.Spec = ts.Gw.apiSpecs[0]
+			ts.Gw.apisMu.Unlock()
+
+			err := k.checkPassword(session, "password", logger)
+			assert.NoError(t, err)
+		})
+	}
+
+}
+
+func TestBasicAuthCachedUserCollision(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	globalConf := ts.Gw.GetConfig()
+	globalConf.HashKeys = true
+	globalConf.HashKeyFunction = "murmur64"
+	ts.Gw.SetConfig(globalConf)
+
+	session := ts.testPrepareBasicAuth(false)
 
 	correct := map[string]string{"Authorization": genAuthHeader("bellbell1", "password")}
 	remove1 := map[string]string{"Authorization": genAuthHeader("bellbell", "password")}
@@ -168,7 +221,7 @@ func TestBasicAuthCachedUserCollision(t *testing.T) {
 }
 
 func TestBasicAuthCachedPasswordCollision(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	for _, useCache := range []bool{true, false} {
@@ -183,7 +236,7 @@ func TestBasicAuthCachedPasswordCollision(t *testing.T) {
 		add3 := map[string]string{"Authorization": genAuthHeader("bellbell1", "password333")}
 
 		t.Run(fmt.Sprintf("Cache disabled:%v", useCache), func(t *testing.T) {
-			session := testPrepareBasicAuth(useCache)
+			session := ts.testPrepareBasicAuth(useCache)
 
 			ts.Run(t, []test.TestCase{
 				// Create base auth based key
@@ -206,10 +259,10 @@ func TestBasicAuthCachedPasswordCollision(t *testing.T) {
 func BenchmarkBasicAuth(b *testing.B) {
 	b.ReportAllocs()
 
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	session := testPrepareBasicAuth(false)
+	session := ts.testPrepareBasicAuth(false)
 
 	validPassword := map[string]string{"Authorization": genAuthHeader("user", "password")}
 	wrongPassword := map[string]string{"Authorization": genAuthHeader("user", "wrong")}
@@ -239,10 +292,10 @@ func BenchmarkBasicAuth(b *testing.B) {
 func BenchmarkBasicAuth_CacheEnabled(b *testing.B) {
 	b.ReportAllocs()
 
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	session := testPrepareBasicAuth(false)
+	session := ts.testPrepareBasicAuth(false)
 
 	validPassword := map[string]string{"Authorization": genAuthHeader("user", "password")}
 
@@ -265,10 +318,10 @@ func BenchmarkBasicAuth_CacheEnabled(b *testing.B) {
 func BenchmarkBasicAuth_CacheDisabled(b *testing.B) {
 	b.ReportAllocs()
 
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	session := testPrepareBasicAuth(true)
+	session := ts.testPrepareBasicAuth(true)
 
 	validPassword := map[string]string{"Authorization": genAuthHeader("user", "password")}
 

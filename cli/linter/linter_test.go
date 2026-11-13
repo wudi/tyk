@@ -1,3 +1,6 @@
+//go:build !dev
+// +build !dev
+
 package linter
 
 import (
@@ -49,6 +52,20 @@ var tests = []struct {
 	},
 	{"Empty", `{}`, nil},
 	{"Default", onDefaults(`{}`), nil},
+	{
+		"TrustedProxyCIDRs", `{"http_server_options":{"trusted_proxy_cidrs":["10.0.0.0/8","2001:db8::/32"]}}`, nil,
+	},
+	{
+		"NullTrustedProxyCIDRs", `{"http_server_options":{"trusted_proxy_cidrs":null}}`, nil,
+	},
+	{
+		"WrongTrustedProxyCIDRsType", `{"http_server_options":{"trusted_proxy_cidrs":"10.0.0.0/8"}}`,
+		"cannot unmarshal string into Go struct field HttpServerOptionsConfig.http_server_options.trusted_proxy_cidrs of type []string",
+	},
+	{
+		"WrongTrustedProxyCIDRItemType", `{"http_server_options":{"trusted_proxy_cidrs":[42]}}`,
+		"cannot unmarshal number into Go struct field HttpServerOptionsConfig.http_server_options.trusted_proxy_cidrs of type string",
+	},
 	{"OldMonitor", `{"Monitor": {}}`, nil},
 	{"NullObject", `{"event_handlers": null}`, nil},
 	{
@@ -76,8 +93,21 @@ var tests = []struct {
 		`policies.policy_source: policies.policy_source must be one of the following: "", "service", "rpc"`,
 	},
 	{
+		"KVFileBasePath", `{"kv": {"file": {"base_path": "/etc/tyk/secrets"}}}`, nil,
+	},
+	{
+		"KVStores",
+		`{"kv": {"stores": {"vault": {"type": "hashicorp_vault", "required": false, "config": {"address": "https://vault.internal:8200", "token": "kv://env/VAULT_TOKEN", "kv_version": 2}}}}}`,
+		nil,
+	},
+	{
+		"KVStoreFieldTypo",
+		`{"kv": {"stores": {"x": {"typ": "env"}}}}`,
+		`Additional property typ is not allowed`,
+	},
+	{
 		"MalformedDnsCacheEntry", `{"dns_cache": { "enabled": true, "tttl": 10} }`,
-		`tttl: Additional property tttl is not allowed`,
+		`dns_cache: Additional property tttl is not allowed`,
 	},
 	{
 		"BadDnsCacheTTL", `{"dns_cache": { "enabled": false, "ttl": -2 } }`,
@@ -85,11 +115,19 @@ var tests = []struct {
 	},
 	{
 		"ExtraDnsCacheCheckInterval", `{"dns_cache": { "enabled": true, "ttl": -1, "check_interval": 2500 } }`,
-		`check_interval: Additional property check_interval is not allowed`,
+		`dns_cache: Additional property check_interval is not allowed`,
 	},
 	{
 		"InvalidDnsCacheMultipleIPsHandleStrategy", `{"dns_cache": { "enabled": true, "ttl": 1, "multiple_ips_handle_strategy": "true" } }`,
 		`dns_cache.multiple_ips_handle_strategy: dns_cache.multiple_ips_handle_strategy must be one of the following: "pick_first", "random", "no_cache"`,
+	},
+	{
+		"InvalidErrorOverridesResponseStatusCode", `{"error_overrides": {"400": [{"response": {"status_code": "not-an-int"}}]}}`,
+		"cannot unmarshal string into Go struct field ErrorResponse.error_overrides.response.status_code of type int",
+	},
+	{
+		"InvalidErrorOverridesMissingRequired", `{"error_overrides": {"400": [{}]}}`,
+		"error_overrides.400.0: response is required",
 	},
 }
 

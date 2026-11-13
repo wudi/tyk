@@ -1,62 +1,58 @@
 package storage
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
-	"fmt"
-	"hash"
-	"strings"
 
-	"github.com/buger/jsonparser"
-	uuid "github.com/satori/go.uuid"
-
-	"github.com/TykTechnologies/murmur3"
-	"github.com/TykTechnologies/tyk/config"
 	logger "github.com/TykTechnologies/tyk/log"
 )
+
+//go:generate mockgen -destination=./mock/storage.go -package mock . Handler
 
 var log = logger.Get()
 
 // ErrKeyNotFound is a standard error for when a key is not found in the storage engine
 var ErrKeyNotFound = errors.New("key not found")
 
+var ErrMDCBConnectionLost = errors.New("mdcb connection is lost")
+
 // Handler is a standard interface to a storage backend, used by
 // AuthorisationManager to read and write key values to the backend
 type Handler interface {
-	GetKey(string) (string, error) // Returned string is expected to be a JSON object (user.SessionState)
-	GetMultiKey([]string) ([]string, error)
-	GetRawKey(string) (string, error)
-	SetKey(string, string, int64) error // Second input string is expected to be a JSON object (user.SessionState)
-	SetRawKey(string, string, int64) error
-	SetExp(string, int64) error   // Set key expiration
-	GetExp(string) (int64, error) // Returns expiry of a key
-	GetKeys(string) []string
-	DeleteKey(string) bool
-	DeleteAllKeys() bool
-	DeleteRawKey(string) bool
-	Connect() bool
-	GetKeysAndValues() map[string]string
-	GetKeysAndValuesWithFilter(string) map[string]string
-	DeleteKeys([]string) bool
-	Decrement(string)
-	IncrememntWithExpire(string, int64) int64
-	SetRollingWindow(key string, per int64, val string, pipeline bool) (int, []interface{})
-	GetRollingWindow(key string, per int64, pipeline bool) (int, []interface{})
-	GetSet(string) (map[string]string, error)
-	AddToSet(string, string)
-	GetAndDeleteSet(string) []interface{}
-	RemoveFromSet(string, string)
-	DeleteScanMatch(string) bool
-	GetKeyPrefix() string
-	AddToSortedSet(string, string, float64)
-	GetSortedSetRange(string, string, string) ([]string, []float64, error)
-	RemoveSortedSetRange(string, string, string) error
-	GetListRange(string, int64, int64) ([]string, error)
-	RemoveFromList(string, string) error
-	AppendToSet(string, string)
-	Exists(string) (bool, error)
+	GetKeyHandler
+	GetMultiKeyHandler
+	GetRawKeyHandler
+	SetKeyHandler
+	SetRawKeyHandler
+	SetExpHandler
+	GetExpHandler
+	GetKeysHandler
+	DeleteKeyHandler
+	DeleteAllKeysHandler
+	DeleteRawKeyHandler
+	DeleteRawKeysHandler
+	ConnectHandler
+	GetKeysAndValuesHandler
+	GetKeysAndValuesWithFilterHandler
+	DeleteKeysHandler
+	DecrementHandler
+	IncrememntWithExpireHandler
+	SetRollingWindowHandler
+	GetRollingWindowHandler
+	GetSetHandler
+	AddToSetHandler
+	GetAndDeleteSetHandler
+	RemoveFromSetHandler
+	DeleteScanMatchHandler
+	GetKeyPrefixHandler
+	AddToSortedSetHandler
+	GetSortedSetRangeHandler
+	RemoveSortedSetRangeHandler
+	GetListRangeHandler
+	RemoveFromListHandler
+	AppendToSetHandler
+	ExistsHandler
+	SetKeyExHandler
+	SetRawKeyExHandler
 }
 
 type AnalyticsHandler interface {
@@ -67,93 +63,144 @@ type AnalyticsHandler interface {
 	GetExp(string) (int64, error) // Returns expiry of a key
 }
 
-const defaultHashAlgorithm = "murmur64"
-
-// If hashing algorithm is empty, use legacy key generation
-func GenerateToken(orgID, keyID, hashAlgorithm string) (string, error) {
-	if keyID == "" {
-		keyID = strings.Replace(uuid.NewV4().String(), "-", "", -1)
-	}
-
-	if hashAlgorithm != "" {
-		_, err := hashFunction(hashAlgorithm)
-		if err != nil {
-			hashAlgorithm = defaultHashAlgorithm
-		}
-
-		jsonToken := fmt.Sprintf(`{"org":"%s","id":"%s","h":"%s"}`, orgID, keyID, hashAlgorithm)
-		return base64.StdEncoding.EncodeToString([]byte(jsonToken)), err
-	}
-
-	// Legacy keys
-	return orgID + keyID, nil
+type GetKeyHandler interface {
+	GetKey(string) (string, error) // Returned string is expected to be a JSON object (user.SessionState)
 }
 
-// `{"` in base64
-const B64JSONPrefix = "ey"
-
-func TokenHashAlgo(token string) string {
-	// Legacy tokens not b64 and not JSON records
-	if strings.HasPrefix(token, B64JSONPrefix) {
-		if jsonToken, err := base64.StdEncoding.DecodeString(token); err == nil {
-			hashAlgo, _ := jsonparser.GetString(jsonToken, "h")
-			return hashAlgo
-		}
-	}
-
-	return ""
+type GetMultiKeyHandler interface {
+	GetMultiKey([]string) ([]string, error)
 }
 
-func TokenOrg(token string) string {
-	if strings.HasPrefix(token, B64JSONPrefix) {
-		if jsonToken, err := base64.StdEncoding.DecodeString(token); err == nil {
-			// Checking error in case if it is a legacy tooken which just by accided has the same b64JSON prefix
-			if org, err := jsonparser.GetString(jsonToken, "org"); err == nil {
-				return org
-			}
-		}
-	}
-
-	// 24 is mongo bson id length
-	if len(token) > 24 {
-		return token[:24]
-	}
-
-	return ""
+type GetRawKeyHandler interface {
+	GetRawKey(string) (string, error)
 }
 
-var (
-	HashSha256    = "sha256"
-	HashMurmur32  = "murmur32"
-	HashMurmur64  = "murmur64"
-	HashMurmur128 = "murmur128"
-)
-
-func hashFunction(algorithm string) (hash.Hash, error) {
-	switch algorithm {
-	case HashSha256:
-		return sha256.New(), nil
-	case HashMurmur64:
-		return murmur3.New64(), nil
-	case HashMurmur128:
-		return murmur3.New128(), nil
-	case "", HashMurmur32:
-		return murmur3.New32(), nil
-	default:
-		return murmur3.New32(), fmt.Errorf("Unknown key hash function: %s. Falling back to murmur32.", algorithm)
-	}
+type SetKeyHandler interface {
+	SetKey(string, string, int64) error // Second input string is expected to be a JSON object (user.SessionState)
 }
 
-func HashStr(in string) string {
-	h, _ := hashFunction(TokenHashAlgo(in))
-	h.Write([]byte(in))
-	return hex.EncodeToString(h.Sum(nil))
+type SetRawKeyHandler interface {
+	SetRawKey(string, string, int64) error
 }
 
-func HashKey(in string) string {
-	if !config.Global().HashKeys {
-		// Not hashing? Return the raw key
-		return in
-	}
-	return HashStr(in)
+type SetExpHandler interface {
+	SetExp(string, int64) error // Set key expiration
+}
+
+type GetExpHandler interface {
+	GetExp(string) (int64, error) // Returns expiry of a key
+}
+
+type GetKeysHandler interface {
+	GetKeys(string) []string
+}
+
+type DeleteKeyHandler interface {
+	DeleteKey(string) bool
+}
+
+type DeleteAllKeysHandler interface {
+	DeleteAllKeys() bool
+}
+
+type DeleteRawKeyHandler interface {
+	DeleteRawKey(string) bool
+}
+
+type DeleteRawKeysHandler interface {
+	DeleteRawKeys([]string) bool
+}
+
+type ConnectHandler interface {
+	Connect() bool
+}
+
+type GetKeysAndValuesHandler interface {
+	GetKeysAndValues() map[string]string
+}
+
+type GetKeysAndValuesWithFilterHandler interface {
+	GetKeysAndValuesWithFilter(string) map[string]string
+}
+
+type DeleteKeysHandler interface {
+	DeleteKeys([]string) bool
+}
+
+type DecrementHandler interface {
+	Decrement(string)
+}
+
+type IncrememntWithExpireHandler interface {
+	IncrememntWithExpire(string, int64) int64
+}
+
+type SetRollingWindowHandler interface {
+	SetRollingWindow(key string, per int64, val string, pipeline bool) (int, []interface{})
+}
+
+type GetRollingWindowHandler interface {
+	GetRollingWindow(key string, per int64, pipeline bool) (int, []interface{})
+}
+
+type GetSetHandler interface {
+	GetSet(string) (map[string]string, error)
+}
+
+type AddToSetHandler interface {
+	AddToSet(string, string)
+}
+
+type GetAndDeleteSetHandler interface {
+	GetAndDeleteSet(string) []interface{}
+}
+
+type RemoveFromSetHandler interface {
+	RemoveFromSet(string, string)
+}
+
+type DeleteScanMatchHandler interface {
+	DeleteScanMatch(string) bool
+}
+
+type GetKeyPrefixHandler interface {
+	GetKeyPrefix() string
+}
+
+type AddToSortedSetHandler interface {
+	AddToSortedSet(string, string, float64)
+}
+
+type GetSortedSetRangeHandler interface {
+	GetSortedSetRange(string, string, string) ([]string, []float64, error)
+}
+
+type RemoveSortedSetRangeHandler interface {
+	RemoveSortedSetRange(string, string, string) error
+}
+
+type GetListRangeHandler interface {
+	GetListRange(string, int64, int64) ([]string, error)
+}
+
+type RemoveFromListHandler interface {
+	RemoveFromList(string, string) error
+}
+
+type AppendToSetHandler interface {
+	AppendToSet(string, string)
+}
+
+type ExistsHandler interface {
+	Exists(string) (bool, error)
+}
+
+type SetKeyExHandler interface {
+	// SetKeyEx sets key if key already exists.
+	SetKeyEx(string, string, int64) error
+}
+
+type SetRawKeyExHandler interface {
+	// SetRawKeyEx sets raw key if key already exists.
+	SetRawKeyEx(string, string, int64) error
 }

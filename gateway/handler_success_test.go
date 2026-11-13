@@ -1,0 +1,647 @@
+package gateway
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/TykTechnologies/graphql-go-tools/pkg/engine/datasource/httpclient"
+	"github.com/TykTechnologies/graphql-go-tools/pkg/graphql"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
+	ctxpkg "github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/mcp"
+	"github.com/TykTechnologies/tyk/test"
+)
+
+type bindContextFunc = func(context.Context) context.Context
+type bindAPIDefFunc = func(*APISpec)
+
+func testRequestWithContext(binding bindContextFunc) *http.Request {
+	req, _ := http.NewRequest("GET", "/", nil)
+	ctx := req.Context()
+	if binding != nil {
+		ctx = binding(ctx)
+	}
+	return req.WithContext(ctx)
+}
+
+func testAPISpec(binding bindAPIDefFunc) *APISpec {
+	spec := &APISpec{
+		APIDefinition: &apidef.APIDefinition{},
+		GlobalConfig:  config.Config{},
+	}
+	if binding != nil {
+		binding(spec)
+	}
+	return spec
+}
+
+func TestAnalyticRecord_GraphStats(t *testing.T) {
+
+	generateApiDefinition := func(spec *APISpec) {
+		spec.Name = "graphql API"
+		spec.APIID = "graphql-api"
+		spec.Proxy.TargetURL = testGraphQLProxyUpstream
+		spec.Proxy.ListenPath = "/"
+		spec.GraphQL = apidef.GraphQLConfig{
+			Enabled:       true,
+			ExecutionMode: apidef.GraphQLExecutionModeProxyOnly,
+			Version:       apidef.GraphQLConfigVersion2,
+			Schema:        gqlProxyUpstreamSchema,
+		}
+	}
+
+	testCases := []struct {
+		name      string
+		code      int
+		request   graphql.Request
+		checkFunc func(*testing.T, *analytics.AnalyticsRecord)
+		reloadAPI func(*APISpec)
+		headers   map[string]string
+	}{
+		{
+			name: "successfully generate stats",
+			code: http.StatusOK,
+			request: graphql.Request{
+				Query: `{ hello(name: "World") httpMethod }`,
+			},
+			checkFunc: func(t *testing.T, record *analytics.AnalyticsRecord) {
+				t.Helper()
+				assert.True(t, record.GraphQLStats.IsGraphQL)
+				assert.False(t, record.GraphQLStats.HasErrors)
+				assert.ElementsMatch(t, []string{"hello", "httpMethod"}, record.GraphQLStats.RootFields)
+				assert.Equal(t, map[string][]string{}, record.GraphQLStats.Types)
+				assert.Equal(t, analytics.OperationQuery, record.GraphQLStats.OperationType)
+			},
+		},
+		{
+			name: "should have variables",
+			code: http.StatusOK,
+			request: graphql.Request{
+				Query:     `{ hello(name: "World") httpMethod }`,
+				Variables: []byte(`{"in":"hello"}`),
+			},
+			checkFunc: func(t *testing.T, record *analytics.AnalyticsRecord) {
+				t.Helper()
+				assert.True(t, record.GraphQLStats.IsGraphQL)
+				assert.False(t, record.GraphQLStats.HasErrors)
+				assert.ElementsMatch(t, []string{"httpMethod", "hello"}, record.GraphQLStats.RootFields)
+				assert.Equal(t, map[string][]string{}, record.GraphQLStats.Types)
+				assert.Equal(t, analytics.OperationQuery, record.GraphQLStats.OperationType)
+				assert.Equal(t, `{"in":"hello"}`, record.GraphQLStats.Variables)
+			},
+		},
+		{
+			name: "should read response and error response request with detailed recording",
+			code: http.StatusInternalServerError,
+			request: graphql.Request{
+				Query:     `{ hello(name: "World") httpMethod }`,
+				Variables: []byte(`{"in":"hello"}`),
+			},
+			reloadAPI: func(spec *APISpec) {
+				spec.Proxy.TargetURL = testGraphQLProxyUpstreamError
+				spec.EnableDetailedRecording = true
+			},
+			checkFunc: func(t *testing.T, record *analytics.AnalyticsRecord) {
+				t.Helper()
+				assert.True(t, record.GraphQLStats.IsGraphQL)
+				assert.True(t, record.GraphQLStats.HasErrors)
+				assert.ElementsMatch(t, []string{"hello", "httpMethod"}, record.GraphQLStats.RootFields)
+				assert.Equal(t, map[string][]string{}, record.GraphQLStats.Types)
+				assert.Equal(t, analytics.OperationQuery, record.GraphQLStats.OperationType)
+				assert.Equal(t, `{"in":"hello"}`, record.GraphQLStats.Variables)
+				assert.Equal(t, []analytics.GraphError{
+					{Message: "unable to resolve"},
+				}, record.GraphQLStats.Errors)
+			},
+		},
+		{
+			name: "should read response request without detailed recording",
+			code: http.StatusInternalServerError,
+			request: graphql.Request{
+				Query:     `{ hello(name: "World") httpMethod }`,
+				Variables: []byte(`{"in":"hello"}`),
+			},
+			reloadAPI: func(spec *APISpec) {
+				spec.Proxy.TargetURL = testGraphQLProxyUpstreamError
+			},
+			checkFunc: func(t *testing.T, record *analytics.AnalyticsRecord) {
+				t.Helper()
+				assert.True(t, record.GraphQLStats.IsGraphQL)
+				assert.True(t, record.GraphQLStats.HasErrors)
+				assert.ElementsMatch(t, []string{"hello", "httpMethod"}, record.GraphQLStats.RootFields)
+				assert.Equal(t, map[string][]string{}, record.GraphQLStats.Types)
+				assert.Equal(t, analytics.OperationQuery, record.GraphQLStats.OperationType)
+				assert.Equal(t, `{"in":"hello"}`, record.GraphQLStats.Variables)
+				assert.Equal(t, []analytics.GraphError{
+					{Message: "unable to resolve"},
+				}, record.GraphQLStats.Errors)
+			},
+		},
+		{
+			name: "successfully generate stats for compressed request body",
+			code: http.StatusOK,
+			request: graphql.Request{
+				Query: `{ hello(name: "World") httpMethod }`,
+			},
+			headers: map[string]string{
+				httpclient.AcceptEncodingHeader: "gzip",
+			},
+			checkFunc: func(t *testing.T, record *analytics.AnalyticsRecord) {
+				t.Helper()
+				assert.True(t, record.GraphQLStats.IsGraphQL)
+				assert.False(t, record.GraphQLStats.HasErrors)
+				assert.ElementsMatch(t, []string{"hello", "httpMethod"}, record.GraphQLStats.RootFields)
+				assert.Equal(t, map[string][]string{}, record.GraphQLStats.Types)
+				assert.Equal(t, analytics.OperationQuery, record.GraphQLStats.OperationType)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := BuildAPI(generateApiDefinition)[0]
+			if tc.reloadAPI != nil {
+				tc.reloadAPI(spec)
+			}
+
+			ts := StartTest(nil)
+			defer ts.Close()
+			ts.Gw.LoadAPI(spec)
+			ts.Gw.Analytics.mockEnabled = true
+			ts.Gw.Analytics.mockRecordHit = func(record *analytics.AnalyticsRecord) {
+				tc.checkFunc(t, record)
+			}
+			var headers = map[string]string{
+				httpclient.AcceptEncodingHeader: "",
+			}
+			if tc.headers != nil {
+				headers = tc.headers
+			}
+			_, err := ts.Run(t, test.TestCase{
+				Data:    tc.request,
+				Method:  http.MethodPost,
+				Code:    tc.code,
+				Headers: headers,
+			})
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestAnalyticsIgnoreSubgraph(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	accountsSubgraph := BuildAPI(func(spec *APISpec) {
+		spec.Name = "subgraph-accounts"
+		spec.APIID = "subgraph-accounts"
+		spec.Proxy.TargetURL = testSubgraphAccounts
+		spec.Proxy.ListenPath = "/subgraph-accounts"
+		spec.GraphQL = apidef.GraphQLConfig{
+			Enabled: true,
+
+			ExecutionMode: apidef.GraphQLExecutionModeSubgraph,
+			Version:       apidef.GraphQLConfigVersion2,
+			Schema:        gqlSubgraphSchemaAccounts,
+			Subgraph: apidef.GraphQLSubgraphConfig{
+				SDL: gqlSubgraphSDLAccounts,
+			},
+		}
+	})[0]
+
+	superGraph := BuildAPI(func(spec *APISpec) {
+		spec.Name = "supergraph"
+		spec.APIID = "supergraph"
+		spec.Proxy.ListenPath = "/supergraph"
+		spec.EnableDetailedRecording = true
+		spec.GraphQL = apidef.GraphQLConfig{
+			Enabled:       true,
+			ExecutionMode: apidef.GraphQLExecutionModeSupergraph,
+			Version:       apidef.GraphQLConfigVersion2,
+			Supergraph: apidef.GraphQLSupergraphConfig{
+				Subgraphs: []apidef.GraphQLSubgraphEntity{
+					{
+						Name:  "subgraph-accounts",
+						APIID: "subgraph-accounts",
+						SDL:   gqlSubgraphSDLAccounts,
+						URL:   "tyk://subgraph-accounts",
+					},
+				},
+				MergedSDL: gqlMergedSupergraphSDL,
+			},
+			Schema: gqlMergedSupergraphSDL,
+		}
+	})[0]
+
+	ts.Gw.LoadAPI(accountsSubgraph, superGraph)
+
+	ts.Gw.Analytics.mockEnabled = true
+	ts.Gw.Analytics.mockRecordHit = func(record *analytics.AnalyticsRecord) {
+		if record.APIID != "subgraph-accounts" {
+			return
+		}
+		found := false
+		for _, val := range record.Tags {
+			if val == "tyk-graph-analytics" {
+				found = true
+				break
+			}
+		}
+		if record.ApiSchema != "" && found {
+			t.Error("subgraph request should not tagged or have schema")
+		}
+		assert.False(t, record.GraphQLStats.IsGraphQL)
+	}
+
+	_, err := ts.Run(t,
+		test.TestCase{
+			Path: "/supergraph",
+			Data: graphql.Request{
+				Query: `query Query { me { id username} }`,
+			},
+			Code: 200,
+		},
+		test.TestCase{
+			Path: "/supergraph",
+			Data: graphql.Request{
+				Query: `query Query { mem { id username} }`,
+			},
+			Code: 400,
+		},
+	)
+	assert.NoError(t, err)
+}
+
+func TestSuccessHandler_addTraceIDTag(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	s := &SuccessHandler{
+		BaseMiddleware: &BaseMiddleware{Gw: ts.Gw},
+	}
+
+	makeCtxWithTrace := func(hex string) context.Context {
+		tid, err := trace.TraceIDFromHex(hex)
+		if err != nil {
+			t.Fatalf("invalid trace id: %v", err)
+		}
+		sc := trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID:    tid,
+			TraceFlags: trace.FlagsSampled,
+		})
+		return trace.ContextWithSpanContext(context.Background(), sc)
+	}
+
+	tests := map[string]struct {
+		enableOTel bool
+		ctx        context.Context
+		in         []string
+		want       []string
+	}{
+		"enabled_with_trace_appends": {
+			enableOTel: true,
+			ctx:        makeCtxWithTrace("0123456789abcdef0123456789abcdef"),
+			in:         []string{"a", "b"},
+			want:       []string{"a", "b", traceTagPrefix + "0123456789abcdef0123456789abcdef"},
+		},
+		"enabled_without_trace_noop": {
+			enableOTel: true,
+			ctx:        context.Background(),
+			in:         []string{"x"},
+			want:       []string{"x"},
+		},
+		"disabled_with_trace_noop": {
+			enableOTel: false,
+			ctx:        makeCtxWithTrace("ffffffffffffffffffffffffffffffff"),
+			in:         []string{},
+			want:       []string{},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := ts.Gw.GetConfig()
+			cfg.OpenTelemetry.Enabled = tc.enableOTel
+			ts.Gw.SetConfig(cfg)
+
+			tags := make([]string, 0, len(tc.in))
+			tags = append(tags, tc.in...)
+
+			tags = s.addTraceIDTag(tc.ctx, tags)
+
+			want := tc.want
+			if want == nil {
+				want = []string{}
+			}
+
+			if diff := cmp.Diff(tags, want); diff != "" {
+				t.Fatalf("tags mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRecordMCPDetails(t *testing.T) {
+	t.Run("populates MCPStats from context values", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST", "/mcp", nil)
+		assert.NoError(t, err)
+		ctxSetMCPMethod(req, "tools/call")
+		ctxSetMCPPrimitiveType(req, "tool")
+		ctxSetMCPPrimitiveName(req, "my_tool")
+		httpctx.SetMCPProtocolContext(req, mcp.NewProtocolContext("2026-07-28", "", &mcp.RequestEnvelope{Method: "tools/call"}, nil))
+		ctxSetJSONRPCErrorCode(req, -33002)
+
+		var rec analytics.AnalyticsRecord
+		recordMCPDetails(&rec, req)
+
+		assert.True(t, rec.MCPStats.IsMCP)
+		assert.Equal(t, "tools/call", rec.MCPStats.JSONRPCMethod)
+		assert.Equal(t, "tool", rec.MCPStats.PrimitiveType)
+		assert.Equal(t, "my_tool", rec.MCPStats.PrimitiveName)
+		assert.Equal(t, "2026-07-28", rec.MCPStats.EffectiveProtocolVersion)
+		assert.Equal(t, "2026-07-28", rec.MCPStats.DeclaredProtocolVersion)
+		assert.Equal(t, "header", rec.MCPStats.ProtocolVersionSource)
+		assert.EqualValues(t, -33002, rec.MCPStats.JSONRPCErrorCode)
+	})
+
+	t.Run("list operation has empty PrimitiveType and PrimitiveName", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST", "/mcp", nil)
+		assert.NoError(t, err)
+		ctxSetMCPMethod(req, "tools/list")
+
+		var rec analytics.AnalyticsRecord
+		recordMCPDetails(&rec, req)
+
+		assert.True(t, rec.MCPStats.IsMCP)
+		assert.Equal(t, "tools/list", rec.MCPStats.JSONRPCMethod)
+		assert.Empty(t, rec.MCPStats.PrimitiveType)
+		assert.Empty(t, rec.MCPStats.PrimitiveName)
+	})
+
+	t.Run("initialize has empty PrimitiveType and PrimitiveName", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST", "/mcp", nil)
+		assert.NoError(t, err)
+		ctxSetMCPMethod(req, "initialize")
+
+		var rec analytics.AnalyticsRecord
+		recordMCPDetails(&rec, req)
+
+		assert.True(t, rec.MCPStats.IsMCP)
+		assert.Equal(t, "initialize", rec.MCPStats.JSONRPCMethod)
+		assert.Empty(t, rec.MCPStats.PrimitiveType)
+		assert.Empty(t, rec.MCPStats.PrimitiveName)
+	})
+
+	t.Run("no MCP context still tags record as MCP", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "GET", "/api/users", nil)
+		assert.NoError(t, err)
+
+		original := analytics.AnalyticsRecord{
+			APIID:        "rest-api",
+			Path:         "/api/users",
+			ResponseCode: 200,
+		}
+		rec := original
+		recordMCPDetails(&rec, req)
+
+		assert.True(t, rec.MCPStats.IsMCP)
+		assert.Equal(t, original.Path, rec.Path)
+		assert.Equal(t, original.APIID, rec.APIID)
+		assert.Equal(t, original.ResponseCode, rec.ResponseCode)
+		assert.Empty(t, rec.MCPStats.JSONRPCMethod)
+		assert.Empty(t, rec.MCPStats.PrimitiveType)
+		assert.Empty(t, rec.MCPStats.PrimitiveName)
+	})
+}
+
+func TestSuccessHandler_classifyUpstreamError(t *testing.T) {
+	tests := []struct {
+		name           string
+		statusCode     int
+		urlHost        string
+		specTargetHost string
+		wantClassified bool
+		wantTarget     string
+	}{
+		{
+			name:           "500 Internal Server Error with URL host",
+			statusCode:     500,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: true,
+			wantTarget:     "api.example.com",
+		},
+		{
+			name:           "502 Bad Gateway with URL host",
+			statusCode:     502,
+			urlHost:        "backend.example.com",
+			specTargetHost: "",
+			wantClassified: true,
+			wantTarget:     "backend.example.com",
+		},
+		{
+			name:           "503 Service Unavailable with URL host",
+			statusCode:     503,
+			urlHost:        "service.example.com",
+			specTargetHost: "",
+			wantClassified: true,
+			wantTarget:     "service.example.com",
+		},
+		{
+			name:           "504 Gateway Timeout with URL host",
+			statusCode:     504,
+			urlHost:        "upstream.example.com",
+			specTargetHost: "",
+			wantClassified: true,
+			wantTarget:     "upstream.example.com",
+		},
+		{
+			name:           "500 with empty URL host falls back to spec target",
+			statusCode:     500,
+			urlHost:        "",
+			specTargetHost: "fallback.example.com",
+			wantClassified: true,
+			wantTarget:     "fallback.example.com",
+		},
+		{
+			name:           "500 with empty URL host and no spec target",
+			statusCode:     500,
+			urlHost:        "",
+			specTargetHost: "",
+			wantClassified: true,
+			wantTarget:     "",
+		},
+		{
+			name:           "200 OK should not be classified",
+			statusCode:     200,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: false,
+			wantTarget:     "",
+		},
+		{
+			name:           "201 Created should not be classified",
+			statusCode:     201,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: false,
+			wantTarget:     "",
+		},
+		{
+			name:           "400 Bad Request should not be classified",
+			statusCode:     400,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: false,
+			wantTarget:     "",
+		},
+		{
+			name:           "404 Not Found should not be classified",
+			statusCode:     404,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: false,
+			wantTarget:     "",
+		},
+		{
+			name:           "499 (boundary) should not be classified",
+			statusCode:     499,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: false,
+			wantTarget:     "",
+		},
+		{
+			name:           "599 (max 5xx) should be classified",
+			statusCode:     599,
+			urlHost:        "api.example.com",
+			specTargetHost: "",
+			wantClassified: true,
+			wantTarget:     "api.example.com",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create request with URL
+			req, err := http.NewRequest("GET", "/test", nil)
+			assert.NoError(t, err)
+
+			req.URL.Host = tc.urlHost
+
+			// Create spec with optional target
+			spec := &APISpec{
+				APIDefinition: &apidef.APIDefinition{},
+			}
+			if tc.specTargetHost != "" {
+				spec.target = &url.URL{Host: tc.specTargetHost}
+			}
+
+			// Create handler
+			handler := &SuccessHandler{
+				BaseMiddleware: &BaseMiddleware{
+					Spec: spec,
+				},
+			}
+
+			// Call the method
+			handler.classifyUpstreamError(req, tc.statusCode)
+
+			// Verify the result
+			errClass := ctxpkg.GetErrorClassification(req)
+
+			if tc.wantClassified {
+				assert.NotNil(t, errClass, "expected error classification to be set")
+				if errClass != nil {
+					assert.Equal(t, tc.wantTarget, errClass.Target, "target mismatch")
+				}
+			} else {
+				assert.Nil(t, errClass, "expected no error classification")
+			}
+		})
+	}
+}
+
+type mockReturningHttpHandler struct {
+	serveHTTPCalled         bool
+	serveHTTPForCacheCalled bool
+}
+
+func (m *mockReturningHttpHandler) ServeHTTP(_ http.ResponseWriter, _ *http.Request) ProxyResponse {
+	m.serveHTTPCalled = true
+	return ProxyResponse{}
+}
+
+func (m *mockReturningHttpHandler) ServeHTTPForCache(_ http.ResponseWriter, _ *http.Request) ProxyResponse {
+	m.serveHTTPForCacheCalled = true
+	return ProxyResponse{}
+}
+
+func (m *mockReturningHttpHandler) CopyResponse(_ io.Writer, _ io.Reader, _ time.Duration) error {
+	return nil
+}
+
+func TestSuccessHandler_ServeHTTP_Branching(t *testing.T) {
+	tests := []struct {
+		name                    string
+		graphqlEnabled          bool
+		expectServeHTTP         bool
+		expectServeHTTPForCache bool
+	}{
+		{
+			name:                    "GraphQL disabled calls ServeHTTP",
+			graphqlEnabled:          false,
+			expectServeHTTP:         true,
+			expectServeHTTPForCache: false,
+		},
+		{
+			name:                    "GraphQL enabled calls ServeHTTPForCache",
+			graphqlEnabled:          true,
+			expectServeHTTP:         false,
+			expectServeHTTPForCache: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockProxy := &mockReturningHttpHandler{}
+
+			spec := &APISpec{
+				APIDefinition: &apidef.APIDefinition{
+					GraphQL: apidef.GraphQLConfig{
+						Enabled: tt.graphqlEnabled,
+					},
+				},
+			}
+
+			handler := &SuccessHandler{
+				BaseMiddleware: &BaseMiddleware{
+					Spec:  spec,
+					Proxy: mockProxy,
+				},
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			w := httptest.NewRecorder()
+
+			handler.ServeHTTP(w, req)
+
+			assert.Equal(t, tt.expectServeHTTP, mockProxy.serveHTTPCalled)
+			assert.Equal(t, tt.expectServeHTTPForCache, mockProxy.serveHTTPForCacheCalled)
+		})
+	}
+}

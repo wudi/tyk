@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -10,18 +11,21 @@ import (
 	"time"
 
 	"github.com/justinas/alice"
-	"github.com/lonelycode/go-uuid/uuid"
+	"github.com/stretchr/testify/assert"
 
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/certs"
 	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/signature_validator"
+	"github.com/TykTechnologies/tyk/internal/crypto"
+	"github.com/TykTechnologies/tyk/internal/uuid"
+	signaturevalidator "github.com/TykTechnologies/tyk/signature_validator"
 	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
 
 func TestMurmur3CharBug(t *testing.T) {
-	defer ResetTestConfig()
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	api := BuildAPI(func(spec *APISpec) {
@@ -34,13 +38,13 @@ func TestMurmur3CharBug(t *testing.T) {
 	}
 
 	t.Run("Without hashing", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HashKeys = false
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		LoadAPI(api)
+		ts.Gw.LoadAPI(api)
 
-		key := CreateSession()
+		key := CreateSession(ts.Gw)
 
 		ts.Run(t, []test.TestCase{
 			genTestCase("wrong", 403),
@@ -50,14 +54,14 @@ func TestMurmur3CharBug(t *testing.T) {
 	})
 
 	t.Run("murmur32 hashing, legacy", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HashKeys = true
 		globalConf.HashKeyFunction = ""
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		LoadAPI(api)
+		ts.Gw.LoadAPI(api)
 
-		key := CreateSession()
+		key := CreateSession(ts.Gw)
 
 		ts.Run(t, []test.TestCase{
 			genTestCase("wrong", 403),
@@ -67,14 +71,14 @@ func TestMurmur3CharBug(t *testing.T) {
 	})
 
 	t.Run("murmur32 hashing, json keys", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HashKeys = true
 		globalConf.HashKeyFunction = "murmur32"
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		LoadAPI(api)
+		ts.Gw.LoadAPI(api)
 
-		key := CreateSession()
+		key := CreateSession(ts.Gw)
 
 		ts.Run(t, []test.TestCase{
 			genTestCase("wrong", 403),
@@ -85,14 +89,14 @@ func TestMurmur3CharBug(t *testing.T) {
 	})
 
 	t.Run("murmur64 hashing", func(t *testing.T) {
-		globalConf := config.Global()
+		globalConf := ts.Gw.GetConfig()
 		globalConf.HashKeys = true
 		globalConf.HashKeyFunction = "murmur64"
-		config.SetGlobal(globalConf)
+		ts.Gw.SetConfig(globalConf)
 
-		LoadAPI(api)
+		ts.Gw.LoadAPI(api)
 
-		key := CreateSession()
+		key := CreateSession(ts.Gw)
 
 		ts.Run(t, []test.TestCase{
 			genTestCase("wrong", 403),
@@ -104,25 +108,36 @@ func TestMurmur3CharBug(t *testing.T) {
 }
 
 func TestSignatureValidation(t *testing.T) {
-	defer ResetTestConfig()
-	ts := StartTest()
-	defer ts.Close()
+	test.Flaky(t) // Test uses StorageConnectionHandler (singleton).
+
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
 	api := BuildAPI(func(spec *APISpec) {
 		spec.UseKeylessAccess = false
 		spec.Proxy.ListenPath = "/"
-		spec.Auth.ValidateSignature = true
-		spec.Auth.Signature.Algorithm = "MasheryMD5"
-		spec.Auth.Signature.Header = "Signature"
-		spec.Auth.Signature.Secret = "foobar"
-		spec.Auth.Signature.AllowedClockSkew = 1
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			apidef.AuthTokenType: {
+				ValidateSignature: true,
+				UseParam:          true,
+				ParamName:         "api_key",
+				Signature: apidef.SignatureConfig{
+					UseParam:         true,
+					ParamName:        "sig",
+					Secret:           "foobar",
+					Algorithm:        "MasheryMD5",
+					Header:           "Signature",
+					AllowedClockSkew: 1,
+				},
+			},
+		}
 	})[0]
 
-	t.Run("Static signature", func(t *testing.T) {
-		api.Auth.Signature.Secret = "foobar"
-		LoadAPI(api)
+	ts.Gw.LoadAPI(api)
 
-		key := CreateSession()
-		hasher := signature_validator.MasheryMd5sum{}
+	t.Run("Static signature", func(t *testing.T) {
+		key := CreateSession(ts.Gw)
+		hasher := signaturevalidator.MasheryMd5sum{}
 		validHash := hasher.Hash(key, "foobar", time.Now().Unix())
 
 		validSigHeader := map[string]string{
@@ -138,31 +153,56 @@ func TestSignatureValidation(t *testing.T) {
 		emptySigHeader := map[string]string{
 			"authorization": key,
 		}
-		storage.DisableRedis(true)
+		ts.Gw.StorageConnectionHandler.DisableStorage(true)
 		ts.Run(t, []test.TestCase{
 			{Headers: emptySigHeader, Code: http.StatusForbidden},
 			{Headers: invalidSigHeader, Code: http.StatusForbidden},
 			{Headers: validSigHeader, Code: http.StatusForbidden},
 		}...)
-		storage.DisableRedis(false)
+		ts.Gw.StorageConnectionHandler.DisableStorage(false)
 		ts.Run(t, []test.TestCase{
-			{Headers: emptySigHeader, Code: 401},
-			{Headers: invalidSigHeader, Code: 401},
-			{Headers: validSigHeader, Code: 200},
+			{Headers: emptySigHeader, Code: http.StatusUnauthorized},
+			{Headers: invalidSigHeader, Code: http.StatusUnauthorized},
+			{Headers: validSigHeader, Code: http.StatusOK},
+		}...)
+	})
+
+	t.Run("Static signature in params", func(t *testing.T) {
+		key := CreateSession(ts.Gw)
+		hasher := signaturevalidator.MasheryMd5sum{}
+		validHash := hasher.Hash(key, "foobar", time.Now().Unix())
+
+		emptySigPath := "?api_key=" + key
+		invalidSigPath := emptySigPath + "&sig=junk"
+		validSigPath := emptySigPath + "&sig=" + hex.EncodeToString(validHash)
+
+		ts.Gw.StorageConnectionHandler.DisableStorage(true)
+		_, _ = ts.Run(t, []test.TestCase{
+			{Path: emptySigPath, Code: http.StatusForbidden},
+			{Path: invalidSigPath, Code: http.StatusForbidden},
+			{Path: validSigPath, Code: http.StatusForbidden},
+		}...)
+		ts.Gw.StorageConnectionHandler.DisableStorage(false)
+		_, _ = ts.Run(t, []test.TestCase{
+			{Path: emptySigPath, Code: http.StatusUnauthorized},
+			{Path: invalidSigPath, Code: http.StatusUnauthorized},
+			{Path: validSigPath, Code: http.StatusOK},
 		}...)
 	})
 
 	t.Run("Dynamic signature", func(t *testing.T) {
-		api.Auth.Signature.Secret = "$tyk_meta.signature_secret"
-		LoadAPI(api)
+		authConfig := api.AuthConfigs[apidef.AuthTokenType]
+		authConfig.Signature.Secret = "$tyk_meta.signature_secret"
+		api.AuthConfigs[apidef.AuthTokenType] = authConfig
+		ts.Gw.LoadAPI(api)
 
-		key := CreateSession(func(s *user.SessionState) {
-			s.MetaData = map[string]interface{}{
+		key := CreateSession(ts.Gw, func(s *user.SessionState) {
+			s.MetaData = map[string]any{
 				"signature_secret": "foobar",
 			}
 		})
 
-		hasher := signature_validator.MasheryMd5sum{}
+		hasher := signaturevalidator.MasheryMd5sum{}
 		validHash := hasher.Hash(key, "foobar", time.Now().Unix())
 
 		validSigHeader := map[string]string{
@@ -174,21 +214,96 @@ func TestSignatureValidation(t *testing.T) {
 			"authorization": key,
 			"signature":     "junk",
 		}
-		storage.DisableRedis(true)
+		ts.Gw.StorageConnectionHandler.DisableStorage(true)
 		ts.Run(t, []test.TestCase{
 			{Headers: invalidSigHeader, Code: http.StatusForbidden},
 			{Headers: validSigHeader, Code: http.StatusForbidden},
 		}...)
-		storage.DisableRedis(false)
+		ts.Gw.StorageConnectionHandler.DisableStorage(false)
 		ts.Run(t, []test.TestCase{
-			{Headers: invalidSigHeader, Code: 401},
-			{Headers: validSigHeader, Code: 200},
+			{Headers: invalidSigHeader, Code: http.StatusUnauthorized},
+			{Headers: validSigHeader, Code: http.StatusOK},
+		}...)
+	})
+
+	t.Run("Dynamic signature with custom key", func(t *testing.T) {
+		authConfig := api.AuthConfigs[apidef.AuthTokenType]
+		authConfig.Signature.Secret = "$tyk_meta.signature_secret"
+		api.AuthConfigs[apidef.AuthTokenType] = authConfig
+		ts.Gw.LoadAPI(api)
+
+		customKey := "c8zj99aze7hdvtaqh4qvcck7"
+		secret := "foobar"
+
+		session := CreateStandardSession()
+		session.AccessRights = map[string]user.AccessDefinition{"test": {
+			APIID: "test", Versions: []string{"v1"},
+		}}
+		session.MetaData = map[string]any{
+			"signature_secret": secret,
+		}
+
+		client := GetTLSClient(nil, nil)
+		_, _ = ts.Run(t, test.TestCase{AdminAuth: true, Method: http.MethodPost, Path: "/tyk/keys/" + customKey,
+			Data: session, Client: client, Code: http.StatusOK})
+
+		hasher := signaturevalidator.MasheryMd5sum{}
+
+		// First request is for raw key scenarios, signature is based on this key:
+		validHash := hasher.Hash(customKey, secret, time.Now().Unix())
+		validSigHeader := map[string]string{
+			"authorization": customKey,
+			"signature":     hex.EncodeToString(validHash),
+		}
+
+		// Second request uses token (org ID + key) and token-based signature:
+		token, err := storage.GenerateToken("default", customKey, "murmur64")
+		if err != nil {
+			t.Fatal(err)
+		}
+		validHash2 := hasher.Hash(token, secret, time.Now().Unix())
+		validSigHeader2 := map[string]string{
+			"authorization": token,
+			"signature":     hex.EncodeToString(validHash2),
+		}
+
+		// Third request uses token (org ID + key) and raw key based signature:
+		validSigHeader3 := map[string]string{
+			"authorization": token,
+			"signature":     hex.EncodeToString(validHash),
+		}
+
+		// Fourth request uses raw key and token-based signature:
+		validSigHeader4 := map[string]string{
+			"authorization": customKey,
+			"signature":     hex.EncodeToString(validHash2),
+		}
+
+		invalidSigHeader := map[string]string{
+			"authorization": customKey,
+			"signature":     "junk",
+		}
+		ts.Gw.StorageConnectionHandler.DisableStorage(true)
+		ts.Run(t, []test.TestCase{
+			{Headers: invalidSigHeader, Code: http.StatusForbidden},
+			{Headers: validSigHeader, Code: http.StatusForbidden},
+			{Headers: validSigHeader2, Code: http.StatusForbidden},
+			{Headers: validSigHeader3, Code: http.StatusForbidden},
+			{Headers: validSigHeader4, Code: http.StatusForbidden},
+		}...)
+		ts.Gw.StorageConnectionHandler.DisableStorage(false)
+		ts.Run(t, []test.TestCase{
+			{Headers: invalidSigHeader, Code: http.StatusUnauthorized},
+			{Headers: validSigHeader, Code: http.StatusOK},
+			{Headers: validSigHeader2, Code: http.StatusOK},
+			{Headers: validSigHeader3, Code: http.StatusOK},
+			{Headers: validSigHeader4, Code: http.StatusOK},
 		}...)
 	})
 }
 
 func createAuthKeyAuthSession(isBench bool) *user.SessionState {
-	session := new(user.SessionState)
+	session := user.NewSessionState()
 	// essentially non-throttled
 	session.Rate = 100.0
 	session.Allowance = session.Rate
@@ -207,12 +322,13 @@ func createAuthKeyAuthSession(isBench bool) *user.SessionState {
 	return session
 }
 
-func getAuthKeyChain(spec *APISpec) http.Handler {
+func getAuthKeyChain(spec *APISpec, ts *Test) http.Handler {
+
 	remote, _ := url.Parse(spec.Proxy.TargetURL)
-	proxy := TykNewSingleHostReverseProxy(remote, spec, nil)
+	proxy := ts.Gw.TykNewSingleHostReverseProxy(remote, spec, nil)
 	proxyHandler := ProxyHandler(proxy, spec)
-	baseMid := BaseMiddleware{Spec: spec, Proxy: proxy}
-	chain := alice.New(mwList(
+	baseMid := &BaseMiddleware{Spec: spec, Proxy: proxy, Gw: ts.Gw}
+	chain := alice.New(ts.Gw.mwList(
 		&IPWhiteListMiddleware{baseMid},
 		&IPBlackListMiddleware{BaseMiddleware: baseMid},
 		&AuthKey{baseMid},
@@ -224,8 +340,9 @@ func getAuthKeyChain(spec *APISpec) http.Handler {
 	return chain
 }
 
-func testPrepareAuthKeySession(apiDef string, isBench bool) (string, *APISpec) {
-	spec := LoadSampleAPI(apiDef)
+func (ts *Test) testPrepareAuthKeySession(apiDef string, isBench bool) (string, *APISpec, error) {
+
+	spec := ts.Gw.LoadSampleAPI(apiDef)
 
 	session := createAuthKeyAuthSession(isBench)
 	customToken := ""
@@ -235,19 +352,23 @@ func testPrepareAuthKeySession(apiDef string, isBench bool) (string, *APISpec) {
 		customToken = "54321111"
 	}
 	// AuthKey sessions are stored by {token}
-	GlobalSessionManager.UpdateSession(customToken, session, 60, false)
-	return customToken, spec
+	return customToken, spec, ts.Gw.GlobalSessionManager.UpdateSession(customToken, session, 60, false)
 }
 
 func TestBearerTokenAuthKeySession(t *testing.T) {
-	customToken, spec := testPrepareAuthKeySession(authKeyDef, false)
+	ts := StartTest(nil)
+	defer ts.Close()
+	customToken, spec, err := ts.testPrepareAuthKeySession(authKeyDef, false)
+	if err != nil {
+		t.Error(err)
+	}
 
 	recorder := httptest.NewRecorder()
 	req := TestReq(t, "GET", "/auth_key_test/", nil)
 
 	req.Header.Set("authorization", "Bearer "+customToken)
 
-	chain := getAuthKeyChain(spec)
+	chain := getAuthKeyChain(spec, ts)
 	chain.ServeHTTP(recorder, req)
 
 	if recorder.Code != 200 {
@@ -255,20 +376,24 @@ func TestBearerTokenAuthKeySession(t *testing.T) {
 		t.Error(recorder.Body.String())
 	}
 }
-
 func BenchmarkBearerTokenAuthKeySession(b *testing.B) {
+	ts := StartTest(nil)
+	defer ts.Close()
 	b.ReportAllocs()
 
-	customToken, spec := testPrepareAuthKeySession(authKeyDef, true)
+	customToken, spec, err := ts.testPrepareAuthKeySession(authKeyDef, true)
+	if err != nil {
+		b.Error(err)
+	}
 
 	recorder := httptest.NewRecorder()
 	req := TestReq(b, "GET", "/auth_key_test/", nil)
 
 	req.Header.Set("authorization", "Bearer "+customToken)
 
-	chain := getAuthKeyChain(spec)
+	chain := getAuthKeyChain(spec, ts)
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		chain.ServeHTTP(recorder, req)
 		if recorder.Code != 200 {
 			b.Error("Initial request failed with non-200 code, should have gone through!: \n", recorder.Code)
@@ -294,12 +419,17 @@ const authKeyDef = `{
 }`
 
 func TestMultiAuthBackwardsCompatibleSession(t *testing.T) {
-	customToken, spec := testPrepareAuthKeySession(multiAuthBackwardsCompatible, false)
+	ts := StartTest(nil)
+	defer ts.Close()
+	customToken, spec, err := ts.testPrepareAuthKeySession(multiAuthBackwardsCompatible, false)
+	if err != nil {
+		t.Error(err)
+	}
 
 	recorder := httptest.NewRecorder()
 	req := TestReq(t, "GET", fmt.Sprintf("/auth_key_test/?token=%s", customToken), nil)
 
-	chain := getAuthKeyChain(spec)
+	chain := getAuthKeyChain(spec, ts)
 	chain.ServeHTTP(recorder, req)
 
 	if recorder.Code != 200 {
@@ -309,16 +439,21 @@ func TestMultiAuthBackwardsCompatibleSession(t *testing.T) {
 }
 
 func BenchmarkMultiAuthBackwardsCompatibleSession(b *testing.B) {
-	b.ReportAllocs()
+	ts := StartTest(nil)
+	defer ts.Close()
 
-	customToken, spec := testPrepareAuthKeySession(multiAuthBackwardsCompatible, true)
+	b.ReportAllocs()
+	customToken, spec, err := ts.testPrepareAuthKeySession(multiAuthBackwardsCompatible, true)
+	if err != nil {
+		b.Error(err)
+	}
 
 	recorder := httptest.NewRecorder()
 	req := TestReq(b, "GET", fmt.Sprintf("/auth_key_test/?token=%s", customToken), nil)
 
-	chain := getAuthKeyChain(spec)
+	chain := getAuthKeyChain(spec, ts)
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		chain.ServeHTTP(recorder, req)
 		if recorder.Code != 200 {
 			b.Error("Initial request failed with non-200 code, should have gone through!: \n", recorder.Code)
@@ -347,17 +482,23 @@ const multiAuthBackwardsCompatible = `{
 }`
 
 func TestMultiAuthSession(t *testing.T) {
-	spec := LoadSampleAPI(multiAuthDef)
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	spec := ts.Gw.LoadSampleAPI(multiAuthDef)
 	session := createAuthKeyAuthSession(false)
 	customToken := "54321111"
 	// AuthKey sessions are stored by {token}
-	GlobalSessionManager.UpdateSession(customToken, session, 60, false)
+	err := ts.Gw.GlobalSessionManager.UpdateSession(customToken, session, 60, false)
+	if err != nil {
+		t.Error("could not update session in Session Manager. " + err.Error())
+	}
 
 	// Set the url param
 	recorder := httptest.NewRecorder()
 	req := TestReq(t, "GET", fmt.Sprintf("/auth_key_test/?token=%s", customToken), nil)
 
-	chain := getAuthKeyChain(spec)
+	chain := getAuthKeyChain(spec, ts)
 	chain.ServeHTTP(recorder, req)
 
 	if recorder.Code != 200 {
@@ -407,6 +548,8 @@ const multiAuthDef = `{
 	"auth": {
 		"auth_header_name": "authorization",
 		"param_name": "token",
+		"use_param": true,
+		"use_cookie": true,
 		"cookie_name": "oreo"
 	},
 	"version_data": {
@@ -447,7 +590,219 @@ func TestStripBearer(t *testing.T) {
 func BenchmarkStripBearer(b *testing.B) {
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = stripBearer("Bearer abcdefghijklmnopqrstuvwxyz12345678910")
 	}
+}
+
+func TestDynamicMTLSInsecure(t *testing.T) {
+	serverCertPem, _, combinedPEM, _ := certs.GenServerCertificate()
+	certID, _, _ := certs.GetCertIDAndChainPEM(combinedPEM, "")
+
+	conf := func(globalConf *config.Config) {
+		globalConf.Security.ControlAPIUseMutualTLS = false
+		globalConf.Security.AllowUnsafeDynamicMTLSToken = true // Insecure behavior for this test
+		globalConf.HttpServerOptions.UseSSL = true
+		globalConf.HttpServerOptions.SSLInsecureSkipVerify = true
+		globalConf.HttpServerOptions.SSLCertificates = []string{"default" + certID}
+	}
+	ts := StartTest(conf)
+	defer ts.Close()
+
+	certID, err := ts.Gw.CertificateManager.Add(combinedPEM, "default")
+	assert.NoError(t, err)
+	defer ts.Gw.CertificateManager.Delete(certID, "default")
+	ts.ReloadGatewayProxy()
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.APIID = "apiID-1"
+		spec.UseStandardAuth = true
+		spec.UseKeylessAccess = false
+		authConf := apidef.AuthConfig{
+			Name:           "authToken",
+			UseCertificate: true,
+			AuthHeaderName: "Authorization",
+		}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": authConf,
+		}
+		spec.Auth = authConf
+		spec.Proxy.ListenPath = "/dynamic-mtls"
+	})
+
+	// Initialize client certificates
+	clientCertPem, _, _, clientCert := certs.GenCertificate(&x509.Certificate{}, false)
+
+	clientCertID, err := ts.Gw.CertificateManager.Add(clientCertPem, "default")
+	assert.NoError(t, err)
+	certHash := "default" + crypto.HexSHA256(clientCert.Certificate[0])
+
+	_, keyHash := ts.CreateSession(func(s *user.SessionState) {
+		s.AccessRights = map[string]user.AccessDefinition{"apiID-1": {
+			APIID: "apiID-1",
+		}}
+		s.Certificate = clientCertID
+	})
+
+	t.Run("valid certificate provided", func(t *testing.T) {
+		validCertClient := GetTLSClient(&clientCert, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Domain: "localhost",
+			Client: validCertClient,
+			Path:   "/dynamic-mtls",
+			Code:   http.StatusOK,
+		})
+	})
+
+	t.Run("missing cert with generated cert hash and allow unsafe - should be accepted", func(t *testing.T) {
+		certClient := GetTLSClient(nil, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Path:   "/dynamic-mtls",
+			Code:   http.StatusOK,
+			Client: certClient,
+			Headers: map[string]string{
+				"Authorization": certHash,
+			},
+		})
+	})
+
+	t.Run("missing cert with generated key and allow unsafe - should be accepted", func(t *testing.T) {
+		certClient := GetTLSClient(nil, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Path:   "/dynamic-mtls",
+			Code:   http.StatusOK,
+			Client: certClient,
+			Headers: map[string]string{
+				"Authorization": keyHash,
+			},
+		})
+	})
+}
+
+func TestDynamicMTLSSecure(t *testing.T) {
+	serverCertPem, _, combinedPEM, _ := certs.GenServerCertificate()
+	certID, _, err := certs.GetCertIDAndChainPEM(combinedPEM, "")
+	assert.NoError(t, err)
+
+	conf := func(globalConf *config.Config) {
+		globalConf.Security.ControlAPIUseMutualTLS = false
+		globalConf.Security.AllowUnsafeDynamicMTLSToken = false // Default secure behavior
+		globalConf.HttpServerOptions.UseSSL = true
+		globalConf.HttpServerOptions.SSLInsecureSkipVerify = true
+		globalConf.HttpServerOptions.SSLCertificates = []string{"default" + certID}
+	}
+	ts := StartTest(conf)
+	defer ts.Close()
+
+	certID, err = ts.Gw.CertificateManager.Add(combinedPEM, "default")
+	assert.NoError(t, err)
+	defer ts.Gw.CertificateManager.Delete(certID, "default")
+	ts.ReloadGatewayProxy()
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.APIID = "apiID-1"
+		spec.UseStandardAuth = true
+		spec.UseKeylessAccess = false
+		authConf := apidef.AuthConfig{
+			Name:           "authToken",
+			UseCertificate: true,
+			AuthHeaderName: "Authorization",
+		}
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			"authToken": authConf,
+		}
+		spec.Auth = authConf
+		spec.Proxy.ListenPath = "/dynamic-mtls"
+	})
+
+	// Initialize client certificates
+	clientCertPem, _, _, clientCert := certs.GenCertificate(&x509.Certificate{}, false)
+
+	clientCertID, err := ts.Gw.CertificateManager.Add(clientCertPem, "default")
+	assert.NoError(t, err)
+	certHash := "default" + crypto.HexSHA256(clientCert.Certificate[0])
+
+	_, keyHash := ts.CreateSession(func(s *user.SessionState) {
+		s.AccessRights = map[string]user.AccessDefinition{"apiID-1": {
+			APIID: "apiID-1",
+		}}
+		s.Certificate = clientCertID
+	})
+
+	t.Run("valid certificate provided", func(t *testing.T) {
+		validCertClient := GetTLSClient(&clientCert, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Domain: "localhost",
+			Client: validCertClient,
+			Path:   "/dynamic-mtls",
+			Code:   http.StatusOK,
+		})
+	})
+
+	t.Run("missing certificate - should be rejected by default", func(t *testing.T) {
+		// client that only checks server ca
+		certClient := GetTLSClient(nil, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Path:      "/dynamic-mtls",
+			Code:      http.StatusUnauthorized,
+			BodyMatch: MsgAuthCertRequired,
+			Client:    certClient,
+		})
+	})
+
+	t.Run("missing cert with generated key - should be rejected by default", func(t *testing.T) {
+		certClient := GetTLSClient(nil, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Path:      "/dynamic-mtls",
+			Code:      http.StatusUnauthorized,
+			BodyMatch: MsgAuthCertRequired,
+			Client:    certClient,
+			Headers: map[string]string{
+				"Authorization": keyHash,
+			},
+		})
+	})
+
+	t.Run("missing cert with generated cert hash - should be rejected by default", func(t *testing.T) {
+		certClient := GetTLSClient(nil, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Path:      "/dynamic-mtls",
+			Code:      http.StatusUnauthorized,
+			BodyMatch: MsgAuthCertRequired,
+			Client:    certClient,
+			Headers: map[string]string{
+				"Authorization": certHash,
+			},
+		})
+	})
+
+	t.Run("expired client cert", func(t *testing.T) {
+		_, _, _, expiredClientCert := certs.GenCertificate(&x509.Certificate{
+			NotBefore: time.Now().AddDate(-1, 0, 0),
+			NotAfter:  time.Now().AddDate(0, 0, -1),
+		}, false)
+
+		expiredCertClient := GetTLSClient(&expiredClientCert, serverCertPem)
+
+		_, _ = ts.Run(t, test.TestCase{
+			Client:    expiredCertClient,
+			Path:      "/dynamic-mtls",
+			Code:      http.StatusForbidden,
+			BodyMatch: MsgCertificateExpired,
+		})
+	})
+
+	t.Run("non-matching certificate - should be rejected", func(t *testing.T) {
+		differentClientPem, _, _, differentClientCert := certs.GenCertificate(&x509.Certificate{}, false)
+		_, err := ts.Gw.CertificateManager.Add(differentClientPem, "default")
+		assert.NoError(t, err)
+
+		differentCertClient := GetTLSClient(&differentClientCert, serverCertPem)
+		_, _ = ts.Run(t, test.TestCase{
+			Client:    differentCertClient,
+			Path:      "/dynamic-mtls",
+			Code:      http.StatusUnauthorized,
+			BodyMatch: MsgApiAccessDisallowed,
+		})
+	})
 }

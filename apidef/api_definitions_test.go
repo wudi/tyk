@@ -1,0 +1,1386 @@
+package apidef
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/service/gojsonschema"
+	tyktime "github.com/TykTechnologies/tyk/internal/time"
+)
+
+func TestAPIDefinition_JsonRpcVersion(t *testing.T) {
+	t.Run("json-rpc version field marshaling", func(t *testing.T) {
+		api := APIDefinition{
+			JsonRpcVersion: "2.0",
+		}
+
+		data, err := json.Marshal(api)
+		assert.NoError(t, err)
+
+		var result APIDefinition
+		err = json.Unmarshal(data, &result)
+		assert.NoError(t, err)
+
+		assert.Equal(t, "2.0", result.JsonRpcVersion)
+	})
+
+	t.Run("empty json-rpc version omitted", func(t *testing.T) {
+		api := APIDefinition{
+			JsonRpcVersion: "",
+		}
+
+		data, err := json.Marshal(api)
+		assert.NoError(t, err)
+
+		assert.NotContains(t, string(data), "json_rpc_version")
+	})
+
+	t.Run("json-rpc version persists through encode/decode", func(t *testing.T) {
+		api := APIDefinition{
+			JsonRpcVersion: "2.0",
+		}
+
+		api.EncodeForDB()
+		api.DecodeFromDB()
+
+		assert.Equal(t, "2.0", api.JsonRpcVersion)
+	})
+}
+
+// TestHardTimeoutMeta_DurationWireTag locks in the TT-17515 rename of the
+// granular enforced-timeout field from `timeout_duration` to `duration`.
+// The Go field name (TimeoutDuration) is unchanged; only the JSON/BSON tags moved.
+func TestHardTimeoutMeta_DurationWireTag(t *testing.T) {
+	t.Run("marshals to duration, not timeout_duration", func(t *testing.T) {
+		meta := HardTimeoutMeta{
+			Path:            "/get",
+			Method:          http.MethodGet,
+			TimeOut:         2,
+			TimeoutDuration: tyktime.ReadableDuration(1500 * time.Millisecond),
+		}
+
+		data, err := json.Marshal(meta)
+		assert.NoError(t, err)
+
+		assert.Contains(t, string(data), `"duration"`)
+		assert.NotContains(t, string(data), "timeout_duration")
+	})
+
+	t.Run("unmarshals the duration key", func(t *testing.T) {
+		var meta HardTimeoutMeta
+		err := json.Unmarshal([]byte(`{"path":"/get","method":"GET","timeout":2,"duration":"500ms"}`), &meta)
+		require.NoError(t, err)
+
+		assert.Equal(t, 2, meta.TimeOut)
+		assert.Equal(t, tyktime.ReadableDuration(500*time.Millisecond), meta.TimeoutDuration)
+	})
+
+	t.Run("empty duration omitted", func(t *testing.T) {
+		data, err := json.Marshal(HardTimeoutMeta{Path: "/get", Method: http.MethodGet, TimeOut: 3})
+		assert.NoError(t, err)
+
+		assert.NotContains(t, string(data), "duration")
+	})
+}
+
+func TestAPIDefinition_ApplicationProtocol(t *testing.T) {
+	t.Run("application protocol field marshaling", func(t *testing.T) {
+		api := APIDefinition{
+			ApplicationProtocol: AppProtocolMCP,
+		}
+
+		data, err := json.Marshal(api)
+		assert.NoError(t, err)
+
+		var result APIDefinition
+		err = json.Unmarshal(data, &result)
+		assert.NoError(t, err)
+
+		assert.Equal(t, AppProtocolMCP, result.ApplicationProtocol)
+	})
+
+	t.Run("empty application protocol omitted", func(t *testing.T) {
+		api := APIDefinition{
+			ApplicationProtocol: "",
+		}
+
+		data, err := json.Marshal(api)
+		assert.NoError(t, err)
+
+		assert.NotContains(t, string(data), "application_protocol")
+	})
+
+	t.Run("application protocol persists through encode/decode", func(t *testing.T) {
+		api := APIDefinition{
+			ApplicationProtocol: AppProtocolMCP,
+		}
+
+		api.EncodeForDB()
+		api.DecodeFromDB()
+
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+	})
+
+	t.Run("supports custom protocols", func(t *testing.T) {
+		customProtocol := "a2a"
+		api := APIDefinition{
+			ApplicationProtocol: customProtocol,
+		}
+
+		data, err := json.Marshal(api)
+		assert.NoError(t, err)
+
+		var result APIDefinition
+		err = json.Unmarshal(data, &result)
+		assert.NoError(t, err)
+
+		assert.Equal(t, customProtocol, result.ApplicationProtocol)
+	})
+}
+
+func TestAPIDefinition_SetProtocol(t *testing.T) {
+	t.Run("sets transport and application protocol", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.SetProtocol(JsonRPC20, AppProtocolMCP)
+
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("IsMCP method returns correct value based on application protocol", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.SetProtocol(JsonRPC20, AppProtocolMCP)
+		assert.True(t, api.IsMCP())
+
+		api.SetProtocol(JsonRPC20, "a2a")
+		assert.False(t, api.IsMCP())
+
+		api.SetProtocol(JsonRPC20, AppProtocolMCP)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("overwrites existing values", func(t *testing.T) {
+		api := APIDefinition{
+			JsonRpcVersion:      "1.0",
+			ApplicationProtocol: "old",
+		}
+
+		api.SetProtocol(JsonRPC20, AppProtocolMCP)
+
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("allows empty application protocol", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.SetProtocol(JsonRPC20, "")
+
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, "", api.ApplicationProtocol)
+		assert.False(t, api.IsMCP())
+	})
+
+	t.Run("allows empty transport protocol", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.SetProtocol("", "custom")
+
+		assert.Equal(t, "", api.JsonRpcVersion)
+		assert.Equal(t, "custom", api.ApplicationProtocol)
+		assert.False(t, api.IsMCP())
+	})
+}
+
+func TestAPIDefinition_MarkAsMCP(t *testing.T) {
+	t.Run("marks API as MCP", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.MarkAsMCP()
+
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("overwrites existing values", func(t *testing.T) {
+		api := APIDefinition{
+			JsonRpcVersion:      "1.0",
+			ApplicationProtocol: "old",
+		}
+
+		api.MarkAsMCP()
+
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("is idempotent", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.MarkAsMCP()
+		api.MarkAsMCP()
+		api.MarkAsMCP()
+
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("does not affect other fields", func(t *testing.T) {
+		api := APIDefinition{
+			Name:  "test-api",
+			APIID: "123",
+			Slug:  "test",
+		}
+
+		api.MarkAsMCP()
+
+		assert.Equal(t, "test-api", api.Name)
+		assert.Equal(t, "123", api.APIID)
+		assert.Equal(t, "test", api.Slug)
+		assert.Equal(t, JsonRPC20, api.JsonRpcVersion)
+		assert.Equal(t, AppProtocolMCP, api.ApplicationProtocol)
+		assert.True(t, api.IsMCP())
+	})
+
+	t.Run("uses SetProtocol internally", func(t *testing.T) {
+		api := APIDefinition{}
+
+		api.MarkAsMCP()
+
+		// Verify it's equivalent to calling SetProtocol with MCP constants
+		expected := APIDefinition{}
+		expected.SetProtocol(JsonRPC20, AppProtocolMCP)
+
+		assert.Equal(t, expected.JsonRpcVersion, api.JsonRpcVersion)
+		assert.Equal(t, expected.ApplicationProtocol, api.ApplicationProtocol)
+		assert.Equal(t, expected.IsMCP(), api.IsMCP())
+	})
+}
+
+func TestAPIDefinition_IsPairedMCPAdapterProxy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		{
+			name:   "canonical mcp path target",
+			target: "tyk://rest-1/mcp",
+			want:   true,
+		},
+		{
+			name:   "id-prefixed mcp path target",
+			target: "tyk://id:rest-1/mcp/",
+			want:   true,
+		},
+		{
+			name:   "fallback suffix target",
+			target: "tyk://rest-1__mcp-server",
+			want:   true,
+		},
+		{
+			name:   "non mcp path target",
+			target: "tyk://rest-1/not-mcp",
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			api := &APIDefinition{Proxy: ProxyConfig{TargetURL: tt.target}}
+
+			assert.Equal(t, tt.want, api.IsPairedMCPAdapterProxy())
+		})
+	}
+}
+
+func TestSchema(t *testing.T) {
+	schemaLoader := gojsonschema.NewBytesLoader([]byte(Schema))
+
+	spec := DummyAPI()
+	goLoader := gojsonschema.NewGoLoader(spec)
+	result, err := gojsonschema.Validate(schemaLoader, goLoader)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if !result.Valid() {
+		for _, err := range result.Errors() {
+			t.Error(err)
+		}
+	}
+}
+
+func TestSchema_SecurityRequirementScopes(t *testing.T) {
+	schemaLoader := gojsonschema.NewBytesLoader([]byte(Schema))
+
+	spec := DummyAPI()
+	spec.SecurityRequirementScopes = []map[string][]string{
+		{"jwt1": {}, "oauth2_scheme": {"read:pets", "write:pets"}},
+		{"oauth2_scheme": {"admin"}},
+	}
+
+	goLoader := gojsonschema.NewGoLoader(spec)
+	result, err := gojsonschema.Validate(schemaLoader, goLoader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !result.Valid() {
+		for _, e := range result.Errors() {
+			t.Error(e)
+		}
+	}
+}
+
+func TestSchema_GlobalEnforceTimeout(t *testing.T) {
+	schemaLoader := gojsonschema.NewBytesLoader([]byte(Schema))
+
+	setVersionTimeout := func(spec *APIDefinition, d tyktime.ReadableDuration, disabled bool) {
+		v := spec.VersionData.Versions["Default"]
+		v.GlobalEnforceTimeout = d
+		v.GlobalEnforceTimeoutDisabled = disabled
+		spec.VersionData.Versions["Default"] = v
+	}
+
+	t.Run("valid string duration passes schema", func(t *testing.T) {
+		spec := DummyAPI()
+		setVersionTimeout(&spec, tyktime.ReadableDuration(5*time.Second), false)
+
+		result, err := gojsonschema.Validate(schemaLoader, gojsonschema.NewGoLoader(spec))
+		require.NoError(t, err)
+		assert.True(t, result.Valid(), result.Errors())
+	})
+
+	t.Run("valid sub-second duration passes schema", func(t *testing.T) {
+		spec := DummyAPI()
+		setVersionTimeout(&spec, tyktime.ReadableDuration(500*time.Millisecond), false)
+
+		result, err := gojsonschema.Validate(schemaLoader, gojsonschema.NewGoLoader(spec))
+		require.NoError(t, err)
+		assert.True(t, result.Valid(), result.Errors())
+	})
+
+	t.Run("disabled flag passes schema", func(t *testing.T) {
+		spec := DummyAPI()
+		setVersionTimeout(&spec, tyktime.ReadableDuration(5*time.Second), true)
+
+		result, err := gojsonschema.Validate(schemaLoader, gojsonschema.NewGoLoader(spec))
+		require.NoError(t, err)
+		assert.True(t, result.Valid(), result.Errors())
+	})
+}
+
+func TestSchema_DNSDiscovery(t *testing.T) {
+	schemaLoader := gojsonschema.NewBytesLoader([]byte(Schema))
+
+	validate := func(t *testing.T, dnsDiscovery string) *gojsonschema.Result {
+		t.Helper()
+
+		spec := DummyAPI()
+		data, err := json.Marshal(spec)
+		require.NoError(t, err)
+
+		var doc map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &doc))
+
+		var proxy map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(doc["proxy"], &proxy))
+		proxy["dns_discovery"] = json.RawMessage(dnsDiscovery)
+
+		doc["proxy"], err = json.Marshal(proxy)
+		require.NoError(t, err)
+		data, err = json.Marshal(doc)
+		require.NoError(t, err)
+
+		result, err := gojsonschema.Validate(schemaLoader, gojsonschema.NewBytesLoader(data))
+		require.NoError(t, err)
+		return result
+	}
+
+	t.Run("default definition passes schema", func(t *testing.T) {
+		spec := DummyAPI()
+		spec.Proxy.DNSDiscovery = DNSDiscoveryConfig{
+			Enabled:            true,
+			RefreshInterval:    tyktime.ReadableDuration(10 * time.Second),
+			ConnectionDraining: &ConnectionDrainingConfig{Enabled: true},
+		}
+
+		result, err := gojsonschema.Validate(schemaLoader, gojsonschema.NewGoLoader(spec))
+		require.NoError(t, err)
+		assert.True(t, result.Valid(), result.Errors())
+	})
+
+	validCases := map[string]string{
+		"valid durations": `{"enabled": true, "refresh_interval": "10s", "stale_ttl": "2m", "connection_draining": {"enabled": true, "timeout": "1m30s"}}`,
+		"empty durations": `{"enabled": true, "refresh_interval": "", "stale_ttl": "", "connection_draining": {"enabled": true, "timeout": ""}}`,
+		"zero durations":  `{"enabled": true, "refresh_interval": "0s", "stale_ttl": "0s"}`,
+		"null block":      `null`,
+	}
+
+	for name, dnsDiscovery := range validCases {
+		t.Run(name+" pass schema", func(t *testing.T) {
+			result := validate(t, dnsDiscovery)
+			assert.True(t, result.Valid(), result.Errors())
+		})
+	}
+
+	invalidCases := map[string]struct {
+		dnsDiscovery string
+		field        string
+	}{
+		"malformed refresh_interval": {
+			dnsDiscovery: `{"enabled": true, "refresh_interval": "invalid"}`,
+			field:        "proxy.dns_discovery.refresh_interval",
+		},
+		"negative stale_ttl": {
+			dnsDiscovery: `{"enabled": true, "stale_ttl": "-10s"}`,
+			field:        "proxy.dns_discovery.stale_ttl",
+		},
+		"malformed connection_draining.timeout": {
+			dnsDiscovery: `{"enabled": true, "connection_draining": {"enabled": true, "timeout": "30sec"}}`,
+			field:        "proxy.dns_discovery.connection_draining.timeout",
+		},
+		"non-string refresh_interval": {
+			dnsDiscovery: `{"enabled": true, "refresh_interval": 10}`,
+			field:        "proxy.dns_discovery.refresh_interval",
+		},
+	}
+
+	for name, tc := range invalidCases {
+		t.Run(name+" fails schema", func(t *testing.T) {
+			result := validate(t, tc.dnsDiscovery)
+			require.False(t, result.Valid())
+			require.Len(t, result.Errors(), 1)
+			assert.Equal(t, tc.field, result.Errors()[0].Field())
+		})
+	}
+}
+
+func TestStringRegexMap(t *testing.T) {
+	var v StringRegexMap
+	assert.True(t, v.Empty())
+
+	v = StringRegexMap{MatchPattern: ".*"}
+	assert.False(t, v.Empty())
+
+	v = StringRegexMap{Reverse: true}
+	assert.False(t, v.Empty())
+}
+
+func TestRoutingTriggerOptions(t *testing.T) {
+	opts := NewRoutingTriggerOptions()
+
+	assert.NotNil(t, opts.HeaderMatches)
+	assert.NotNil(t, opts.QueryValMatches)
+	assert.NotNil(t, opts.PathPartMatches)
+	assert.NotNil(t, opts.SessionMetaMatches)
+	assert.NotNil(t, opts.RequestContextMatches)
+	assert.Empty(t, opts.PayloadMatches)
+}
+
+func TestEncodeForDB(t *testing.T) {
+	t.Run("EncodeForDB persist schema objects from extended path", func(t *testing.T) {
+		spec := DummyAPI()
+		spec.EncodeForDB()
+		var schemaNotEmpty bool
+		for _, version := range spec.VersionData.Versions {
+			for _, validateObj := range version.ExtendedPaths.ValidateJSON {
+				schemaNotEmpty = schemaNotEmpty || (validateObj.Schema != nil)
+			}
+		}
+		assert.True(t, schemaNotEmpty, "expected EncodeForDB to persist schema objects")
+	})
+}
+
+func TestDecodeFromDB(t *testing.T) {
+	t.Run("json schema validation middleware", func(t *testing.T) {
+		apiDef := DummyAPI()
+		var (
+			bodySchema map[string]interface{}
+			v1         = "v1"
+			v1B64      = base64.StdEncoding.EncodeToString([]byte(v1))
+		)
+		err := json.Unmarshal([]byte(`{"$schema":"http://json-schema.org/draft-04/schema#","properties":{"id":{"type":"integer"}},"required":["id"],"type":"object"}`),
+			&bodySchema)
+		assert.NoError(t, err)
+		apiDef.VersionData.Versions[v1] = VersionInfo{
+			ExtendedPaths: ExtendedPathsSet{
+				ValidateJSON: []ValidatePathMeta{
+					{
+						Path:   "/",
+						Method: http.MethodPost,
+						Schema: bodySchema,
+					},
+				},
+			},
+		}
+		apiDef.EncodeForDB()
+		copyAPIDef := apiDef
+		copyAPIDef.DecodeFromDB()
+
+		assert.Equal(t, apiDef.VersionData.Versions[v1B64].ExtendedPaths.ValidateJSON[0].Schema,
+			copyAPIDef.VersionData.Versions[v1].ExtendedPaths.ValidateJSON[0].Schema)
+		assert.Empty(t, copyAPIDef.VersionData.Versions[v1].ExtendedPaths.ValidateJSON[0].SchemaB64)
+	})
+}
+
+func TestSchemaGraphqlConfig(t *testing.T) {
+	schemaLoader := gojsonschema.NewBytesLoader([]byte(Schema))
+
+	spec := DummyAPI()
+	spec.GraphQL.ExecutionMode = ""
+
+	goLoader := gojsonschema.NewGoLoader(spec)
+
+	result, err := gojsonschema.Validate(schemaLoader, goLoader)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if !result.Valid() {
+		for _, err := range result.Errors() {
+			t.Error(err)
+		}
+	}
+}
+
+func TestAPIDefinition_DecodeFromDB_AuthDeprecation(t *testing.T) {
+	const authHeader = "authorization"
+
+	spec := DummyAPI()
+	spec.Auth = AuthConfig{AuthHeaderName: authHeader}
+	spec.UseStandardAuth = true
+	spec.DecodeFromDB()
+
+	assert.Equal(t, spec.AuthConfigs, map[string]AuthConfig{
+		"authToken": spec.Auth,
+	})
+
+	spec.EnableJWT = true
+	spec.DecodeFromDB()
+
+	assert.Equal(t, spec.AuthConfigs, map[string]AuthConfig{
+		"authToken": spec.Auth,
+		"jwt":       spec.Auth,
+	})
+
+}
+
+func TestAPIDefinition_GenerateAPIID(t *testing.T) {
+	a := APIDefinition{}
+	a.GenerateAPIID()
+	assert.NotEmpty(t, a.APIID)
+}
+
+func TestAPIDefinition_ValidListenPath(t *testing.T) {
+	tests := []struct {
+		name       string
+		listenPath string
+		want       string
+	}{
+		{"empty", "", ""},
+		{"already has leading slash", "/foo", "/foo"},
+		{"missing leading slash", "foo", "/foo"},
+		{"root", "/", "/"},
+		{"env reference", "env://FOO", "env://FOO"},
+		{"secrets reference", "secrets://foo", "secrets://foo"},
+		{"consul reference", "consul://foo", "consul://foo"},
+		{"vault reference", "vault://secret/data/foo", "vault://secret/data/foo"},
+		{"file reference", "file:///etc/tyk/foo", "file:///etc/tyk/foo"},
+		{"env reference containing traversal is left untouched", "env://../FOO", "env://../FOO"},
+
+		// trailing slash is preserved, since it's significant for strict-route matching
+		{"trailing slash preserved", "/foo/", "/foo/"},
+		{"missing leading slash with trailing slash", "foo/", "/foo/"},
+
+		// "." / ".." segments are resolved
+		{"traversal to root", "..", "/"},
+		{"traversal to root with leading slash", "/..", "/"},
+		{"traversal above root collapses to root", "/../..", "/"},
+		{"traversal within path", "/foo/../bar", "/bar"},
+		{"traversal within path with trailing slash", "/foo/../bar/", "/bar/"},
+		{"traversal to root with trailing slash stays root", "/../", "/"},
+		{"current dir segment resolved", "/foo/./bar", "/foo/bar"},
+		{"trailing current dir segment resolved", "/foo/.", "/foo"},
+		{"duplicate slashes collapsed", "//foo//bar", "/foo/bar"},
+		{"traversal substring without dot segment is untouched", "/foo..bar", "/foo..bar"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &APIDefinition{}
+			a.Proxy.ListenPath = tt.listenPath
+			assert.Equal(t, tt.want, a.ValidListenPath())
+		})
+	}
+}
+
+func TestAPIDefinition_GetScopeClaimName(t *testing.T) {
+	var (
+		scopeName        = "scope"
+		oidcScopeName    = "oidc_scope"
+		newScopeName     = "new_scope"
+		newOIDCScopeName = "new_oidc_scope"
+	)
+
+	getAPIDef := func(deprecatedScopeName, jwtScopeName, oidcScopeName string, useOIDC bool) APIDefinition {
+		return APIDefinition{
+			UseOpenID:         useOIDC,
+			JWTScopeClaimName: deprecatedScopeName,
+			Scopes: Scopes{
+				JWT: ScopeClaim{
+					ScopeClaimName: jwtScopeName,
+				},
+				OIDC: ScopeClaim{
+					ScopeClaimName: oidcScopeName,
+				},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name                string
+		deprecatedScopeName string
+		jwtScopeName        string
+		oidcScopeName       string
+		useOIDC             bool
+		expectedScopeName   string
+	}{
+		{
+			name:                "jwt: only deprecated fields",
+			deprecatedScopeName: scopeName,
+			expectedScopeName:   scopeName,
+		},
+		{
+			name:              "jwt: only scopes.jwt",
+			jwtScopeName:      newScopeName,
+			expectedScopeName: newScopeName,
+		},
+		{
+			name:              "jwt: both scopes.jwt and scopes.oidc",
+			jwtScopeName:      newScopeName,
+			oidcScopeName:     newOIDCScopeName,
+			expectedScopeName: newScopeName,
+		},
+		{
+			name:                "jwt: deprecated field and jwt.scopes",
+			deprecatedScopeName: scopeName,
+			jwtScopeName:        newScopeName,
+			expectedScopeName:   newScopeName,
+		},
+
+		{
+			name:                "oidc: only deprecated fields",
+			deprecatedScopeName: oidcScopeName,
+			expectedScopeName:   oidcScopeName,
+			useOIDC:             true,
+		},
+		{
+			name:              "oidc: only scopes.oidc",
+			oidcScopeName:     newOIDCScopeName,
+			expectedScopeName: newOIDCScopeName,
+			useOIDC:           true,
+		},
+		{
+			name:              "oidc: both scopes.jwt and scopes.oidc",
+			jwtScopeName:      newScopeName,
+			oidcScopeName:     newOIDCScopeName,
+			expectedScopeName: newOIDCScopeName,
+			useOIDC:           true,
+		},
+		{
+			name:                "oidc: deprecated field and oidc.scopes",
+			deprecatedScopeName: oidcScopeName,
+			oidcScopeName:       newOIDCScopeName,
+			expectedScopeName:   newOIDCScopeName,
+			useOIDC:             true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			apiDef := getAPIDef(tc.deprecatedScopeName, tc.jwtScopeName, tc.oidcScopeName, tc.useOIDC)
+			assert.Equal(t, tc.expectedScopeName, apiDef.GetScopeClaimName())
+		})
+	}
+}
+
+func TestAPIDefinition_GetScopeToPolicyMapping(t *testing.T) {
+	var (
+		scopeToPolicyMapping        = map[string]string{"jwtClaim": "pol1"}
+		newScopeToPolicyMapping     = map[string]string{"jwtClaim1": "pol1"}
+		oidcScopeToPolicyMapping    = map[string]string{"oidcClaim": "pol1"}
+		newOIDCScopeToPolicyMapping = map[string]string{"oidcClaim1": "pol1"}
+	)
+
+	getAPIDef := func(deprecatedScopeToPolicy, jwtScopeToPolicy, oidcScopeToPolicy map[string]string, useOIDC bool) APIDefinition {
+		return APIDefinition{
+			UseOpenID:               useOIDC,
+			JWTScopeToPolicyMapping: deprecatedScopeToPolicy,
+			Scopes: Scopes{
+				JWT: ScopeClaim{
+					ScopeToPolicy: jwtScopeToPolicy,
+				},
+				OIDC: ScopeClaim{
+					ScopeToPolicy: oidcScopeToPolicy,
+				},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name                    string
+		deprecatedScopeToPolicy map[string]string
+		jwtScopeToPolicy        map[string]string
+		oidcScopeToPolicy       map[string]string
+		useOIDC                 bool
+		expectedScopeToPolicy   map[string]string
+	}{
+		{
+			name:                    "jwt: only deprecated fields",
+			deprecatedScopeToPolicy: scopeToPolicyMapping,
+			expectedScopeToPolicy:   scopeToPolicyMapping,
+		},
+		{
+			name:                  "jwt: only scopes.jwt",
+			jwtScopeToPolicy:      scopeToPolicyMapping,
+			expectedScopeToPolicy: scopeToPolicyMapping,
+		},
+		{
+			name:                  "jwt: both scopes.jwt and scopes.oidc",
+			jwtScopeToPolicy:      scopeToPolicyMapping,
+			oidcScopeToPolicy:     oidcScopeToPolicyMapping,
+			expectedScopeToPolicy: scopeToPolicyMapping,
+		},
+		{
+			name:                    "jwt: deprecated field and jwt.scopes",
+			deprecatedScopeToPolicy: scopeToPolicyMapping,
+			jwtScopeToPolicy:        newScopeToPolicyMapping,
+			expectedScopeToPolicy:   newScopeToPolicyMapping,
+		},
+
+		{
+			name:                    "oidc: only deprecated fields",
+			deprecatedScopeToPolicy: oidcScopeToPolicyMapping,
+			expectedScopeToPolicy:   oidcScopeToPolicyMapping,
+			useOIDC:                 true,
+		},
+		{
+			name:                  "oidc: only scopes.oidc",
+			oidcScopeToPolicy:     newOIDCScopeToPolicyMapping,
+			expectedScopeToPolicy: newOIDCScopeToPolicyMapping,
+			useOIDC:               true,
+		},
+		{
+			name:                  "oidc: both scopes.jwt and scopes.oidc",
+			jwtScopeToPolicy:      scopeToPolicyMapping,
+			oidcScopeToPolicy:     oidcScopeToPolicyMapping,
+			expectedScopeToPolicy: oidcScopeToPolicyMapping,
+			useOIDC:               true,
+		},
+		{
+			name:                    "oidc: deprecated field and oidc.scopes",
+			deprecatedScopeToPolicy: oidcScopeToPolicyMapping,
+			oidcScopeToPolicy:       newOIDCScopeToPolicyMapping,
+			expectedScopeToPolicy:   newOIDCScopeToPolicyMapping,
+			useOIDC:                 true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			apiDef := getAPIDef(tc.deprecatedScopeToPolicy, tc.jwtScopeToPolicy, tc.oidcScopeToPolicy, tc.useOIDC)
+			assert.Equal(t, tc.expectedScopeToPolicy, apiDef.GetScopeToPolicyMapping())
+		})
+	}
+
+}
+
+func TestJSVMEventHandlerConf_Scan(t *testing.T) {
+	jsvmEventMeta := map[string]any{
+		"disabled": true,
+		"id":       "1234",
+		"name":     "myMethod",
+		"path":     "my_script.js",
+	}
+
+	expected := JSVMEventHandlerConf{
+		Disabled:   true,
+		ID:         "1234",
+		MethodName: "myMethod",
+		Path:       "my_script.js",
+	}
+
+	var jsvmEventConf JSVMEventHandlerConf
+	err := jsvmEventConf.Scan(jsvmEventMeta)
+
+	assert.NoError(t, err)
+	assert.Equal(t, expected, jsvmEventConf)
+}
+
+func TestLogEventHandlerConf_Scan(t *testing.T) {
+	logEventMeta := map[string]any{
+		"disabled": true,
+		"prefix":   "AuthFailureEvent",
+	}
+
+	expected := LogEventHandlerConf{
+		Disabled: true,
+		Prefix:   "AuthFailureEvent",
+	}
+
+	var logEventConf LogEventHandlerConf
+	err := logEventConf.Scan(logEventMeta)
+
+	assert.NoError(t, err)
+	assert.Equal(t, expected, logEventConf)
+}
+
+func TestAPIDefinition_IsChildAPI(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      APIDefinition
+		expected bool
+	}{
+		{
+			name: "child API - BaseID set and different from APIID",
+			api: APIDefinition{
+				APIID: "child-api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID: "base-api-456",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "not a child - BaseID empty",
+			api: APIDefinition{
+				APIID: "standalone-api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID: "",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "not a child - BaseID equals APIID (base API)",
+			api: APIDefinition{
+				APIID: "base-api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID: "base-api-123",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "not a child - no version definition",
+			api: APIDefinition{
+				APIID:             "api-123",
+				VersionDefinition: VersionDefinition{},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.api.IsChildAPI()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestAPIDefinition_IsBaseAPI(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      APIDefinition
+		expected bool
+	}{
+		{
+			name: "base API - has versions and no BaseID",
+			api: APIDefinition{
+				APIID: "base-api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID: "",
+					Versions: map[string]string{
+						"v1": "child-api-1",
+						"v2": "child-api-2",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "base API - has versions and BaseID equals APIID",
+			api: APIDefinition{
+				APIID: "base-api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID: "base-api-123",
+					Versions: map[string]string{
+						"v1": "child-api-1",
+						"v2": "child-api-2",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "not a base API - no versions",
+			api: APIDefinition{
+				APIID: "api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID:   "",
+					Versions: map[string]string{},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "not a base API - is a child (BaseID different from APIID)",
+			api: APIDefinition{
+				APIID: "child-api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID: "base-api-456",
+					Versions: map[string]string{
+						"v1": "child-api-123",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "not a base API - nil versions",
+			api: APIDefinition{
+				APIID: "api-123",
+				VersionDefinition: VersionDefinition{
+					BaseID:   "",
+					Versions: nil,
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.api.IsBaseAPI()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestAPIDefinition_ErrorOverrides_UnmarshalJSON(t *testing.T) {
+	t.Run("basic error override", func(t *testing.T) {
+		jsonData := []byte(`{
+		  "name": "Test API Override Upstream",
+		  "api_id": "test-api-override-upstream",
+		  "org_id": "default",
+		  "use_keyless": true,
+		  "error_overrides_disabled": false,
+		  "error_overrides": {
+			"404": [
+			  {
+				"response": {
+				  "status_code": 420,
+				  "body": "{\"error\": \"api_level_upstream\", \"status\": 404}",
+				  "headers": {
+					"X-Error-Flag": "UPSTREAM-API",
+					"X-Override-Applied": "true"
+				  }
+				}
+			  }
+			]
+		  }
+	    }`)
+
+		var api APIDefinition
+		err := json.Unmarshal(jsonData, &api)
+		require.NoError(t, err)
+
+		require.NotNil(t, api.ErrorOverrides)
+		require.Len(t, api.ErrorOverrides["404"], 1)
+		assert.Equal(t, 420, api.ErrorOverrides["404"][0].Response.StatusCode)
+		assert.False(t, api.ErrorOverridesDisabled)
+	})
+
+	t.Run("complete error override with all fields", func(t *testing.T) {
+		jsonData := []byte(`{
+		  "name": "Test API Complete Override",
+		  "api_id": "test-api-complete-override",
+		  "org_id": "default",
+		  "use_keyless": true,
+		  "error_overrides_disabled": false,
+		  "error_overrides": {
+			"500": [
+			  {
+				"match": {
+				  "flag": "TLE",
+				  "message_pattern": "timeout.*error",
+				  "body_field": "error.type",
+				  "body_value": "timeout"
+				},
+				"response": {
+				  "status_code": 503,
+				  "body": "{\"error\": \"Certificate expired\", \"retry_after\": 30}",
+				  "message": "Custom timeout error message",
+				  "template": "error_template.html",
+				  "headers": {
+					"X-Custom-Error": "TIMEOUT",
+					"Retry-After": "30",
+					"Content-Type": "application/json"
+				  }
+				}
+			  }
+			],
+			"401": [
+			  {
+				"match": {
+				  "flag": "TLI",
+				  "body_field": "error.code",
+				  "body_value": "INVALID_TOKEN"
+				},
+				"response": {
+				  "status_code": 401,
+				  "body": "{\"error\": \"Certificate invalid\"}",
+				  "message": "Token validation failed",
+				  "headers": {
+					"WWW-Authenticate": "Bearer",
+					"X-Auth-Error": "true"
+				  }
+				}
+			  }
+			]
+		  }
+	    }`)
+
+		var api APIDefinition
+		err := json.Unmarshal(jsonData, &api)
+		require.NoError(t, err)
+
+		require.NotNil(t, api.ErrorOverrides)
+		require.False(t, api.ErrorOverridesDisabled)
+		require.Len(t, api.ErrorOverrides, 2)
+
+		require.Len(t, api.ErrorOverrides["500"], 1)
+		override500 := api.ErrorOverrides["500"][0]
+
+		require.NotNil(t, override500.Match)
+		assert.Equal(t, errors.TLE, override500.Match.Flag)
+		assert.Equal(t, "timeout.*error", override500.Match.MessagePattern)
+		assert.Equal(t, "error.type", override500.Match.BodyField)
+		assert.Equal(t, "timeout", override500.Match.BodyValue)
+
+		assert.Equal(t, 503, override500.Response.StatusCode)
+		assert.Equal(t, "{\"error\": \"Certificate expired\", \"retry_after\": 30}", override500.Response.Body)
+		assert.Equal(t, "Custom timeout error message", override500.Response.Message)
+		assert.Equal(t, "error_template.html", override500.Response.Template)
+		require.Len(t, override500.Response.Headers, 3)
+		assert.Equal(t, "TIMEOUT", override500.Response.Headers["X-Custom-Error"])
+		assert.Equal(t, "30", override500.Response.Headers["Retry-After"])
+		assert.Equal(t, "application/json", override500.Response.Headers["Content-Type"])
+
+		require.Len(t, api.ErrorOverrides["401"], 1)
+		override401 := api.ErrorOverrides["401"][0]
+
+		require.NotNil(t, override401.Match)
+		assert.Equal(t, errors.TLI, override401.Match.Flag)
+		assert.Equal(t, "", override401.Match.MessagePattern)
+		assert.Equal(t, "error.code", override401.Match.BodyField)
+		assert.Equal(t, "INVALID_TOKEN", override401.Match.BodyValue)
+
+		assert.Equal(t, 401, override401.Response.StatusCode)
+		assert.Equal(t, "{\"error\": \"Certificate invalid\"}", override401.Response.Body)
+		assert.Equal(t, "Token validation failed", override401.Response.Message)
+		assert.Equal(t, "", override401.Response.Template)
+		require.Len(t, override401.Response.Headers, 2)
+		assert.Equal(t, "Bearer", override401.Response.Headers["WWW-Authenticate"])
+		assert.Equal(t, "true", override401.Response.Headers["X-Auth-Error"])
+	})
+
+	t.Run("multiple overrides for same status code", func(t *testing.T) {
+		jsonData := []byte(`{
+		  "name": "Test API Multiple Overrides",
+		  "api_id": "test-api-multiple-overrides",
+		  "org_id": "default",
+		  "use_keyless": true,
+		  "error_overrides_disabled": true,
+		  "error_overrides": {
+			"400": [
+			  {
+				"match": {
+				  "body_field": "error.type",
+				  "body_value": "validation"
+				},
+				"response": {
+				  "status_code": 422,
+				  "body": "{\"error\": \"Validation failed\"}"
+				}
+			  },
+			  {
+				"match": {
+				  "body_field": "error.type",
+				  "body_value": "malformed"
+				},
+				"response": {
+				  "status_code": 400,
+				  "body": "{\"error\": \"Malformed request\"}"
+				}
+			  }
+			]
+		  }
+	    }`)
+
+		var api APIDefinition
+		err := json.Unmarshal(jsonData, &api)
+		require.NoError(t, err)
+
+		require.NotNil(t, api.ErrorOverrides)
+		require.True(t, api.ErrorOverridesDisabled)
+		require.Len(t, api.ErrorOverrides["400"], 2)
+
+		assert.Equal(t, "validation", api.ErrorOverrides["400"][0].Match.BodyValue)
+		assert.Equal(t, 422, api.ErrorOverrides["400"][0].Response.StatusCode)
+
+		assert.Equal(t, "malformed", api.ErrorOverrides["400"][1].Match.BodyValue)
+		assert.Equal(t, 400, api.ErrorOverrides["400"][1].Response.StatusCode)
+	})
+
+	t.Run("override without match criteria", func(t *testing.T) {
+		jsonData := []byte(`{
+		  "name": "Test API No Match Override",
+		  "api_id": "test-api-no-match-override",
+		  "org_id": "default",
+		  "use_keyless": true,
+		  "error_overrides_disabled": false,
+		  "error_overrides": {
+			"502": [
+			  {
+				"response": {
+				  "status_code": 503,
+				  "body": "{\"error\": \"Service unavailable\"}",
+				  "message": "Upstream service is down",
+				  "template": "maintenance.html",
+				  "headers": {
+					"X-Maintenance": "true"
+				  }
+				}
+			  }
+			]
+		  }
+	    }`)
+
+		var api APIDefinition
+		err := json.Unmarshal(jsonData, &api)
+		require.NoError(t, err)
+
+		require.NotNil(t, api.ErrorOverrides)
+		require.False(t, api.ErrorOverridesDisabled)
+		require.Len(t, api.ErrorOverrides["502"], 1)
+
+		override := api.ErrorOverrides["502"][0]
+		assert.Nil(t, override.Match)
+		assert.Equal(t, 503, override.Response.StatusCode)
+		assert.Equal(t, "{\"error\": \"Service unavailable\"}", override.Response.Body)
+		assert.Equal(t, "Upstream service is down", override.Response.Message)
+		assert.Equal(t, "maintenance.html", override.Response.Template)
+		assert.Equal(t, "true", override.Response.Headers["X-Maintenance"])
+	})
+
+	t.Run("empty error overrides", func(t *testing.T) {
+		jsonData := []byte(`{
+		  "name": "Test API Empty Overrides",
+		  "api_id": "test-api-empty-overrides",
+		  "org_id": "default",
+		  "use_keyless": true,
+		  "error_overrides": {}
+	    }`)
+
+		var api APIDefinition
+		err := json.Unmarshal(jsonData, &api)
+		require.NoError(t, err)
+
+		require.NotNil(t, api.ErrorOverrides)
+		require.False(t, api.ErrorOverridesDisabled)
+		assert.Len(t, api.ErrorOverrides, 0)
+	})
+
+	t.Run("nil error overrides", func(t *testing.T) {
+		jsonData := []byte(`{
+		  "name": "Test API Nil Overrides",
+		  "api_id": "test-api-nil-overrides",
+		  "org_id": "default",
+		  "use_keyless": true
+	    }`)
+
+		var api APIDefinition
+		err := json.Unmarshal(jsonData, &api)
+		require.NoError(t, err)
+
+		assert.Nil(t, api.ErrorOverrides)
+		require.False(t, api.ErrorOverridesDisabled)
+	})
+}
+
+func TestAPIDefinition_IsBaseAPIWithVersioning(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      APIDefinition
+		expected bool
+	}{
+		{
+			name: "base API with versioning - all conditions met",
+			api: APIDefinition{
+				APIID: "base-api-123",
+				VersionDefinition: VersionDefinition{
+					Enabled: true,
+					Name:    "v1",
+					BaseID:  "",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "base API with versioning - BaseID equals APIID",
+			api: APIDefinition{
+				APIID: "base-api-123",
+				VersionDefinition: VersionDefinition{
+					Enabled: true,
+					Name:    "v1",
+					BaseID:  "base-api-123",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "not versioned - Enabled is false",
+			api: APIDefinition{
+				APIID: "api-123",
+				VersionDefinition: VersionDefinition{
+					Enabled: false,
+					Name:    "v1",
+					BaseID:  "",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "not versioned - Name is empty",
+			api: APIDefinition{
+				APIID: "api-123",
+				VersionDefinition: VersionDefinition{
+					Enabled: true,
+					Name:    "",
+					BaseID:  "",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "is a child API - BaseID different from APIID",
+			api: APIDefinition{
+				APIID: "child-api-123",
+				VersionDefinition: VersionDefinition{
+					Enabled: true,
+					Name:    "v2",
+					BaseID:  "base-api-456",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "not versioned - all fields false/empty",
+			api: APIDefinition{
+				APIID: "api-123",
+				VersionDefinition: VersionDefinition{
+					Enabled: false,
+					Name:    "",
+					BaseID:  "",
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.api.IsBaseAPIWithVersioning()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestVersionDefinition_ResolvedDefault(t *testing.T) {
+	tests := []struct {
+		name     string
+		vd       VersionDefinition
+		expected string
+	}{
+		{
+			name: "resolves 'self' to actual version name",
+			vd: VersionDefinition{
+				Name:    "v1",
+				Default: Self,
+			},
+			expected: "v1",
+		},
+		{
+			name: "keeps specific version unchanged",
+			vd: VersionDefinition{
+				Name:    "v1",
+				Default: "v2",
+			},
+			expected: "v2",
+		},
+		{
+			name: "handles empty default",
+			vd: VersionDefinition{
+				Name:    "v1",
+				Default: "",
+			},
+			expected: "",
+		},
+		{
+			name: "handles empty name with self",
+			vd: VersionDefinition{
+				Name:    "",
+				Default: Self,
+			},
+			expected: "",
+		},
+		{
+			name: "handles both empty",
+			vd: VersionDefinition{
+				Name:    "",
+				Default: "",
+			},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.vd.ResolvedDefault()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

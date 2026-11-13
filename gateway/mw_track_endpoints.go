@@ -8,7 +8,7 @@ import (
 
 // TrackEndpointMiddleware sets context variables to enable or disable whether Tyk should record analytitcs for a specific path.
 type TrackEndpointMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (t *TrackEndpointMiddleware) Name() string {
@@ -16,12 +16,19 @@ func (t *TrackEndpointMiddleware) Name() string {
 }
 
 func (t *TrackEndpointMiddleware) EnabledForSpec() bool {
-	if !t.Spec.GlobalConfig.EnableAnalytics || t.Spec.DoNotTrack {
+	if t.Spec.DoNotTrack {
+		return false
+	}
+
+	analyticsEnabled := t.Spec.GlobalConfig.EnableAnalytics
+	metricsEnabled := t.Spec.GlobalConfig.OpenTelemetry.Metrics.Enabled != nil && *t.Spec.GlobalConfig.OpenTelemetry.Metrics.Enabled
+
+	if !analyticsEnabled && !metricsEnabled {
 		return false
 	}
 
 	for _, version := range t.Spec.VersionData.Versions {
-		if len(version.ExtendedPaths.TrackEndpoints) > 0 {
+		if len(version.ExtendedPaths.TrackEndpoints) > 0 || len(version.ExtendedPaths.DoNotTrackEndpoints) > 0 {
 			return true
 		}
 	}
@@ -31,7 +38,8 @@ func (t *TrackEndpointMiddleware) EnabledForSpec() bool {
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (t *TrackEndpointMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	_, versionPaths, _, _ := t.Spec.Version(r)
+	vInfo, _ := t.Spec.Version(r)
+	versionPaths := t.Spec.RxPaths[vInfo.Name]
 	foundTracked, metaTrack := t.Spec.CheckSpecMatchesStatus(r, versionPaths, RequestTracked)
 	if foundTracked {
 		ctxSetTrackedPath(r, metaTrack.(*apidef.TrackEndpointMeta).Path)

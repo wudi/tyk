@@ -2,23 +2,25 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"net/url"
-	"strings"
-	"time"
-	"unicode/utf8"
-
-	"github.com/sirupsen/logrus"
-
-	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/coprocess"
-	"github.com/TykTechnologies/tyk/user"
-
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/coprocess"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/middleware"
+	"github.com/TykTechnologies/tyk/user"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -28,7 +30,8 @@ var (
 
 // CoProcessMiddleware is the basic CP middleware struct.
 type CoProcessMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	HookType         coprocess.HookType
 	HookName         string
 	MiddlewareDriver apidef.MiddlewareDriver
@@ -42,16 +45,16 @@ func (m *CoProcessMiddleware) Name() string {
 }
 
 // CreateCoProcessMiddleware initializes a new CP middleware, takes hook type (pre, post, etc.), hook name ("my_hook") and driver ("python").
-func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwDriver apidef.MiddlewareDriver, baseMid BaseMiddleware) func(http.Handler) http.Handler {
+func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwDriver apidef.MiddlewareDriver, baseMid *BaseMiddleware) func(http.Handler) http.Handler {
 	dMiddleware := &CoProcessMiddleware{
 		BaseMiddleware:   baseMid,
 		HookType:         hookType,
 		HookName:         hookName,
 		MiddlewareDriver: mwDriver,
-		successHandler:   &SuccessHandler{baseMid},
+		successHandler:   &SuccessHandler{baseMid.Copy()},
 	}
 
-	return createMiddleware(dMiddleware)
+	return baseMid.Gw.createMiddleware(dMiddleware)
 }
 
 func DoCoprocessReload() {
@@ -69,7 +72,7 @@ type CoProcessor struct {
 }
 
 // BuildObject constructs a CoProcessObject from a given http.Request.
-func (c *CoProcessor) BuildObject(req *http.Request, res *http.Response) (*coprocess.Object, error) {
+func (c *CoProcessor) BuildObject(req *http.Request, res *http.Response, spec *APISpec) (*coprocess.Object, error) {
 	headers := ProtoMap(req.Header)
 
 	host := req.Host
@@ -123,7 +126,7 @@ func (c *CoProcessor) BuildObject(req *http.Request, res *http.Response) (*copro
 	// Append spec data:
 	if c.Middleware != nil {
 		configDataAsJSON := []byte("{}")
-		if len(c.Middleware.Spec.ConfigData) > 0 {
+		if shouldAddConfigData(c.Middleware.Spec) {
 			var err error
 			configDataAsJSON, err = json.Marshal(c.Middleware.Spec.ConfigData)
 			if err != nil {
@@ -131,10 +134,19 @@ func (c *CoProcessor) BuildObject(req *http.Request, res *http.Response) (*copro
 			}
 		}
 
+		bundleHash, err := c.Middleware.Gw.getHashedBundleName(spec.CustomMiddlewareBundle)
+		if err != nil {
+			return nil, err
+		}
+
 		object.Spec = map[string]string{
 			"OrgID":       c.Middleware.Spec.OrgID,
 			"APIID":       c.Middleware.Spec.APIID,
-			"config_data": string(configDataAsJSON),
+			"bundle_hash": bundleHash,
+		}
+
+		if shouldAddConfigData(c.Middleware.Spec) {
+			object.Spec["config_data"] = string(configDataAsJSON)
 		}
 	}
 
@@ -153,7 +165,15 @@ func (c *CoProcessor) BuildObject(req *http.Request, res *http.Response) (*copro
 			Headers: make(map[string]string, len(res.Header)),
 		}
 		for k, v := range res.Header {
+			// set univalue header
 			resObj.Headers[k] = v[0]
+
+			// set multivalue header
+			currentHeader := coprocess.Header{
+				Key:    k,
+				Values: v,
+			}
+			resObj.MultivalueHeaders = append(resObj.MultivalueHeaders, &currentHeader)
 		}
 		resObj.StatusCode = int32(res.StatusCode)
 		rawBody, err := ioutil.ReadAll(res.Body)
@@ -182,18 +202,18 @@ func (c *CoProcessor) ObjectPostProcess(object *coprocess.Object, r *http.Reques
 	for _, dh := range object.Request.DeleteHeaders {
 		r.Header.Del(dh)
 	}
-
+	ignoreCanonical := c.Middleware.Gw.GetConfig().IgnoreCanonicalMIMEHeaderKey
 	for h, v := range object.Request.SetHeaders {
-		r.Header.Set(h, v)
+		setCustomHeader(r.Header, h, v, ignoreCanonical)
 	}
 
-	values := r.URL.Query()
+	updatedValues := r.URL.Query()
 	for _, k := range object.Request.DeleteParams {
-		values.Del(k)
+		updatedValues.Del(k)
 	}
 
 	for p, v := range object.Request.AddParams {
-		values.Set(p, v)
+		updatedValues.Set(p, v)
 	}
 
 	parsedURL, err := url.ParseRequestURI(object.Request.Url)
@@ -222,14 +242,16 @@ func (c *CoProcessor) ObjectPostProcess(object *coprocess.Object, r *http.Reques
 		r.Method = object.Request.Method
 	}
 
-	r.URL.RawQuery = values.Encode()
+	if !reflect.DeepEqual(r.URL.Query(), updatedValues) {
+		r.URL.RawQuery = updatedValues.Encode()
+	}
 
 	return
 }
 
 // CoProcessInit creates a new CoProcessDispatcher, it will be called when Tyk starts.
-func CoProcessInit() {
-	if !config.Global().CoProcessOptions.EnableCoProcess {
+func (gw *Gateway) CoProcessInit() {
+	if !gw.GetConfig().CoProcessOptions.EnableCoProcess {
 		log.WithFields(logrus.Fields{
 			"prefix": "coprocess",
 		}).Info("Rich plugins are disabled")
@@ -237,9 +259,9 @@ func CoProcessInit() {
 	}
 
 	// Load gRPC dispatcher:
-	if config.Global().CoProcessOptions.CoProcessGRPCServer != "" {
+	if gw.GetConfig().CoProcessOptions.CoProcessGRPCServer != "" {
 		var err error
-		loadedDrivers[apidef.GrpcDriver], err = NewGRPCDispatcher()
+		loadedDrivers[apidef.GrpcDriver], err = gw.NewGRPCDispatcher()
 		if err == nil {
 			log.WithFields(logrus.Fields{
 				"prefix": "coprocess",
@@ -250,62 +272,60 @@ func CoProcessInit() {
 			}).WithError(err).Error("Couldn't load gRPC dispatcher")
 		}
 	}
+
 }
 
 // EnabledForSpec checks if this middleware should be enabled for a given API.
 func (m *CoProcessMiddleware) EnabledForSpec() bool {
-	if !config.Global().CoProcessOptions.EnableCoProcess {
+	if !m.Gw.GetConfig().CoProcessOptions.EnableCoProcess {
 		log.WithFields(logrus.Fields{
 			"prefix": "coprocess",
 		}).Error("Your API specifies a CP custom middleware, either Tyk wasn't build with CP support or CP is not enabled in your Tyk configuration file!")
 		return false
 	}
 
-	var supported bool
-	for _, driver := range supportedDrivers {
-		if m.Spec.CustomMiddleware.Driver == driver {
-			supported = true
-		}
-	}
-
-	if !supported {
-		log.WithFields(logrus.Fields{
-			"prefix": "coprocess",
-		}).Errorf("Unsupported driver '%s'", m.Spec.CustomMiddleware.Driver)
-		return false
-	}
-
-	if d, _ := loadedDrivers[m.Spec.CustomMiddleware.Driver]; d == nil {
-		log.WithFields(logrus.Fields{
-			"prefix": "coprocess",
-		}).Errorf("Driver '%s' isn't loaded", m.Spec.CustomMiddleware.Driver)
-		return false
-	}
-
 	log.WithFields(logrus.Fields{
 		"prefix": "coprocess",
 	}).Debug("Enabling CP middleware.")
-	m.successHandler = &SuccessHandler{m.BaseMiddleware}
+	m.successHandler = &SuccessHandler{m.BaseMiddleware.Copy()}
 	return true
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
+	// Skip global CoProcess plugins on self-looped requests (internal redirects) BEFORE driver validation.
+	// This prevents the plugin from executing multiple times during internal routing
+	// (e.g., VEM chain traversal, URL rewrites with tyk://self).
+	// CustomKeyCheck hooks must run on every request, so they're excluded from this check.
+	// Similar to auth middleware behavior (see mw_auth_key.go:124).
+	// Only applies to MCP proxies.
+	if m.Spec.IsMCP() && m.HookType != coprocess.HookType_CustomKeyCheck && httpctx.IsSelfLooping(r) {
+		return nil, http.StatusOK
+	}
+
+	errorCode, err := m.validateDriver()
+	if err != nil {
+		return err, errorCode
+	}
+
+	if m.HookType == coprocess.HookType_CustomKeyCheck {
+		if ctxGetRequestStatus(r) == StatusOkAndIgnore {
+			return nil, http.StatusOK
+		}
+	}
+
 	logger := m.Logger()
 	logger.Debug("CoProcess Request, HookType: ", m.HookType)
 	originalURL := r.URL
+	authToken, _ := m.getAuthToken(apidef.CoprocessType, r)
 
-	var extractor IdExtractor
-	if m.Spec.EnableCoProcessAuth && m.Spec.CustomMiddleware.IdExtractor.Extractor != nil {
-		extractor = m.Spec.CustomMiddleware.IdExtractor.Extractor.(IdExtractor)
-	}
+	extractor := getIDExtractor(m.Spec)
 
 	var returnOverrides ReturnOverrides
 	var sessionID string
 
 	if m.HookType == coprocess.HookType_CustomKeyCheck && extractor != nil {
 		sessionID, returnOverrides = extractor.ExtractAndCheck(r)
-
 		if returnOverrides.ResponseCode != 0 {
 			if returnOverrides.ResponseError == "" {
 				return nil, returnOverrides.ResponseCode
@@ -319,7 +339,7 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 		Middleware: m,
 	}
 
-	object, err := coProcessor.BuildObject(r, nil)
+	object, err := coProcessor.BuildObject(r, nil, m.Spec)
 	if err != nil {
 		logger.WithError(err).Error("Failed to build request object")
 		return errors.New("Middleware error"), 500
@@ -339,7 +359,7 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 	}
 
 	t1 := time.Now()
-	returnObject, err := coProcessor.Dispatch(object)
+	returnObject, err := coProcessor.Dispatch(r.Context(), object)
 	ms := DurationToMillisecond(time.Since(t1))
 
 	if err != nil {
@@ -382,7 +402,7 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 
 	// The CP middleware indicates this is a bad auth:
 	if returnObject.Request.ReturnOverrides.ResponseCode >= http.StatusBadRequest && !returnObject.Request.ReturnOverrides.OverrideError {
-		logger.WithField("key", obfuscateKey(token)).Info("Attempted access with invalid key")
+		logger.WithField("key", m.Gw.obfuscateKey(token)).Info("Attempted access with invalid key")
 
 		for h, v := range returnObject.Request.ReturnOverrides.Headers {
 			w.Header().Set(h, v)
@@ -419,12 +439,12 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 			ReadSeeker: strings.NewReader(returnObject.Request.ReturnOverrides.ResponseBody),
 		}
 		res.ContentLength = int64(len(returnObject.Request.ReturnOverrides.ResponseBody))
-		m.successHandler.RecordHit(r, Latency{Total: int64(ms)}, int(returnObject.Request.ReturnOverrides.ResponseCode), res)
-		return nil, mwStatusRespond
+		m.successHandler.RecordHit(r, analytics.Latency{Total: int64(ms), Upstream: 0, Gateway: int64(ms)}, int(returnObject.Request.ReturnOverrides.ResponseCode), res, false)
+		return nil, middleware.StatusRespond
 	}
 
 	// Is this a CP authentication middleware?
-	if m.Spec.EnableCoProcessAuth && m.HookType == coprocess.HookType_CustomKeyCheck {
+	if coprocessAuthEnabled(m.Spec) && m.HookType == coprocess.HookType_CustomKeyCheck {
 		if extractor == nil {
 			sessionID = token
 		}
@@ -444,22 +464,26 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 		}
 
 		returnedSession.OrgID = m.Spec.OrgID
+		// set a Key ID as default
+		returnedSession.KeyID = token
 
 		if err := m.ApplyPolicies(returnedSession); err != nil {
-			AuthFailed(m, r, r.Header.Get(m.Spec.Auth.AuthHeaderName))
+			AuthFailed(m, r, authToken)
 			return errors.New(http.StatusText(http.StatusForbidden)), http.StatusForbidden
 		}
 
-		existingSession, found := GlobalSessionManager.SessionDetail(m.Spec.OrgID, sessionID, false)
+		existingSession, found := m.Gw.GlobalSessionManager.SessionDetail(m.Spec.OrgID, sessionID, false)
 		if found {
 			returnedSession.QuotaRenews = existingSession.QuotaRenews
 			returnedSession.QuotaRemaining = existingSession.QuotaRemaining
 
 			for api := range returnedSession.AccessRights {
 				if _, found := existingSession.AccessRights[api]; found {
-					if returnedSession.AccessRights[api].Limit != nil {
-						returnedSession.AccessRights[api].Limit.QuotaRenews = existingSession.AccessRights[api].Limit.QuotaRenews
-						returnedSession.AccessRights[api].Limit.QuotaRemaining = existingSession.AccessRights[api].Limit.QuotaRemaining
+					if !returnedSession.AccessRights[api].Limit.IsEmpty() {
+						ar := returnedSession.AccessRights[api]
+						ar.Limit.QuotaRenews = existingSession.AccessRights[api].Limit.QuotaRenews
+						ar.Limit.QuotaRemaining = existingSession.AccessRights[api].Limit.QuotaRemaining
+						returnedSession.AccessRights[api] = ar
 					}
 				}
 			}
@@ -467,26 +491,72 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 
 		// Apply it second time to fix the quota
 		if err := m.ApplyPolicies(returnedSession); err != nil {
-			AuthFailed(m, r, r.Header.Get(m.Spec.Auth.AuthHeaderName))
+			AuthFailed(m, r, authToken)
 			return errors.New(http.StatusText(http.StatusForbidden)), http.StatusForbidden
 		}
 
-		ctxSetSession(r, returnedSession, sessionID, true)
+		returnedSession.KeyID = sessionID
+
+		switch m.Spec.BaseIdentityProvidedBy {
+		case apidef.CustomAuth, apidef.UnsetAuth:
+			ctxSetSession(r, returnedSession, true, m.Gw.GetConfig().HashKeys)
+		}
 	}
 
 	return nil, http.StatusOK
 }
 
+func (m *CoProcessMiddleware) validateDriver() (int, error) {
+	if !m.isDriverSupported() {
+		log.WithFields(logrus.Fields{
+			"prefix": "coprocess",
+		}).Errorf("Unsupported driver '%s'", m.Spec.CustomMiddleware.Driver)
+		respCode := http.StatusInternalServerError
+
+		return respCode, errors.New(http.StatusText(respCode))
+	}
+
+	if d := loadedDrivers[m.Spec.CustomMiddleware.Driver]; d == nil {
+		log.WithFields(logrus.Fields{
+			"prefix": "coprocess",
+		}).Errorf("Driver '%s' isn't loaded", m.Spec.CustomMiddleware.Driver)
+		respCode := http.StatusInternalServerError
+
+		return respCode, errors.New(http.StatusText(respCode))
+	}
+
+	return http.StatusOK, nil
+}
+
+func (m *CoProcessMiddleware) isDriverSupported() bool {
+	for _, driver := range supportedDrivers {
+		if m.Spec.CustomMiddleware.Driver == driver {
+			return true
+		}
+	}
+
+	return false
+}
+
 type CustomMiddlewareResponseHook struct {
+	BaseTykResponseHandler
 	mw *CoProcessMiddleware
+}
+
+func (h CustomMiddlewareResponseHook) Base() *BaseTykResponseHandler {
+	return &h.BaseTykResponseHandler
 }
 
 func (h *CustomMiddlewareResponseHook) Init(mwDef interface{}, spec *APISpec) error {
 	mwDefinition := mwDef.(apidef.MiddlewareDefinition)
+
+	baseMid := &BaseMiddleware{
+		Spec: spec,
+		Gw:   h.Gw,
+	}
+	baseMid.SetName("CoProcessMiddleware")
 	h.mw = &CoProcessMiddleware{
-		BaseMiddleware: BaseMiddleware{
-			Spec: spec,
-		},
+		BaseMiddleware:   baseMid,
 		HookName:         mwDefinition.Name,
 		HookType:         coprocess.HookType_Response,
 		RawBodyOnly:      mwDefinition.RawBodyOnly,
@@ -497,7 +567,7 @@ func (h *CustomMiddlewareResponseHook) Init(mwDef interface{}, spec *APISpec) er
 
 // getAuthType overrides BaseMiddleware.getAuthType.
 func (m *CoProcessMiddleware) getAuthType() string {
-	return coprocessType
+	return apidef.CoprocessType
 }
 
 func (h *CustomMiddlewareResponseHook) Name() string {
@@ -505,58 +575,143 @@ func (h *CustomMiddlewareResponseHook) Name() string {
 }
 
 func (h *CustomMiddlewareResponseHook) HandleError(rw http.ResponseWriter, req *http.Request) {
-	handler := ErrorHandler{h.mw.BaseMiddleware}
+	handler := ErrorHandler{h.mw.BaseMiddleware.Copy()}
 	handler.HandleError(rw, req, "Middleware error", http.StatusInternalServerError, true)
 }
 
 func (h *CustomMiddlewareResponseHook) HandleResponse(rw http.ResponseWriter, res *http.Response, req *http.Request, ses *user.SessionState) error {
-	log.WithFields(logrus.Fields{
+
+	h.logger().WithFields(logrus.Fields{
 		"prefix": "coprocess",
 	}).Debugf("Response hook '%s' is called", h.mw.Name())
+
 	coProcessor := CoProcessor{
 		Middleware: h.mw,
 	}
 
-	object, err := coProcessor.BuildObject(req, res)
+	object, err := coProcessor.BuildObject(req, res, h.mw.Spec)
 	if err != nil {
-		log.WithError(err).Debug("Couldn't build request object")
+		h.logger().WithError(err).Debug("Couldn't build request object")
 		return errors.New("Middleware error")
 	}
 	object.Session = ProtoSessionState(ses)
 
-	retObject, err := coProcessor.Dispatch(object)
+	retObject, err := coProcessor.Dispatch(req.Context(), object)
 	if err != nil {
-		log.WithError(err).Debug("Couldn't dispatch request object")
+		h.logger().WithError(err).Debug("Couldn't dispatch request object")
 		return errors.New("Middleware error")
 	}
 
 	if retObject.Response == nil {
-		log.WithError(err).Debug("No response object returned by response hook")
+		h.logger().WithError(err).Debug("No response object returned by response hook")
 		return errors.New("Middleware error")
 	}
 
+	// Clear all response headers before populating from coprocess response object:
+	for k := range res.Header {
+		delete(res.Header, k)
+	}
+
+	// check if we have changes in headers
+	if !areMapsEqual(object.Response.Headers, retObject.Response.Headers) {
+		// as we have changes we need to synchronize them
+		retObject.Response.MultivalueHeaders = syncHeadersAndMultiValueHeaders(retObject.Response.Headers, retObject.Response.MultivalueHeaders)
+	}
+
 	// Set headers:
-	for k, v := range retObject.Response.Headers {
-		res.Header.Set(k, v)
+	ignoreCanonical := h.mw.Gw.GetConfig().IgnoreCanonicalMIMEHeaderKey
+	for _, v := range retObject.Response.MultivalueHeaders {
+		setCustomHeaderMultipleValues(res.Header, v.Key, v.Values, ignoreCanonical)
 	}
 
 	// Set response body:
 	bodyBuf := bytes.NewBuffer(retObject.Response.RawBody)
 	res.Body = ioutil.NopCloser(bodyBuf)
 
+	//set response body length with the size of response body returned from the hook
+	//so that it is updated accordingly in the response object
+	responseBodyLen := len(retObject.Response.RawBody)
+	res.ContentLength = int64(responseBodyLen)
+	res.Header.Set("Content-Length", fmt.Sprintf("%d", responseBodyLen))
+
 	res.StatusCode = int(retObject.Response.StatusCode)
 	return nil
 }
 
-func (c *CoProcessor) Dispatch(object *coprocess.Object) (*coprocess.Object, error) {
+// syncHeadersAndMultiValueHeaders synchronizes the content of 'headers' and 'multiValueHeaders'.
+// If a key is updated or added in 'headers', the corresponding key in 'multiValueHeaders' is also updated or added.
+// If a key is removed from 'headers', the corresponding key in 'multiValueHeaders' is also removed.
+// If multiValuesHeaders contains a key with multiple values and the same key is present in headers, the first value in multiValuesHeaders is updated with the value from headers, while the remaining values remain unchanged.
+func syncHeadersAndMultiValueHeaders(headers map[string]string, multiValueHeaders []*coprocess.Header) []*coprocess.Header {
+	updatedMultiValueHeaders := []*coprocess.Header{}
+
+	for k, v := range headers {
+		found := false
+		for _, header := range multiValueHeaders {
+			if header.Key == k {
+				found = true
+
+				// if the key is present in multiValueHeaders, update the first value with the value from headers
+				if len(header.Values) > 0 {
+					header.Values[0] = v
+				}
+
+				break
+			}
+		}
+
+		if !found {
+			newHeader := &coprocess.Header{
+				Key:    k,
+				Values: []string{v},
+			}
+			updatedMultiValueHeaders = append(updatedMultiValueHeaders, newHeader)
+		}
+	}
+
+	// Append any existing headers that are still in the headers map
+	for _, header := range multiValueHeaders {
+		if _, ok := headers[header.Key]; ok {
+			updatedMultiValueHeaders = append(updatedMultiValueHeaders, header)
+		}
+	}
+
+	return updatedMultiValueHeaders
+}
+
+func (c *CoProcessor) Dispatch(ctx context.Context, object *coprocess.Object) (*coprocess.Object, error) {
 	dispatcher := loadedDrivers[c.Middleware.MiddlewareDriver]
 	if dispatcher == nil {
 		err := fmt.Errorf("Couldn't dispatch request, driver '%s' isn't available", c.Middleware.MiddlewareDriver)
 		return nil, err
 	}
-	newObject, err := dispatcher.Dispatch(object)
+	newObject, err := dispatcher.DispatchWithContext(ctx, object)
 	if err != nil {
 		return nil, err
 	}
 	return newObject, nil
+}
+
+func coprocessAuthEnabled(spec *APISpec) bool {
+	return spec.EnableCoProcessAuth || spec.CustomPluginAuthEnabled
+}
+
+func getIDExtractor(spec *APISpec) IdExtractor {
+	if !coprocessAuthEnabled(spec) {
+		return nil
+	}
+
+	if spec.CustomMiddleware.IdExtractor.Disabled {
+		return nil
+	}
+
+	if extractor, ok := spec.CustomMiddleware.IdExtractor.Extractor.(IdExtractor); ok {
+		return extractor
+	}
+
+	return nil
+}
+
+func shouldAddConfigData(spec *APISpec) bool {
+	return !spec.ConfigDataDisabled && len(spec.ConfigData) > 0
 }

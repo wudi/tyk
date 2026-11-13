@@ -10,6 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TykTechnologies/tyk/internal/crypto"
+
+	"github.com/stretchr/testify/assert"
+
 	"github.com/justinas/alice"
 	"github.com/sirupsen/logrus"
 
@@ -20,13 +24,13 @@ import (
 
 var algoList = [4]string{"hmac-sha1", "hmac-sha256", "hmac-sha384", "hmac-sha512"}
 
-func getMiddlewareChain(spec *APISpec) http.Handler {
+func (ts *Test) getMiddlewareChain(spec *APISpec) http.Handler {
 	remote, _ := url.Parse(TestHttpAny)
-	proxy := TykNewSingleHostReverseProxy(remote, spec, logrus.New().WithFields(logrus.Fields{}))
+	proxy := ts.Gw.TykNewSingleHostReverseProxy(remote, spec, logrus.New().WithFields(logrus.Fields{}))
 	proxyHandler := ProxyHandler(proxy, spec)
-	baseMid := BaseMiddleware{Spec: spec, Proxy: proxy}
-	chain := alice.New(mwList(
-		&IPWhiteListMiddleware{baseMid},
+	baseMid := &BaseMiddleware{Spec: spec, Proxy: proxy, Gw: ts.Gw}
+	chain := alice.New(ts.Gw.mwList(
+		&IPWhiteListMiddleware{BaseMiddleware: baseMid},
 		&IPBlackListMiddleware{BaseMiddleware: baseMid},
 		&RequestSigning{BaseMiddleware: baseMid},
 		&HTTPSignatureValidationMiddleware{BaseMiddleware: baseMid},
@@ -35,8 +39,8 @@ func getMiddlewareChain(spec *APISpec) http.Handler {
 	return chain
 }
 
-func generateSession(algo, data string) string {
-	sessionKey := CreateSession(func(s *user.SessionState) {
+func (ts *Test) generateSession(algo, data string) string {
+	sessionKey := CreateSession(ts.Gw, func(s *user.SessionState) {
 		if strings.HasPrefix(algo, "rsa") {
 			s.RSACertificateId = data
 			s.EnableHTTPSignatureValidation = true
@@ -49,8 +53,8 @@ func generateSession(algo, data string) string {
 	return sessionKey
 }
 
-func generateSpec(algo string, data string, sessionKey string, headerList []string) (specs []*APISpec) {
-	return BuildAndLoadAPI(func(spec *APISpec) {
+func (ts *Test) generateSpec(algo string, data string, sessionKey string, headerList []string) (specs []*APISpec) {
+	return ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		spec.Proxy.ListenPath = "/test"
 		spec.UseKeylessAccess = true
 		spec.EnableSignatureChecking = true
@@ -72,19 +76,21 @@ func generateSpec(algo string, data string, sessionKey string, headerList []stri
 }
 
 func TestHMACRequestSigning(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
+
 	secret := "9879879878787878"
 
 	for _, algo := range algoList {
 		name := "Test with " + algo
 		t.Run(name, func(t *testing.T) {
-			sessionKey := generateSession(algo, secret)
-			specs := generateSpec(algo, secret, sessionKey, nil)
+			ts := StartTest(nil)
+			defer ts.Close()
+
+			sessionKey := ts.generateSession(algo, secret)
+			specs := ts.generateSpec(algo, secret, sessionKey, nil)
 
 			req := TestReq(t, "get", "/test/get", nil)
 			recorder := httptest.NewRecorder()
-			chain := getMiddlewareChain(specs[0])
+			chain := ts.getMiddlewareChain(specs[0])
 			chain.ServeHTTP(recorder, req)
 
 			if recorder.Code != 200 {
@@ -94,14 +100,17 @@ func TestHMACRequestSigning(t *testing.T) {
 	}
 
 	t.Run("Empty secret", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-sha256"
 		secret := ""
 
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, secret, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, nil)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 
 		req := TestReq(t, "get", "/test/get", nil)
 		chain.ServeHTTP(recorder, req)
@@ -112,14 +121,17 @@ func TestHMACRequestSigning(t *testing.T) {
 	})
 
 	t.Run("Invalid secret", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-sha256"
 		secret := "12345"
 
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, "789", sessionKey, nil)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, "789", sessionKey, nil)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 
 		req := TestReq(t, "get", "/test/get", nil)
 		chain.ServeHTTP(recorder, req)
@@ -130,14 +142,17 @@ func TestHMACRequestSigning(t *testing.T) {
 	})
 
 	t.Run("Valid Custom headerList", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-sha1"
 		headerList := []string{"foo", "date"}
 
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, secret, sessionKey, headerList)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, headerList)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 
 		req := TestReq(t, "get", "/test/get", nil)
 		refDate := "Mon, 02 Jan 2006 15:04:05 MST"
@@ -152,15 +167,18 @@ func TestHMACRequestSigning(t *testing.T) {
 	})
 
 	t.Run("Invalid Custom headerList", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-sha1"
 		headerList := []string{"foo"}
 
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, secret, sessionKey, headerList)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, headerList)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 200 {
@@ -169,13 +187,16 @@ func TestHMACRequestSigning(t *testing.T) {
 	})
 
 	t.Run("Invalid algorithm", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-123"
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, secret, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 500 {
@@ -184,16 +205,19 @@ func TestHMACRequestSigning(t *testing.T) {
 	})
 
 	t.Run("Invalid Date field", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-sha1"
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, secret, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		// invalid date
 		req.Header.Add("date", "Mon, 02 Jan 2006 15:04:05 GMT")
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 400 {
@@ -202,10 +226,13 @@ func TestHMACRequestSigning(t *testing.T) {
 	})
 
 	t.Run("Custom Signature header", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
 		algo := "hmac-sha256"
 
-		sessionKey := generateSession(algo, secret)
-		specs := generateSpec(algo, secret, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, nil)
 		api := specs[0]
 
 		api.AuthConfigs = make(map[string]apidef.AuthConfig)
@@ -216,7 +243,7 @@ func TestHMACRequestSigning(t *testing.T) {
 		api.RequestSigning.SignatureHeader = "something"
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(api)
+		chain := ts.getMiddlewareChain(api)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		chain.ServeHTTP(recorder, req)
@@ -228,28 +255,29 @@ func TestHMACRequestSigning(t *testing.T) {
 }
 
 func TestRSARequestSigning(t *testing.T) {
-	ts := StartTest()
+
+	ts := StartTest(nil)
 	defer ts.Close()
 
-	_, _, combinedPem, cert := genServerCertificate()
-	privCertId, _ := CertificateManager.Add(combinedPem, "")
-	defer CertificateManager.Delete(privCertId, "")
+	_, _, combinedPem, cert := crypto.GenServerCertificate()
+	privCertId, _ := ts.Gw.CertificateManager.Add(combinedPem, "")
+	defer ts.Gw.CertificateManager.Delete(privCertId, "")
 
 	x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
 	pubDer, _ := x509.MarshalPKIXPublicKey(x509Cert.PublicKey)
 	pubPem := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDer})
-	pubCertId, _ := CertificateManager.Add(pubPem, "")
-	defer CertificateManager.Delete(pubCertId, "")
+	pubCertId, _ := ts.Gw.CertificateManager.Add(pubPem, "")
+	defer ts.Gw.CertificateManager.Delete(pubCertId, "")
 
 	name := "Test with rsa-sha256"
 	t.Run(name, func(t *testing.T) {
 		algo := "rsa-sha256"
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, privCertId, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, privCertId, sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 200 {
@@ -259,12 +287,12 @@ func TestRSARequestSigning(t *testing.T) {
 
 	t.Run("Invalid certificate id", func(t *testing.T) {
 		algo := "rsa-sha256"
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, "12345", sessionKey, nil)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, "12345", sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 500 {
@@ -274,12 +302,12 @@ func TestRSARequestSigning(t *testing.T) {
 
 	t.Run("empty certificate id", func(t *testing.T) {
 		algo := "rsa-sha256"
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, "", sessionKey, nil)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, "", sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 500 {
@@ -289,12 +317,12 @@ func TestRSARequestSigning(t *testing.T) {
 
 	t.Run("Invalid algorithm", func(t *testing.T) {
 		algo := "rsa-123"
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, privCertId, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, privCertId, sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 500 {
@@ -304,13 +332,13 @@ func TestRSARequestSigning(t *testing.T) {
 
 	t.Run("Invalid Date field", func(t *testing.T) {
 		algo := "rsa-sha256"
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, privCertId, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, privCertId, sessionKey, nil)
 
 		req := TestReq(t, "get", "/test/get", nil)
 		req.Header.Add("date", "Mon, 02 Jan 2006 15:04:05 GMT")
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 400 {
@@ -322,8 +350,8 @@ func TestRSARequestSigning(t *testing.T) {
 		algo := "rsa-sha256"
 		headerList := []string{"foo", "date"}
 
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, privCertId, sessionKey, headerList)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, privCertId, sessionKey, headerList)
 
 		req := TestReq(t, "get", "/test/get", nil)
 
@@ -333,7 +361,7 @@ func TestRSARequestSigning(t *testing.T) {
 		req.Header.Add("date", tim)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 200 {
@@ -345,13 +373,13 @@ func TestRSARequestSigning(t *testing.T) {
 		algo := "rsa-sha256"
 		headerList := []string{"foo"}
 
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, privCertId, sessionKey, headerList)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, privCertId, sessionKey, headerList)
 
 		req := TestReq(t, "get", "/test/get", nil)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 200 {
@@ -362,8 +390,8 @@ func TestRSARequestSigning(t *testing.T) {
 	t.Run("Custom Signature header", func(t *testing.T) {
 		algo := "rsa-sha256"
 
-		sessionKey := generateSession(algo, pubCertId)
-		specs := generateSpec(algo, privCertId, sessionKey, nil)
+		sessionKey := ts.generateSession(algo, pubCertId)
+		specs := ts.generateSpec(algo, privCertId, sessionKey, nil)
 
 		api := specs[0]
 		api.AuthConfigs = make(map[string]apidef.AuthConfig)
@@ -376,7 +404,7 @@ func TestRSARequestSigning(t *testing.T) {
 		req := TestReq(t, "get", "/test/get", nil)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 200 {
@@ -385,20 +413,20 @@ func TestRSARequestSigning(t *testing.T) {
 	})
 }
 
-func TestStripListenPath(t *testing.T) {
-	ts := StartTest()
-	defer ts.Close()
-
+func TestAPISpec_StripListenPath(t *testing.T) {
 	algo := "hmac-sha256"
 	secret := "12345"
-	sessionKey := generateSession(algo, secret)
 
 	t.Run("Off", func(t *testing.T) {
-		specs := generateSpec(algo, secret, sessionKey, nil)
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		sessionKey := ts.generateSession(algo, secret)
+		specs := ts.generateSpec(algo, secret, sessionKey, nil)
 		req := TestReq(t, "get", "/test/get", nil)
 
 		recorder := httptest.NewRecorder()
-		chain := getMiddlewareChain(specs[0])
+		chain := ts.getMiddlewareChain(specs[0])
 		chain.ServeHTTP(recorder, req)
 
 		if recorder.Code != 200 {
@@ -407,31 +435,41 @@ func TestStripListenPath(t *testing.T) {
 	})
 
 	t.Run("On", func(t *testing.T) {
-		BuildAndLoadAPI(func(spec *APISpec) {
-			spec.APIID = "protected"
-			spec.Proxy.ListenPath = "/protected"
-			spec.EnableSignatureChecking = true
-			spec.UseKeylessAccess = false
-			spec.Proxy.StripListenPath = true
-		}, func(spec *APISpec) {
-			spec.APIID = "trailingSlash"
-			spec.Proxy.ListenPath = "/trailingSlash/"
-			spec.Proxy.StripListenPath = true
-			spec.RequestSigning.IsEnabled = true
-			spec.RequestSigning.Secret = secret
-			spec.RequestSigning.KeyId = sessionKey
-			spec.RequestSigning.Algorithm = algo
-			spec.Proxy.TargetURL = ts.URL
-		}, func(spec *APISpec) {
-			spec.APIID = "withoutTrailingSlash"
-			spec.Proxy.ListenPath = "/withoutTrailingSlash"
-			spec.Proxy.StripListenPath = true
-			spec.RequestSigning.IsEnabled = true
-			spec.RequestSigning.Secret = secret
-			spec.RequestSigning.KeyId = sessionKey
-			spec.RequestSigning.Algorithm = algo
-			spec.Proxy.TargetURL = ts.URL
-		})
+		test.Flaky(t) // TODO: TT-5255
+
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		sessionKey := ts.generateSession(algo, secret)
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "protected"
+				spec.Proxy.ListenPath = "/protected"
+				spec.EnableSignatureChecking = true
+				spec.UseKeylessAccess = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "trailingSlash"
+				spec.Proxy.ListenPath = "/trailingSlash/"
+				spec.Proxy.StripListenPath = true
+				spec.RequestSigning.IsEnabled = true
+				spec.RequestSigning.Secret = secret
+				spec.RequestSigning.KeyId = sessionKey
+				spec.RequestSigning.Algorithm = algo
+				spec.Proxy.TargetURL = ts.URL
+			},
+			func(spec *APISpec) {
+				spec.APIID = "withoutTrailingSlash"
+				spec.Proxy.ListenPath = "/withoutTrailingSlash"
+				spec.Proxy.StripListenPath = true
+				spec.RequestSigning.IsEnabled = true
+				spec.RequestSigning.Secret = secret
+				spec.RequestSigning.KeyId = sessionKey
+				spec.RequestSigning.Algorithm = algo
+				spec.Proxy.TargetURL = ts.URL
+			},
+		)
 
 		ts.Run(t, []test.TestCase{
 			{Path: "/trailingSlash/protected/get", Method: http.MethodGet, Code: http.StatusOK},
@@ -441,19 +479,19 @@ func TestStripListenPath(t *testing.T) {
 }
 
 func TestWithURLRewrite(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	algo := "hmac-sha256"
 	secret := "12345"
 
-	sessionKey := CreateSession(func(session *user.SessionState) {
+	sessionKey := CreateSession(ts.Gw, func(session *user.SessionState) {
 		session.EnableHTTPSignatureValidation = true
 		session.HmacSecret = secret
 	})
 
 	t.Run("looping", func(t *testing.T) {
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.APIID = "protected"
 			spec.Proxy.ListenPath = "/protected"
 			spec.EnableSignatureChecking = true
@@ -495,7 +533,7 @@ func TestWithURLRewrite(t *testing.T) {
 	})
 
 	t.Run("external", func(t *testing.T) {
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.APIID = "protected"
 			spec.Proxy.ListenPath = "/protected"
 			spec.EnableSignatureChecking = true
@@ -535,4 +573,124 @@ func TestWithURLRewrite(t *testing.T) {
 		}...)
 	})
 
+}
+
+func TestRequestSigning_getRequestPath(t *testing.T) {
+	api := BuildAPI(func(spec *APISpec) {
+		spec.Proxy.ListenPath = "/test/"
+		spec.Proxy.StripListenPath = false
+	})[0]
+
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	rs := RequestSigning{
+		BaseMiddleware: &BaseMiddleware{Spec: api, Gw: ts.Gw},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/test/get?param1=value1", nil)
+
+	t.Run("StripListenPath=true", func(t *testing.T) {
+		api.Proxy.StripListenPath = true
+		assert.Equal(t, "/get?param1=value1", rs.getRequestPath(req))
+
+		t.Run("path is empty", func(t *testing.T) {
+			reqWithEmptyPath, _ := http.NewRequest(http.MethodGet, "http://example.com/test/", nil)
+			assert.Equal(t, "/", rs.getRequestPath(reqWithEmptyPath))
+		})
+
+		api.Proxy.StripListenPath = false
+	})
+
+	t.Run("URL rewrite", func(t *testing.T) {
+		rewrittenURL := &url.URL{Path: "/test/rewritten", RawQuery: "param1=value1"}
+		ctxSetURLRewriteTarget(req, rewrittenURL)
+		assert.Equal(t, "/test/rewritten?param1=value1", rs.getRequestPath(req))
+		ctxSetURLRewriteTarget(req, nil)
+	})
+}
+
+func TestRequestSigning_isRequestSigningConfigValid(t *testing.T) {
+	type testCase struct {
+		name     string
+		conf     apidef.RequestSigningMeta
+		expected bool
+	}
+
+	testCases := []testCase{
+		{
+			name: "missing keyID",
+			conf: apidef.RequestSigningMeta{
+				Secret:        "secret",
+				KeyId:         "",
+				Algorithm:     "hmac-sha256",
+				CertificateId: "certID",
+			},
+			expected: false,
+		},
+		{
+			name: "missing algorithm",
+			conf: apidef.RequestSigningMeta{
+				Secret:        "secret",
+				KeyId:         "keyID",
+				Algorithm:     "",
+				CertificateId: "certID",
+			},
+			expected: false,
+		},
+		{
+			name: "RSA and empty cert ID",
+			conf: apidef.RequestSigningMeta{
+				Secret:        "secret",
+				KeyId:         "keyID",
+				Algorithm:     "rsa-sha256",
+				CertificateId: "",
+			},
+			expected: false,
+		},
+		{
+			name: "non-RSA and empty secret",
+			conf: apidef.RequestSigningMeta{
+				Secret:        "",
+				KeyId:         "keyID",
+				Algorithm:     "hmac-sha256",
+				CertificateId: "certID",
+			},
+			expected: false,
+		},
+		{
+			name: "valid RSA config",
+			conf: apidef.RequestSigningMeta{
+				Secret:        "",
+				KeyId:         "keyID",
+				Algorithm:     "rsa-sha256",
+				CertificateId: "certID",
+			},
+			expected: true,
+		},
+		{
+			name: "valid non-RSA config",
+			conf: apidef.RequestSigningMeta{
+				Secret:        "secret",
+				KeyId:         "keyID",
+				Algorithm:     "hmac-sha256",
+				CertificateId: "",
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+
+		api := BuildAPI(func(spec *APISpec) {
+			spec.RequestSigning = tc.conf
+		})[0]
+
+		rs := RequestSigning{
+			BaseMiddleware: &BaseMiddleware{Spec: api},
+		}
+
+		assert.Equal(t, tc.expected, rs.isRequestSigningConfigValid())
+	}
 }

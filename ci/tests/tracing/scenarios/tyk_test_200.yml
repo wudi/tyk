@@ -1,0 +1,42 @@
+type: Test
+spec:
+  id: 4pnmVurVg
+  name: HTTP Test API - ok request
+  trigger:
+    type: http
+    httpRequest:
+      method: GET
+      url: tyk:8080/test/ip
+      headers:
+      - key: Content-Type
+        value: application/json
+      - key: User-Agent
+        value: Go-http-client/1.1
+  specs:
+  - selector: span[tracetest.span.type="http" name="GET /test/ip" http.request.method="GET"]
+    name: Test main span attributes
+    assertions:
+    - attr:http.request.method         =         "GET"
+    - attr:http.response.status_code         =         200
+    - attr:user_agent.original         =         "Go-http-client/1.1"
+    - attr:http.response.body.size         !=         0
+    - attr:tracetest.span.type         =         "http"
+    - attr:tyk.api.id       =       "3"
+    - attr:tyk.api.name       =       "TestAPI"
+    - attr:tyk.api.orgid       =       "default"
+    - attr:tyk.api.tags       not-contains      "test"
+    - attr:tyk.api.path       =       "/test/"
+    - attr:tyk.original_path       =       "/test/ip"
+  - selector: span[tracetest.span.type="general" name="Tracetest trigger"] span[tracetest.span.type="general"]
+    name: Check if it contains Version and Rate middlewares
+    assertions:
+    - attr:tracetest.selected_spans.count  =  2
+    - attr:tracetest.span.parent_id != ""
+  - selector: span[tracetest.span.type="general" name="RateCheckMW"]
+    name: Check for RateCheckMiddleware
+    assertions:
+    - attr:name  =  "RateCheckMW"
+  - selector: span[tracetest.span.type="general" name="VersionCheck"]
+    name: VersionCheck MW attributes
+    assertions:
+    - attr:tyk.api.version = "Non Versioned"

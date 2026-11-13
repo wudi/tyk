@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-
-	"github.com/TykTechnologies/tyk/config"
 )
 
 // RequestDefinition defines a batch request
@@ -36,6 +34,7 @@ type BatchReplyUnit struct {
 
 // BatchRequestHandler handles batch requests on /tyk/batch for any API Definition that has the feature enabled
 type BatchRequestHandler struct {
+	Gw  *Gateway `json:"-"`
 	API *APISpec
 }
 
@@ -43,13 +42,21 @@ type BatchRequestHandler struct {
 func (b *BatchRequestHandler) doRequest(req *http.Request, relURL string) BatchReplyUnit {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{}}
 
-	if cert := getUpstreamCertificate(req.Host, b.API); cert != nil {
+	if cert := b.Gw.getUpstreamCertificate(req.Host, b.API); cert != nil {
 		tr.TLSClientConfig.Certificates = []tls.Certificate{*cert}
 	}
 
-	tr.TLSClientConfig.InsecureSkipVerify = config.Global().ProxySSLInsecureSkipVerify
+	tr.TLSClientConfig.InsecureSkipVerify = b.Gw.GetConfig().ProxySSLInsecureSkipVerify
 
-	tr.DialTLS = customDialTLSCheck(b.API, tr.TLSClientConfig)
+	if b.Gw.GetConfig().ProxySSLMaxVersion > 0 {
+		tr.TLSClientConfig.MaxVersion = b.Gw.GetConfig().ProxySSLMaxVersion
+	}
+
+	if b.API != nil && b.API.Proxy.Transport.SSLMaxVersion > 0 {
+		tr.TLSClientConfig.MaxVersion = b.API.Proxy.Transport.SSLMaxVersion
+	}
+
+	tr.DialTLS = b.Gw.customDialTLSCheck(b.API, tr.TLSClientConfig)
 
 	tr.Proxy = proxyFromAPI(b.API)
 
@@ -85,12 +92,13 @@ func (b *BatchRequestHandler) DecodeBatchRequest(r *http.Request) (BatchRequestS
 func (b *BatchRequestHandler) ConstructRequests(batchRequest BatchRequestStructure, unsafe bool) ([]*http.Request, error) {
 	requestSet := []*http.Request{}
 
+	ignoreCanonical := b.Gw.GetConfig().IgnoreCanonicalMIMEHeaderKey
 	for i, requestDef := range batchRequest.Requests {
 		// We re-build the URL to ensure that the requested URL is actually for the API in question
 		// URLs need to be built absolute so they go through the rate limiting and request limiting machinery
 		var absURL string
 		if !unsafe {
-			absUrlHeader := "http://localhost:" + strconv.Itoa(config.Global().ListenPort)
+			absUrlHeader := "http://localhost:" + strconv.Itoa(b.Gw.GetConfig().ListenPort)
 			absURL = strings.Join([]string{absUrlHeader, strings.Trim(b.API.Proxy.ListenPath, "/"), requestDef.RelativeURL}, "/")
 		} else {
 			absURL = requestDef.RelativeURL
@@ -104,9 +112,8 @@ func (b *BatchRequestHandler) ConstructRequests(batchRequest BatchRequestStructu
 
 		// Add headers
 		for k, v := range requestDef.Headers {
-			request.Header.Set(k, v)
+			setCustomHeader(request.Header, k, v, ignoreCanonical)
 		}
-
 		requestSet = append(requestSet, request)
 	}
 
@@ -175,13 +182,13 @@ func (b *BatchRequestHandler) ManualBatchRequest(requestObject []byte) ([]byte, 
 	// Decode request
 	var batchRequest BatchRequestStructure
 	if err := json.Unmarshal(requestObject, &batchRequest); err != nil {
-		return nil, fmt.Errorf("Could not decode batch request, decoding failed: %v", err)
+		return nil, fmt.Errorf("could not decode batch request, decoding failed: %w", err)
 	}
 
 	// Construct the unsafe requests
 	requestSet, err := b.ConstructRequests(batchRequest, true)
 	if err != nil {
-		return nil, fmt.Errorf("Batch request creation failed , request structure malformed: %v", err)
+		return nil, fmt.Errorf("batch request creation failed , request structure malformed: %w", err)
 	}
 
 	// Run requests and collate responses
@@ -190,7 +197,7 @@ func (b *BatchRequestHandler) ManualBatchRequest(requestObject []byte) ([]byte, 
 	// Encode responses
 	replyMessage, err := json.Marshal(&replySet)
 	if err != nil {
-		return nil, fmt.Errorf("Couldn't encode response to string: %v", err)
+		return nil, fmt.Errorf("couldn't encode response to string: %w", err)
 	}
 
 	return replyMessage, nil

@@ -3,15 +3,18 @@ package gateway
 import (
 	"errors"
 	"net/http"
+	"slices"
+	"strings"
 
-	"github.com/TykTechnologies/tyk/headers"
+	"github.com/sirupsen/logrus"
 
+	"github.com/TykTechnologies/tyk/internal/httputil"
 	"github.com/TykTechnologies/tyk/regexp"
 )
 
 // GranularAccessMiddleware will check if a URL is specifically enabled for the key
 type GranularAccessMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (m *GranularAccessMiddleware) Name() string {
@@ -24,7 +27,6 @@ func (m *GranularAccessMiddleware) ProcessRequest(w http.ResponseWriter, r *http
 		return nil, http.StatusOK
 	}
 
-	logger := m.Logger()
 	session := ctxGetSession(r)
 
 	sessionVersionData, foundAPI := session.AccessRights[m.Spec.APIID]
@@ -32,56 +34,99 @@ func (m *GranularAccessMiddleware) ProcessRequest(w http.ResponseWriter, r *http
 		return nil, http.StatusOK
 	}
 
-	if m.Spec.GraphQL.Enabled {
-		if len(sessionVersionData.RestrictedTypes) == 0 {
-			return nil, http.StatusOK
-		}
-
-		gqlRequest := ctxGetGraphQLRequest(r)
-
-		result, err := gqlRequest.ValidateRestrictedFields(m.Spec.GraphQLExecutor.Schema, sessionVersionData.RestrictedTypes)
-		if err != nil {
-			m.Logger().Errorf("Error during GraphQL request restricted fields validation: '%s'", err)
-			return errors.New("there was a problem proxying the request"), http.StatusInternalServerError
-		}
-
-		if !result.Valid || (result.Errors != nil && result.Errors.Count() > 0) {
-			w.Header().Set(headers.ContentType, headers.ApplicationJSON)
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = result.Errors.WriteResponse(w)
-			m.Logger().Debugf("Error during GraphQL request restricted fields validation: '%s'", result.Errors)
-			return errCustomBodyResponse, http.StatusBadRequest
-		}
-
-		return nil, http.StatusOK
-
-	}
-
 	if len(sessionVersionData.AllowedURLs) == 0 {
 		return nil, http.StatusOK
 	}
 
+	gwConfig := m.Gw.GetConfig()
+
+	// Hook per-api settings here (m.Spec...)
+	isPrefixMatch := gwConfig.HttpServerOptions.EnablePathPrefixMatching
+	isSuffixMatch := gwConfig.HttpServerOptions.EnablePathSuffixMatching
+
+	if isPrefixMatch {
+		urlPaths := []string{
+			m.Spec.StripListenPath(r.URL.Path),
+			r.URL.Path,
+		}
+
+		logger := m.Logger().WithField("paths", urlPaths)
+
+		for _, accessSpec := range sessionVersionData.AllowedURLs {
+			if !slices.Contains(accessSpec.Methods, r.Method) {
+				continue
+			}
+
+			// Append $ if so configured to match end of request path.
+			pattern := httputil.PreparePathRegexp(accessSpec.URL, isPrefixMatch, isSuffixMatch)
+			if isSuffixMatch && !strings.HasSuffix(pattern, "$") {
+				pattern += "$"
+			}
+
+			match, err := httputil.MatchPaths(pattern, urlPaths)
+
+			// unconditional log of err/match/url
+			// if loglevel is set to debug verbosity increases and all requests are logged,
+			// regardless if an error occured or not.
+			if gwConfig.LogLevel == "debug" || err != nil {
+				logger = logger.WithError(err).WithField("pattern", pattern).WithField("match", match)
+				if err != nil {
+					logger.Error("error matching endpoint")
+				} else {
+					logger.Debug("matching endpoint")
+				}
+			}
+
+			if err != nil || !match {
+				continue
+			}
+
+			if !m.conditionsMatch(r, accessSpec) {
+				continue
+			}
+
+			return m.pass()
+		}
+
+		return m.block(logger)
+	}
+
+	logger := m.Logger().WithField("paths", []string{r.URL.Path})
+
+	// Legacy behaviour (5.5.0 and earlier), wildcard match against full request path.
+	// Fixed error handling in regex compilation to continue to next pattern (block).
+	urlPath := r.URL.Path
+
 	for _, accessSpec := range sessionVersionData.AllowedURLs {
-		logger.Debug("Checking: ", r.URL.Path, " Against:", accessSpec.URL)
-		asRegex, err := regexp.Compile(accessSpec.URL)
+		if !slices.Contains(accessSpec.Methods, r.Method) {
+			continue
+		}
+
+		pattern := httputil.PreparePathRegexp(accessSpec.URL, false, isSuffixMatch)
+
+		logger.Debug("Checking: ", urlPath, " Against:", pattern)
+
+		// Wildcard match (user supplied, as-is)
+		asRegex, err := regexp.Compile(pattern)
 		if err != nil {
-			logger.WithError(err).Error("Regex error")
-			return nil, http.StatusOK
+			logger.WithError(err).Error("error compiling regex")
+			continue
 		}
 
 		match := asRegex.MatchString(r.URL.Path)
-		if match {
-			logger.Debug("Match!")
-			for _, method := range accessSpec.Methods {
-				if method == r.Method {
-					return nil, http.StatusOK
-				}
-			}
+		if match && m.conditionsMatch(r, accessSpec) {
+			return m.pass()
 		}
 	}
 
+	return m.block(logger)
+}
+
+func (m *GranularAccessMiddleware) block(logger *logrus.Entry) (error, int) {
 	logger.Info("Attempted access to unauthorised endpoint (Granular).")
-
 	return errors.New("Access to this resource has been disallowed"), http.StatusForbidden
+}
 
+func (m *GranularAccessMiddleware) pass() (error, int) {
+	return nil, http.StatusOK
 }

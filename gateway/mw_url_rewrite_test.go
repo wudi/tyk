@@ -1,15 +1,21 @@
 package gateway
 
 import (
+	"bytes"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/TykTechnologies/tyk/test"
-
-	"bytes"
-	"net/http"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
 
@@ -19,6 +25,16 @@ var testRewriterData = []struct {
 	in, want    string
 }{
 	{
+		"Encoded",
+		"/test/payment-intents", "/change/to/me",
+		"/test/payment%2Dintents", "/change/to/me",
+	},
+	{
+		"MatchEncodedChars",
+		"^(.+)%2[Dd](.+)$", "/change/to/me",
+		"/test/payment%2Dintents", "/change/to/me",
+	},
+	{
 		"Straight",
 		"/test/straight/rewrite", "/change/to/me",
 		"/test/straight/rewrite", "/change/to/me",
@@ -27,6 +43,16 @@ var testRewriterData = []struct {
 		"OneVal",
 		"test/val/(.*)", "change/to/$1",
 		"/test/val/VALUE", "change/to/VALUE",
+	},
+	{
+		"OneVal Special Case",
+		"test/val/(.*)", "/test/val/$1",
+		"/test/val/VALUE%2C", "/test/val/VALUE%2C",
+	},
+	{
+		"OneVal Special Case With Query Param Encoded",
+		"test/val/(.*)", "/test/val/$1",
+		"/test/val/VALUE%2C?a=te%2Cst", "/test/val/VALUE%2C?a=te%2Cst",
 	},
 	{
 		"ThreeVals",
@@ -87,11 +113,14 @@ func prepareRewriterCases() []testRewriterCase {
 }
 
 func TestRewriter(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	cases := prepareRewriterCases()
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := tc.reqMaker()
-			got, err := urlRewrite(tc.meta, r)
+			got, err := ts.Gw.urlRewrite(tc.meta, r)
 			if err != nil {
 				t.Error("compile failed:", err)
 			}
@@ -102,11 +131,17 @@ func TestRewriter(t *testing.T) {
 	}
 }
 func BenchmarkRewriter(b *testing.B) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	cases := prepareRewriterCases()
 	//warm-up regexp caches
 	for _, tc := range cases {
 		r := tc.reqMaker()
-		urlRewrite(tc.meta, r)
+		_, err := ts.Gw.urlRewrite(tc.meta, r)
+		if err != nil {
+			b.Errorf("benchmark failed %s", err.Error())
+		}
 	}
 
 	b.ReportAllocs()
@@ -116,19 +151,27 @@ func BenchmarkRewriter(b *testing.B) {
 			b.StopTimer()
 			r := tc.reqMaker()
 			b.StartTimer()
-			urlRewrite(tc.meta, r)
+			_, err := ts.Gw.urlRewrite(tc.meta, r)
+			if err != nil {
+				b.Errorf("benchmark failed %s", err.Error())
+			}
 		}
 	}
 }
 
 func TestRewriterTriggers(t *testing.T) {
 	type TestDef struct {
-		name        string
-		pattern, to string
-		in, want    string
-		triggerConf []apidef.RoutingTrigger
-		req         *http.Request
+		name           string
+		pattern, to    string
+		in, want       string
+		triggerConf    []apidef.RoutingTrigger
+		req            *http.Request
+		payloadTrigger bool
 	}
+
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	tests := []func() TestDef{
 		func() TestDef {
 			r, _ := http.NewRequest("GET", "/test/straight/rewrite", nil)
@@ -155,6 +198,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -181,6 +225,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -211,6 +256,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -241,6 +287,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -271,6 +318,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -316,6 +364,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -346,6 +395,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -376,6 +426,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -400,6 +451,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -424,6 +476,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -451,6 +504,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -481,6 +535,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -511,6 +566,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -545,6 +601,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -579,6 +636,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -613,6 +671,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -636,6 +695,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -659,6 +719,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -682,6 +743,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -705,6 +767,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -734,6 +797,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -763,6 +827,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -786,6 +851,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -815,6 +881,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -844,6 +911,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				true,
 			}
 		},
 		func() TestDef {
@@ -867,6 +935,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -890,6 +959,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -901,7 +971,7 @@ func TestRewriterTriggers(t *testing.T) {
 				MetaData: map[string]interface{}{
 					"rewrite": "bar-baz",
 				},
-			}, "", false)
+			}, false, ts.Gw.GetConfig().HashKeys)
 
 			return TestDef{
 				"Meta Simple",
@@ -919,6 +989,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -930,7 +1001,7 @@ func TestRewriterTriggers(t *testing.T) {
 				MetaData: map[string]interface{}{
 					"rewrite": "bar-baz",
 				},
-			}, "", false)
+			}, false, ts.Gw.GetConfig().HashKeys)
 
 			return TestDef{
 				"Meta Simple Group",
@@ -948,6 +1019,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -960,7 +1032,7 @@ func TestRewriterTriggers(t *testing.T) {
 					"rewrite": "bar-baz",
 					"somevar": "someval",
 				},
-			}, "", false)
+			}, false, ts.Gw.GetConfig().HashKeys)
 
 			return TestDef{
 				"Meta Value from Session",
@@ -978,6 +1050,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -1005,6 +1078,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -1016,7 +1090,7 @@ func TestRewriterTriggers(t *testing.T) {
 				MetaData: map[string]interface{}{
 					"rewrite": "bar-baz",
 				},
-			}, "", false)
+			}, false, ts.Gw.GetConfig().HashKeys)
 
 			return TestDef{
 				"Variable not found",
@@ -1034,6 +1108,7 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 		func() TestDef {
@@ -1057,22 +1132,32 @@ func TestRewriterTriggers(t *testing.T) {
 					},
 				},
 				r,
+				false,
 			}
 		},
 	}
 	for _, tf := range tests {
 		tc := tf()
 		t.Run(tc.name, func(t *testing.T) {
+
 			testConf := apidef.URLRewriteMeta{
 				MatchPattern: tc.pattern,
 				RewriteTo:    tc.to,
 				Triggers:     tc.triggerConf,
 			}
 
-			got, err := urlRewrite(&testConf, tc.req)
+			got, err := ts.Gw.urlRewrite(&testConf, tc.req)
 			if err != nil {
 				t.Error("compile failed:", err)
 			}
+
+			//added check to ensure that reading the payload to check for the trigger does not break the request
+			if tc.payloadTrigger {
+				body, err := io.ReadAll(tc.req.Body)
+				assert.NotEqual(t, "", string(body))
+				assert.NoError(t, err)
+			}
+
 			if got != tc.want {
 				t.Errorf("rewrite failed, want %q, got %q", tc.want, got)
 			}
@@ -1081,12 +1166,16 @@ func TestRewriterTriggers(t *testing.T) {
 }
 
 func TestInitTriggerRx(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
 	// prepare test data
 	testRewriteMW := &URLRewriteMiddleware{
-		BaseMiddleware: BaseMiddleware{
+		BaseMiddleware: &BaseMiddleware{
 			Spec: &APISpec{
 				APIDefinition: &apidef.APIDefinition{},
 			},
+			Gw: ts.Gw,
 		},
 	}
 	testRewriteMW.Spec.APIDefinition.VersionData = struct {
@@ -1143,7 +1232,7 @@ func TestInitTriggerRx(t *testing.T) {
 		Options.
 		HeaderMatches["abc"]
 	if headerMatch.Check("abc") == "" {
-		t.Errorf("Expected HeaderMatches initalized and matched, received no match")
+		t.Errorf("Expected HeaderMatches initialized and matched, received no match")
 	}
 
 	// assert QueryValMatches
@@ -1158,7 +1247,7 @@ func TestInitTriggerRx(t *testing.T) {
 		Options.
 		QueryValMatches["def"]
 	if queryValMatch.Check("def") == "" {
-		t.Errorf("Expected QueryValMatches initalized and matched, received no match")
+		t.Errorf("Expected QueryValMatches initialized and matched, received no match")
 	}
 
 	// assert PayloadMatches
@@ -1173,16 +1262,16 @@ func TestInitTriggerRx(t *testing.T) {
 		Options.
 		PayloadMatches
 	if payloadMatch.Check("ghi") == "" {
-		t.Errorf("Expected PayloadMatches initalized and matched, received no match")
+		t.Errorf("Expected PayloadMatches initialized and matched, received no match")
 	}
 }
 
 func TestURLRewriteCaseSensitivity(t *testing.T) {
-	ts := StartTest()
+	ts := StartTest(nil)
 	defer ts.Close()
 
 	assert := func(relativePath string, requestedPath string, bodyMatch string) {
-		BuildAndLoadAPI(func(spec *APISpec) {
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			spec.Proxy.ListenPath = "/"
 			UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
 				v.ExtendedPaths.URLRewrite = []apidef.URLRewriteMeta{{
@@ -1223,16 +1312,391 @@ func TestURLRewriteCaseSensitivity(t *testing.T) {
 func TestValToStr(t *testing.T) {
 
 	example := []interface{}{
-		"abc",      // string
-		int64(456), // int64
-		12.22,      // float
-		"abc,def",  // string url encode
+		"abc",              // string
+		int64(456),         // int64
+		12.22,              // float
+		float64(123452342), // float64
+		"abc,def",          // string url encode
+		13,                 // int
 	}
 
 	str := valToStr(example)
-	expected := "abc,456,12.22,abc%2Cdef"
+	expected := "abc,456,12.22,123452342,abc%2Cdef,13"
 
 	if str != expected {
 		t.Errorf("expected (%s) got (%s)", expected, str)
+	}
+}
+
+func TestLoopingUrl(t *testing.T) {
+	cases := []struct{ host, expectedHost string }{
+		{"__api", "tyk://-api"},
+		{"__api__", "tyk://-api-"},
+		{"__ api __", "tyk://-api-"},
+		{"@api@", "tyk://-api-"},
+		{"__ api __ name __", "tyk://-api-name-"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			assert.Equal(t, tc.expectedHost, LoopingUrl(tc.host))
+		})
+	}
+}
+
+func TestReplaceTykVariables(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	installFakeKVStores(t, ts.Gw, map[string]map[string]string{
+		"vault": {
+			"kv-v2/layer1/layer2/dev": `{"API_KEY": "vault_api_key_value"}`,
+			"simplekey":               "simple_vault_value",
+		},
+		"consul": {
+			"path/to/db_password": "consul_db_password_value",
+			"anotherkey":          "another_consul_value",
+		},
+		"secrets": {
+			"conf_key": "conf_secret_value",
+		},
+	})
+
+	t.Setenv("TYK_SECRET_ENV_VAR", "env_var_value")
+	t.Setenv("TYK_SECRET_ENV_VAR_WITH_UNDERSCORE", "env_var_underscore_value")
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Vault secret with underscore",
+			input:    "$secret_vault.kv-v2/layer1/layer2/dev.API_KEY",
+			expected: "vault_api_key_value",
+		},
+		{
+			name:     "Vault secret without underscore",
+			input:    "$secret_vault.simplekey",
+			expected: "simple_vault_value",
+		},
+		{
+			name:     "Consul secret with underscore",
+			input:    "$secret_consul.path/to/db_password",
+			expected: "consul_db_password_value",
+		},
+		{
+			name:     "Consul secret without underscore",
+			input:    "$secret_consul.anotherkey",
+			expected: "another_consul_value",
+		},
+		{
+			name:     "Environment variable",
+			input:    "$secret_env.env_var",
+			expected: "env_var_value",
+		},
+		{
+			name:     "Environment variable with underscore",
+			input:    "$secret_env.env_var_with_underscore",
+			expected: "env_var_underscore_value",
+		},
+		{
+			name:     "Mixed string with Vault secret",
+			input:    "My API Key is: $secret_vault.kv-v2/layer1/layer2/dev.API_KEY and some other text",
+			expected: "My API Key is: vault_api_key_value and some other text",
+		},
+		{
+			name:     "Mixed string with Consul secret",
+			input:    "My DB Password is: $secret_consul.path/to/db_password and some other text",
+			expected: "My DB Password is: consul_db_password_value and some other text",
+		},
+		{
+			name:     "Multiple secrets of different types",
+			input:    "Vault: $secret_vault.simplekey, Consul: $secret_consul.anotherkey, Env: $secret_env.env_var",
+			expected: "Vault: simple_vault_value, Consul: another_consul_value, Env: env_var_value",
+		},
+		{
+			name:     "Non-existent Vault secret",
+			input:    "$secret_vault.non_existent_key",
+			expected: "",
+		},
+		{
+			name:     "Non-existent Consul secret",
+			input:    "$secret_consul.another_non_existent_key",
+			expected: "",
+		},
+		{
+			name:     "Non-existent environment variable",
+			input:    "$secret_env.non_existent_env_var",
+			expected: "",
+		},
+		{
+			name:     "Config secret",
+			input:    "$secret_conf.conf_key",
+			expected: "conf_secret_value",
+		},
+		{
+			name:     "Non-existent config secret",
+			input:    "$secret_conf.non_existent_conf_key",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			result := ts.Gw.ReplaceTykVariables(req, tt.input, false)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestReplaceTykVariables_SecretConf(t *testing.T) {
+	ts := StartTest(func(conf *config.Config) {
+		conf.Secrets = map[string]string{
+			"api_token": "conf-token-value",
+			"blank":     "",
+		}
+	})
+	defer ts.Close()
+
+	req := httptest.NewRequest("GET", "/", nil)
+
+	t.Run("present key resolves from the promoted secrets store", func(t *testing.T) {
+		got := ts.Gw.ReplaceTykVariables(req, "token=$secret_conf.api_token", false)
+		assert.Equal(t, "token=conf-token-value", got)
+	})
+
+	t.Run("missing key resolves to empty string", func(t *testing.T) {
+		got := ts.Gw.ReplaceTykVariables(req, "token=$secret_conf.missing", false)
+		assert.Equal(t, "token=", got)
+	})
+
+	t.Run("present key with empty value resolves to empty string", func(t *testing.T) {
+		// Legacy treated ok-but-empty the same as missing (token → "");
+		// resolving "" through the inline store produces the same output.
+		got := ts.Gw.ReplaceTykVariables(req, "token=$secret_conf.blank", false)
+		assert.Equal(t, "token=", got)
+	})
+}
+
+func TestReplaceTykVariables_NewSyntax(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	t.Setenv("TYK_SECRET_HOST", "myhost")
+	t.Setenv("TYK_SECRET_USER", "alice")
+	t.Setenv("TYK_SECRET_PASS", "s3cret")
+	t.Setenv("TYK_SECRET_OTHER", "otherval")
+	t.Setenv("TYK_SECRET_RAW", "a b/c") // contains chars url.QueryEscape would change
+
+	req := httptest.NewRequest("GET", "/", nil)
+
+	t.Run("kv:// whole-value reference is fully replaced", func(t *testing.T) {
+		assert.Equal(t, "myhost", ts.Gw.ReplaceTykVariables(req, "kv://env/host", false))
+	})
+
+	t.Run("$kv{} inline token is replaced within a larger string", func(t *testing.T) {
+		assert.Equal(t, "https://myhost/v1", ts.Gw.ReplaceTykVariables(req, "https://$kv{env:host}/v1", false))
+	})
+
+	t.Run("multiple $kv{} tokens all resolve", func(t *testing.T) {
+		assert.Equal(t, "alice:s3cret", ts.Gw.ReplaceTykVariables(req, "$kv{env:user}:$kv{env:pass}", false))
+	})
+
+	t.Run("mixed $kv{} and $secret_* — both passes complete", func(t *testing.T) {
+		// Pass 1 resolves $kv{env:host}; Pass 2 resolves $secret_env.other.
+		got := ts.Gw.ReplaceTykVariables(req, "https://$kv{env:host}/$secret_env.other", false)
+		assert.Equal(t, "https://myhost/otherval", got)
+	})
+
+	t.Run("malformed kv:// reference is left unchanged, not emptied", func(t *testing.T) {
+		in := "kv://no-path-separator"
+		assert.Equal(t, in, ts.Gw.ReplaceTykVariables(req, in, false),
+			"a Pass 1 resolve error leaves the input as-is (unlike $secret_* which empties)")
+	})
+
+	t.Run("KV values are not URL-encoded even when escape=true", func(t *testing.T) {
+		got := ts.Gw.ReplaceTykVariables(req, "$kv{env:raw}", true)
+		assert.Equal(t, "a b/c", got,
+			"Pass 1 completes before the escape logic, so KV values are never URL-encoded")
+	})
+}
+
+func TestReplaceTykVariablesFileSecret(t *testing.T) {
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "api-key")
+	require.NoError(t, os.WriteFile(secretFile, []byte("file-secret-value\n"), 0600))
+
+	pemFile := filepath.Join(dir, "cert.pem")
+	require.NoError(t, os.WriteFile(pemFile, []byte("-----BEGIN CERT-----\nABC\n-----END CERT-----\n"), 0600))
+
+	// No base_path configured — file:// resolution is disabled, so $secret_file.
+	// references resolve to an empty string while other providers are unaffected.
+	t.Run("no base_path", func(t *testing.T) {
+		ts := StartTest(nil)
+		defer ts.Close()
+
+		t.Setenv("TYK_SECRET_TEST_FILE_KV_VAR", "env-test-val")
+
+		tests := []struct {
+			name     string
+			input    string
+			expected string
+		}{
+			{
+				name:     "absolute $secret_file. rejected, resolves to empty",
+				input:    "$secret_file." + secretFile,
+				expected: "",
+			},
+			{
+				name:     "relative $secret_file. rejected, resolves to empty",
+				input:    "$secret_file.api-key",
+				expected: "",
+			},
+			{
+				name:     "non-existent file resolves to empty string",
+				input:    "$secret_file./nonexistent/path/file",
+				expected: "",
+			},
+			{
+				name:     "other secret providers unaffected; file resolves to empty",
+				input:    "env=$secret_env.TEST_FILE_KV_VAR file=$secret_file." + secretFile,
+				expected: "env=env-test-val file=",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := httptest.NewRequest("GET", "/", nil)
+				result := ts.Gw.ReplaceTykVariables(req, tt.input, false)
+				assert.Equal(t, tt.expected, result)
+			})
+		}
+	})
+
+	t.Run("with base_path configured", func(t *testing.T) {
+		ts := StartTest(func(conf *config.Config) {
+			conf.KV.File.BasePath = dir
+		})
+		defer ts.Close()
+
+		t.Run("resolves relative key under base_path", func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			result := ts.Gw.ReplaceTykVariables(req, "$secret_file.api-key", false)
+			assert.Equal(t, "file-secret-value", result)
+		})
+
+		t.Run("multi-line PEM resolved under base_path", func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			result := ts.Gw.ReplaceTykVariables(req, "$secret_file.cert.pem", false)
+			assert.Equal(t, "-----BEGIN CERT-----\nABC\n-----END CERT-----", result)
+		})
+
+		t.Run("not URL-encoded when escape=true", func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			result := ts.Gw.ReplaceTykVariables(req, "$secret_file.api-key", true)
+			assert.Equal(t, "file-secret-value", result)
+			assert.NotContains(t, result, "%")
+		})
+
+		t.Run("absolute path rejected when base_path is set", func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			result := ts.Gw.ReplaceTykVariables(req, "$secret_file."+secretFile, false)
+			assert.Equal(t, "", result)
+		})
+
+		t.Run("dotdot traversal rejected — resolves to empty string", func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			result := ts.Gw.ReplaceTykVariables(req, "$secret_file../etc/passwd", false)
+			assert.Equal(t, "", result)
+		})
+	})
+}
+
+func TestURLRewriteMiddleware_CheckHostRewrite(t *testing.T) {
+	type args struct {
+		oldPath   string
+		newTarget string
+	}
+
+	tests := []struct {
+		name          string
+		args          args
+		errExpected   bool
+		retainHostVal interface{}
+	}{
+		{
+			name: "no host rewrite",
+			args: args{
+				oldPath:   "/hello",
+				newTarget: "/status",
+			},
+			errExpected:   false,
+			retainHostVal: nil,
+		},
+		{
+			name: "invalid new path",
+			args: args{
+				oldPath:   "/hello",
+				newTarget: "http:// example.com/status",
+			},
+			errExpected:   true,
+			retainHostVal: nil,
+		},
+		{
+			name: "host rewrite",
+			args: args{
+				oldPath:   "/hello",
+				newTarget: "http://example.com/status",
+			},
+			errExpected:   false,
+			retainHostVal: true,
+		},
+		{
+			name: "scheme in oldPath - host rewrite",
+			args: args{
+				oldPath:   "http://tyk-gateway/hello",
+				newTarget: "http://example.com/status",
+			},
+			errExpected:   false,
+			retainHostVal: true,
+		},
+		{
+			name: "scheme in oldPath - no host rewrite",
+			args: args{
+				oldPath:   "http://tyk-gateway/hello",
+				newTarget: "/status",
+			},
+			errExpected:   false,
+			retainHostVal: nil,
+		},
+		{
+			name: "same host for new and old URL",
+			args: args{
+				oldPath:   "http://tyk-gateway/hello",
+				newTarget: "http://tyk-gateway/status",
+			},
+			errExpected:   false,
+			retainHostVal: nil,
+		},
+		{
+			name: "invalid old URL",
+			args: args{
+				oldPath:   "http://tyk gateway/hello",
+				newTarget: "http://tyk-gateway/status",
+			},
+			errExpected:   true,
+			retainHostVal: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &URLRewriteMiddleware{BaseMiddleware: &BaseMiddleware{}}
+			r := &http.Request{}
+			err := m.CheckHostRewrite(tt.args.oldPath, tt.args.newTarget, r)
+			assert.Equal(t, tt.errExpected, err != nil)
+			assert.Equal(t, tt.retainHostVal, r.Context().Value(ctx.RetainHost))
+		})
 	}
 }

@@ -1,0 +1,251 @@
+package graphengine
+
+import (
+	"errors"
+	"net"
+	"net/http"
+
+	"github.com/jensneuse/abstractlogger"
+	"github.com/sirupsen/logrus"
+
+	"github.com/TykTechnologies/graphql-go-tools/pkg/graphql"
+	graphqlv2 "github.com/TykTechnologies/graphql-go-tools/v2/pkg/graphql"
+
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/header"
+)
+
+type TykVariableReplacer func(r *http.Request, in string, escape bool) string
+
+func GetSchemaV1(engine Engine) (*graphql.Schema, error) {
+	switch engine.Version() {
+	case EngineVersionV1:
+		return engine.(*EngineV1).Schema, nil
+	case EngineVersionV2:
+		return engine.(*EngineV2).Schema, nil
+	}
+	return nil, errors.New("schema not supported for engine type")
+}
+
+func GetSchemaV2(engine Engine) (*graphqlv2.Schema, error) {
+	switch engine.Version() {
+	case EngineVersionV3:
+		// Handle for tyk graph engine v3
+	}
+	return nil, errors.New("schema not supported for engine type")
+}
+
+func createAbstractLogrusLogger(logger *logrus.Logger) *abstractlogger.LogrusLogger {
+	return abstractlogger.NewLogrusLogger(logger, absLoggerLevel(logger.Level))
+}
+
+func absLoggerLevel(level logrus.Level) abstractlogger.Level {
+	switch level {
+	case logrus.ErrorLevel:
+		return abstractlogger.ErrorLevel
+	case logrus.WarnLevel:
+		return abstractlogger.WarnLevel
+	case logrus.DebugLevel:
+		return abstractlogger.DebugLevel
+	}
+	return abstractlogger.InfoLevel
+}
+
+//nolint:staticcheck // ST1008: engine ProcessRequest convention returns (error, int)
+func wrapGraphQLErrorAndLog(logger abstractlogger.Logger, gqlErrors graphql.Errors) (error, int) {
+	logger.Error("error while validating GraphQL request", abstractlogger.Error(gqlErrors))
+	return GraphQlError{err: gqlErrors}, http.StatusBadRequest
+}
+
+// baseEngine holds what every engine version shares: the logger, the access checkers
+// and the Engine methods built on them.
+type baseEngine struct {
+	logger                abstractlogger.Logger
+	complexityChecker     ComplexityChecker
+	granularAccessChecker GranularAccessChecker
+}
+
+//nolint:staticcheck // ST1008: Engine interface convention returns (error, int)
+func (e *baseEngine) ProcessGraphQLComplexity(r *http.Request, accessDefinition *ComplexityAccessDefinition) (err error, statusCode int) {
+	return e.complexityFailReasonAsHttpStatusCode(e.complexityChecker.DepthLimitExceeded(r, accessDefinition))
+}
+
+//nolint:staticcheck // ST1008: Engine interface convention returns (error, int)
+func (e *baseEngine) ProcessGraphQLGranularAccess(w http.ResponseWriter, r *http.Request, accessDefinition *GranularAccessDefinition) (err error, statusCode int) {
+	result := e.granularAccessChecker.CheckGraphQLRequestFieldAllowance(w, r, accessDefinition)
+	return e.granularAccessFailReasonAsHttpStatusCode(&result)
+}
+
+//nolint:staticcheck // ST1008: Engine interface convention returns (error, int)
+func (e *baseEngine) complexityFailReasonAsHttpStatusCode(failReason ComplexityFailReason) (err error, statusCode int) {
+	switch failReason {
+	case ComplexityFailReasonInternalError:
+		return ProxyingRequestFailedErr, http.StatusInternalServerError
+	case ComplexityFailReasonDepthLimitExceeded:
+		return GraphQLDepthLimitExceededErr, http.StatusForbidden
+	}
+
+	return nil, http.StatusOK
+}
+
+//nolint:staticcheck // ST1008: Engine interface convention returns (error, int)
+func (e *baseEngine) granularAccessFailReasonAsHttpStatusCode(result *GraphQLGranularAccessResult) (err error, statusCode int) {
+	const restrictedFieldValidationFailedLogMsg = "error during GraphQL request restricted fields validation"
+
+	switch result.FailReason {
+	case GranularAccessFailReasonNone:
+		return nil, http.StatusOK
+	case GranularAccessFailReasonInternalError:
+		e.logger.Error(restrictedFieldValidationFailedLogMsg, abstractlogger.Error(result.InternalErr))
+		return ProxyingRequestFailedErr, http.StatusInternalServerError
+	case GranularAccessFailReasonValidationError:
+		e.logger.Debug(restrictedFieldValidationFailedLogMsg, abstractlogger.Error(result.ValidationError))
+		return GraphQlError{err: result.ValidationError}, http.StatusBadRequest
+	case GranularAccessFailReasonIntrospectionDisabled:
+		e.logger.Debug("introspection disabled")
+		return ErrIntrospectionDisabled, http.StatusForbidden
+	}
+
+	return nil, http.StatusOK
+}
+
+func greaterThanIntConsideringUnlimited(first, second int) bool {
+	if first == -1 {
+		return true
+	}
+
+	if second == -1 {
+		return false
+	}
+
+	return first > second
+}
+
+func isSupergraph(apiDefinition *apidef.APIDefinition) bool {
+	return apiDefinition.GraphQL.Enabled && apiDefinition.GraphQL.ExecutionMode == apidef.GraphQLExecutionModeSupergraph
+}
+
+func isProxyOnly(apiDefinition *apidef.APIDefinition) bool {
+	return apiDefinition.GraphQL.Enabled &&
+		(apiDefinition.GraphQL.ExecutionMode == apidef.GraphQLExecutionModeProxyOnly || apiDefinition.GraphQL.ExecutionMode == apidef.GraphQLExecutionModeSubgraph)
+}
+
+func additionalUpstreamHeaders(logger abstractlogger.Logger, outreq *http.Request, apiDefinition *apidef.APIDefinition) http.Header {
+	upstreamHeaders := http.Header{}
+	switch apiDefinition.GraphQL.ExecutionMode {
+	case apidef.GraphQLExecutionModeSupergraph:
+		// if this context vars are enabled and this is a supergraph, inject the sub request id header
+		if !apiDefinition.EnableContextVars {
+			break
+		}
+		ctxData := ctxGetData(outreq)
+		if reqID, exists := ctxData["request_id"]; !exists {
+			logger.Warn("context variables enabled but request_id missing")
+		} else if requestID, ok := reqID.(string); ok {
+			upstreamHeaders.Set("X-Tyk-Parent-Request-Id", requestID)
+		}
+	case apidef.GraphQLExecutionModeExecutionEngine:
+		globalHeaders := headerStructToHeaderMap(apiDefinition.GraphQL.Engine.GlobalHeaders)
+		for key, value := range globalHeaders {
+			upstreamHeaders.Set(key, value)
+		}
+	}
+
+	// When StripAuthData is false, propagate auth headers from the original request
+	// to the upstream. This is the only propagation point for a proxy-only websocket
+	// upgrade, where the transport is not involved at all.
+	//
+	// Every other proxy-only path also reaches setProxyOnlyHeaders, which forwards the
+	// consumer's headers again, so this writes a value that is about to be written a
+	// second time. The only-when-absent guard in the header modifier does not prevent
+	// that: it runs while the fetch input is built, long before the transport adds
+	// anything. setProxyOnlyHeaders is what drops the duplicate.
+	if !apiDefinition.StripAuthData {
+		propagateAuthHeaders(outreq, upstreamHeaders, apiDefinition)
+	}
+
+	return upstreamHeaders
+}
+
+// propagateAuthHeaders copies the authentication header from the original request
+// into the upstream headers based on the API's enabled auth method.
+// Only the auth config for the active auth method is consulted.
+func propagateAuthHeaders(outreq *http.Request, upstreamHeaders http.Header, apiDefinition *apidef.APIDefinition) {
+	authType := activeAuthType(apiDefinition)
+	if authType == "" {
+		return
+	}
+
+	config, ok := apiDefinition.AuthConfigs[authType]
+	// For backward compatibility when AuthConfigs doesn't have the key
+	if !ok && (authType == apidef.AuthTokenType || authType == apidef.JWTType) {
+		config = apiDefinition.Auth
+	} else if !ok {
+		return
+	}
+
+	if config.DisableHeader {
+		return
+	}
+
+	authHeaderName := header.Authorization
+	if config.AuthHeaderName != "" {
+		authHeaderName = config.AuthHeaderName
+	}
+	if val := outreq.Header.Get(authHeaderName); val != "" {
+		upstreamHeaders.Set(authHeaderName, val)
+	}
+}
+
+// activeAuthType returns the AuthConfigs key for the auth method enabled
+// on the API definition. Returns empty string if no recognised auth method
+// is enabled or if the API is keyless.
+func activeAuthType(apiDefinition *apidef.APIDefinition) string {
+	switch {
+	case apiDefinition.UseKeylessAccess:
+		return ""
+	case apiDefinition.EnableJWT:
+		return apidef.JWTType
+	case apiDefinition.UseBasicAuth:
+		return apidef.BasicType
+	case apiDefinition.EnableSignatureChecking:
+		return apidef.HMACType
+	case apiDefinition.UseOauth2:
+		return apidef.OAuthType
+	case apiDefinition.ExternalOAuth.Enabled:
+		return apidef.ExternalOAuthType
+	case apiDefinition.UseOpenID:
+		return apidef.OIDCType
+	default:
+		// UseStandardAuth or fallback — auth token is the default
+		return apidef.AuthTokenType
+	}
+}
+
+func headerStructToHeaderMap(headers []apidef.UDGGlobalHeader) map[string]string {
+	headerMap := make(map[string]string)
+	for _, header := range headers {
+		headerMap[header.Key] = header.Value
+	}
+	return headerMap
+}
+
+func ctxGetData(r *http.Request) map[string]interface{} {
+	if v := r.Context().Value(ctx.ContextData); v != nil {
+		return v.(map[string]interface{})
+	}
+	return nil
+}
+
+func websocketConnWithUpgradeHeader(logger abstractlogger.Logger, params *ReverseProxyParams) (underlyingConn net.Conn, err error) {
+	conn, err := params.WebSocketUpgrader.Upgrade(params.ResponseWriter, params.OutRequest, http.Header{
+		header.SecWebSocketProtocol: {params.OutRequest.Header.Get(header.SecWebSocketProtocol)},
+	})
+	if err != nil {
+		logger.Error("websocket upgrade for GraphQL engine failed", abstractlogger.Error(err))
+		return nil, err
+	}
+
+	return conn.NetConn(), nil
+}

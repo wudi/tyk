@@ -1,3 +1,4 @@
+//go:build goplugin
 // +build goplugin
 
 package goplugin
@@ -8,15 +9,24 @@ import (
 	"plugin"
 )
 
-func GetHandler(path string, symbol string) (http.HandlerFunc, error) {
+func GetSymbol(modulePath string, symbol string) (interface{}, error) {
 	// try to load plugin
-	loadedPlugin, err := plugin.Open(path)
+	loadedPlugin, err := plugin.Open(modulePath)
 	if err != nil {
 		return nil, err
 	}
 
 	// try to lookup function symbol
 	funcSymbol, err := loadedPlugin.Lookup(symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	return funcSymbol, nil
+}
+
+func GetHandler(modulePath string, symbol string) (http.HandlerFunc, error) {
+	funcSymbol, err := GetSymbol(modulePath, symbol)
 	if err != nil {
 		return nil, err
 	}
@@ -28,4 +38,19 @@ func GetHandler(path string, symbol string) (http.HandlerFunc, error) {
 	}
 
 	return pluginHandler, nil
+}
+
+func GetResponseHandler(modulePath string, symbol string) (func(rw http.ResponseWriter, res *http.Response, req *http.Request), error) {
+	funcSymbol, err := GetSymbol(modulePath, symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	// try to cast symbol to real func
+	respPluginHandler, ok := funcSymbol.(func(rw http.ResponseWriter, res *http.Response, req *http.Request))
+	if !ok {
+		return nil, errors.New("could not cast function symbol to TykResponseHandler")
+	}
+
+	return respPluginHandler, nil
 }

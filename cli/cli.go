@@ -1,17 +1,22 @@
 package cli
 
+//lint:file-ignore faillint This file should be ignored by faillint (fmt in use).
+
 import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"sync"
+	"testing"
 
-	"github.com/TykTechnologies/tyk/cli/linter"
-
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	kingpin "github.com/alecthomas/kingpin/v2"
 
 	"github.com/TykTechnologies/tyk/cli/bundler"
 	"github.com/TykTechnologies/tyk/cli/importer"
-	logger "github.com/TykTechnologies/tyk/log"
+	"github.com/TykTechnologies/tyk/cli/linter"
+	"github.com/TykTechnologies/tyk/cli/plugin"
+	"github.com/TykTechnologies/tyk/cli/version"
+	"github.com/TykTechnologies/tyk/internal/build"
 )
 
 const (
@@ -43,15 +48,73 @@ var (
 	DefaultMode bool
 
 	app *kingpin.Application
-
-	log = logger.Get()
 )
 
+var initOnce sync.Once
+
 // Init sets all flags and subcommands.
-func Init(version string, confPaths []string) {
+// It's only run once to avoid races over the globals.
+// The arguments are ignored for subsequent runs.
+func Init(confPaths []string) {
+	initOnce.Do(func() {
+		setup(confPaths)
+	})
+}
+
+// InitTest changes/sets global state.
+// Mocks global state :/
+func InitTest(t *testing.T, confPaths []string) {
+	t.Helper()
+
+	type globalState struct {
+		Conf               *string
+		Port               *string
+		MemProfile         *bool
+		CPUProfile         *bool
+		BlockProfile       *bool
+		MutexProfile       *bool
+		HTTPProfile        *bool
+		DebugMode          *bool
+		LogInstrumentation *bool
+		DefaultMode        bool
+		app                *kingpin.Application
+	}
+
+	snapshot := globalState{
+		Conf:               Conf,
+		Port:               Port,
+		MemProfile:         MemProfile,
+		CPUProfile:         CPUProfile,
+		BlockProfile:       BlockProfile,
+		MutexProfile:       MutexProfile,
+		HTTPProfile:        HTTPProfile,
+		DebugMode:          DebugMode,
+		LogInstrumentation: LogInstrumentation,
+		DefaultMode:        DefaultMode,
+		app:                app,
+	}
+
+	setup(confPaths)
+
+	t.Cleanup(func() {
+		Conf = snapshot.Conf
+		Port = snapshot.Port
+		MemProfile = snapshot.MemProfile
+		CPUProfile = snapshot.CPUProfile
+		BlockProfile = snapshot.BlockProfile
+		MutexProfile = snapshot.MutexProfile
+		HTTPProfile = snapshot.HTTPProfile
+		DebugMode = snapshot.DebugMode
+		LogInstrumentation = snapshot.LogInstrumentation
+		DefaultMode = snapshot.DefaultMode
+		app = snapshot.app
+	})
+}
+
+func setup(confPaths []string) {
 	app = kingpin.New(appName, appDesc)
 	app.HelpFlag.Short('h')
-	app.Version(version)
+	app.Version(build.Version)
 
 	// Start/default command:
 	startCmd := app.Command("start", "Starts the Tyk Gateway")
@@ -63,7 +126,7 @@ func Init(version string, confPaths []string) {
 	MutexProfile = startCmd.Flag("mutexprofile", "generate a mutex profile").Bool()
 	HTTPProfile = startCmd.Flag("httpprofile", "expose runtime profiling data via HTTP").Bool()
 	DebugMode = startCmd.Flag("debug", "enable debug mode").Bool()
-	LogInstrumentation = startCmd.Flag("log-intrumentation", "output intrumentation output to stdout").Bool()
+	LogInstrumentation = startCmd.Flag("log-instrumentation", "output instrumentation output to stdout").Bool()
 
 	startCmd.Action(func(ctx *kingpin.ParseContext) error {
 		DefaultMode = true
@@ -95,11 +158,17 @@ func Init(version string, confPaths []string) {
 		return nil
 	})
 
+	// Add version command:
+	version.AddTo(app)
+
 	// Add import command:
 	importer.AddTo(app)
 
 	// Add bundler commands:
 	bundler.AddTo(app)
+
+	// Add plugin commands:
+	plugin.AddTo(app)
 }
 
 // Parse parses the command-line arguments.

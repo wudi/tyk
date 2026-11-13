@@ -17,7 +17,7 @@ import (
 	"github.com/TykTechnologies/tyk/apidef"
 	logger "github.com/TykTechnologies/tyk/log"
 
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	kingpin "github.com/alecthomas/kingpin/v2"
 )
 
 const (
@@ -30,7 +30,7 @@ const (
 )
 
 var (
-	bundler *Bundler
+	bundler *Bundler = &Bundler{}
 
 	errNoHooks      = errors.New("No hooks defined")
 	errNoDriver     = errors.New("No driver specified")
@@ -47,10 +47,6 @@ type Bundler struct {
 	bundlePath   *string
 	skipSigning  *bool
 	manifestPath *string
-}
-
-func init() {
-	bundler = &Bundler{}
 }
 
 // Bundle is the entrypoint function for this subcommand.
@@ -101,7 +97,6 @@ func (b *Bundler) Build(ctx *kingpin.ParseContext) error {
 			ch := text[0:1]
 			if ch != "y" {
 				log.Fatal("Aborting")
-				os.Exit(1)
 			}
 		}
 	} else {
@@ -177,6 +172,10 @@ func (b *Bundler) validateManifest(manifest *apidef.BundleManifest) (err error) 
 
 	// We should count the auth check middleware (single), if it's present:
 	if manifest.CustomMiddleware.AuthCheck.Name != "" {
+		definedHooks++
+	}
+
+	if manifest.CustomMiddleware.TrafficLogs.Name != "" {
 		definedHooks++
 	}
 

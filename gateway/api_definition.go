@@ -1,52 +1,56 @@
 package gateway
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
-	"text/template"
+	texttemplate "text/template"
 	"time"
 
-	sprig "gopkg.in/Masterminds/sprig.v2"
-
-	circuit "github.com/TykTechnologies/circuitbreaker"
-	"github.com/gorilla/mux"
-	"github.com/jensneuse/graphql-go-tools/pkg/graphql"
+	"github.com/Masterminds/sprig/v3"
+	"github.com/cenk/backoff"
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/routers/gorillamux"
 	"github.com/sirupsen/logrus"
 
-	"github.com/TykTechnologies/gojsonschema"
+	circuit "github.com/TykTechnologies/circuitbreaker"
+	"github.com/TykTechnologies/storage/kv"
+
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/apidef/oas"
 	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/headers"
+	"github.com/TykTechnologies/tyk/ee/middleware/streams"
+	"github.com/TykTechnologies/tyk/header"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
+	"github.com/TykTechnologies/tyk/internal/httputil"
+	"github.com/TykTechnologies/tyk/internal/mcp"
+	"github.com/TykTechnologies/tyk/internal/model"
+	"github.com/TykTechnologies/tyk/internal/oasutil"
+	"github.com/TykTechnologies/tyk/internal/result"
+	"github.com/TykTechnologies/tyk/internal/service/gojsonschema"
+	"github.com/TykTechnologies/tyk/pkg/schema"
 	"github.com/TykTechnologies/tyk/regexp"
 	"github.com/TykTechnologies/tyk/rpc"
 	"github.com/TykTechnologies/tyk/storage"
 )
 
-//const used by cache middleware
+// const used by cache middleware
 const SAFE_METHODS = "SAFE_METHODS"
 
 const (
 	LDAPStorageEngine apidef.StorageEngineCode = "ldap"
 	RPCStorageEngine  apidef.StorageEngineCode = "rpc"
-)
-
-// Constants used by the version check middleware
-const (
-	headerLocation    = "header"
-	urlParamLocation  = "url-param"
-	urlLocation       = "url"
-	expiredTimeFormat = "2006-01-02 15:04"
 )
 
 // URLStatus is a custom enum type to avoid collisions
@@ -59,6 +63,7 @@ const (
 	Ignored
 	WhiteList
 	BlackList
+	MockResponse
 	Cached
 	Transformed
 	TransformedJQ
@@ -75,7 +80,12 @@ const (
 	RequestTracked
 	RequestNotTracked
 	ValidateJSONRequest
+	OASValidateRequest
 	Internal
+	GoPlugin
+	PersistGraphQL
+	RateLimit
+	OASMockResponse
 )
 
 // RequestStatus is a custom type to avoid collisions
@@ -83,69 +93,55 @@ type RequestStatus string
 
 // Statuses of the request, all are false-y except StatusOk and StatusOkAndIgnore
 const (
-	VersionNotFound                RequestStatus = "Version information not found"
-	VersionDoesNotExist            RequestStatus = "This API version does not seem to exist"
-	VersionWhiteListStatusNotFound RequestStatus = "WhiteListStatus for path not found"
-	VersionExpired                 RequestStatus = "Api Version has expired, please check documentation or contact administrator"
-	EndPointNotAllowed             RequestStatus = "Requested endpoint is forbidden"
-	StatusOkAndIgnore              RequestStatus = "Everything OK, passing and not filtering"
-	StatusOk                       RequestStatus = "Everything OK, passing"
-	StatusCached                   RequestStatus = "Cached path"
-	StatusTransform                RequestStatus = "Transformed path"
-	StatusTransformResponse        RequestStatus = "Transformed response"
-	StatusTransformJQ              RequestStatus = "Transformed path with JQ"
-	StatusTransformJQResponse      RequestStatus = "Transformed response with JQ"
-	StatusHeaderInjected           RequestStatus = "Header injected"
-	StatusMethodTransformed        RequestStatus = "Method Transformed"
-	StatusHeaderInjectedResponse   RequestStatus = "Header injected on response"
-	StatusRedirectFlowByReply      RequestStatus = "Exceptional action requested, redirecting flow!"
-	StatusHardTimeout              RequestStatus = "Hard Timeout enforced on path"
-	StatusCircuitBreaker           RequestStatus = "Circuit breaker enforced"
-	StatusURLRewrite               RequestStatus = "URL Rewritten"
-	StatusVirtualPath              RequestStatus = "Virtual Endpoint"
-	StatusRequestSizeControlled    RequestStatus = "Request Size Limited"
-	StatusRequestTracked           RequestStatus = "Request Tracked"
-	StatusRequestNotTracked        RequestStatus = "Request Not Tracked"
-	StatusValidateJSON             RequestStatus = "Validate JSON"
-	StatusInternal                 RequestStatus = "Internal path"
+	VersionNotFound                       RequestStatus = "Version information not found"
+	VersionDoesNotExist                   RequestStatus = "This API version does not seem to exist"
+	VersionWhiteListStatusNotFound        RequestStatus = "WhiteListStatus for path not found"
+	VersionExpired                        RequestStatus = "Api Version has expired, please check documentation or contact administrator"
+	VersionDefaultForNotVersionedNotFound RequestStatus = "No default API version for this non-versioned API found"
+	VersionAmbiguousDefault               RequestStatus = "Ambiguous default API version for this non-versioned API"
+	APIExpired                            RequestStatus = "API has expired, please check documentation or contact administrator"
+	EndPointNotAllowed                    RequestStatus = "Requested endpoint is forbidden"
+	StatusOkAndIgnore                     RequestStatus = "Everything OK, passing and not filtering"
+	StatusOk                              RequestStatus = "Everything OK, passing"
+	StatusCached                          RequestStatus = "Cached path"
+	StatusTransform                       RequestStatus = "Transformed path"
+	StatusTransformResponse               RequestStatus = "Transformed response"
+	StatusTransformJQ                     RequestStatus = "Transformed path with JQ"
+	StatusTransformJQResponse             RequestStatus = "Transformed response with JQ"
+	StatusHeaderInjected                  RequestStatus = "Header injected"
+	StatusMethodTransformed               RequestStatus = "Method Transformed"
+	StatusHeaderInjectedResponse          RequestStatus = "Header injected on response"
+	StatusRedirectFlowByReply             RequestStatus = "Exceptional action requested, redirecting flow!"
+	StatusHardTimeout                     RequestStatus = "Hard Timeout enforced on path"
+	StatusCircuitBreaker                  RequestStatus = "Circuit breaker enforced"
+	StatusURLRewrite                      RequestStatus = "URL Rewritten"
+	StatusVirtualPath                     RequestStatus = "Virtual Endpoint"
+	StatusRequestSizeControlled           RequestStatus = "Request Size Limited"
+	StatusRequestTracked                  RequestStatus = "Request Tracked"
+	StatusRequestNotTracked               RequestStatus = "Request Not Tracked"
+	StatusValidateJSON                    RequestStatus = "Validate JSON"
+	StatusValidateRequest                 RequestStatus = "Validate Request"
+	StatusOASValidateRequest              RequestStatus = "OAS Validate Request"
+	StatusOASMockResponse                 RequestStatus = "OAS Mock Response"
+	StatusInternal                        RequestStatus = "Internal path"
+	StatusGoPlugin                        RequestStatus = "Go plugin"
+	StatusPersistGraphQL                  RequestStatus = "Persist GraphQL"
+	StatusRateLimit                       RequestStatus = "Rate Limited"
+	// MCPPrimitiveNotFound is returned when a primitive VEM is accessed directly (not via JSON-RPC routing).
+	// It intentionally maps to HTTP 404 to avoid exposing internal-only endpoints.
+	MCPPrimitiveNotFound RequestStatus = "MCP Primitive Not Found"
 )
-
-// URLSpec represents a flattened specification for URLs, used to check if a proxy URL
-// path is on any of the white, black or ignored lists. This is generated as part of the
-// configuration init
-type URLSpec struct {
-	Spec                      *regexp.Regexp
-	Status                    URLStatus
-	MethodActions             map[string]apidef.EndpointMethodMeta
-	CacheConfig               EndPointCacheMeta
-	TransformAction           TransformSpec
-	TransformResponseAction   TransformSpec
-	TransformJQAction         TransformJQSpec
-	TransformJQResponseAction TransformJQSpec
-	InjectHeaders             apidef.HeaderInjectionMeta
-	InjectHeadersResponse     apidef.HeaderInjectionMeta
-	HardTimeout               apidef.HardTimeoutMeta
-	CircuitBreaker            ExtendedCircuitBreakerMeta
-	URLRewrite                *apidef.URLRewriteMeta
-	VirtualPathSpec           apidef.VirtualMeta
-	RequestSize               apidef.RequestSizeMeta
-	MethodTransform           apidef.MethodTransformMeta
-	TrackEndpoint             apidef.TrackEndpointMeta
-	DoNotTrackEndpoint        apidef.TrackEndpointMeta
-	ValidatePathMeta          apidef.ValidatePathMeta
-	Internal                  apidef.InternalMeta
-	IgnoreCase                bool
-}
 
 type EndPointCacheMeta struct {
 	Method                 string
 	CacheKeyRegex          string
 	CacheOnlyResponseCodes []int
+	Timeout                int64
 }
 
 type TransformSpec struct {
 	apidef.TemplateMeta
-	Template *template.Template
+	Template result.Result[*texttemplate.Template]
 }
 
 type ExtendedCircuitBreakerMeta struct {
@@ -153,49 +149,30 @@ type ExtendedCircuitBreakerMeta struct {
 	CB *circuit.Breaker `json:"-"`
 }
 
-// APISpec represents a path specification for an API, to avoid enumerating multiple nested lists, a single
-// flattened URL list is checked for matching paths and then it's status evaluated if found.
-type APISpec struct {
-	*apidef.APIDefinition
-	sync.RWMutex
-
-	RxPaths                  map[string][]URLSpec
-	WhiteListEnabled         map[string]bool
-	target                   *url.URL
-	AuthManager              AuthorisationHandler
-	OAuthManager             *OAuthManager
-	OrgSessionManager        SessionHandler
-	EventPaths               map[apidef.TykEvent][]config.TykEventHandler
-	Health                   HealthChecker
-	JSVM                     JSVM
-	ResponseChain            []TykResponseHandler
-	RoundRobin               RoundRobin
-	URLRewriteEnabled        bool
-	CircuitBreakerEnabled    bool
-	EnforcedTimeoutEnabled   bool
-	LastGoodHostList         *apidef.HostList
-	HasRun                   bool
-	ServiceRefreshInProgress bool
-	HTTPTransport            *TykRoundTripper
-	HTTPTransportCreated     time.Time
-	WSTransport              http.RoundTripper
-	WSTransportCreated       time.Time
-	GlobalConfig             config.Config
-	OrgHasNoSession          bool
-
-	middlewareChain *ChainObject
-
-	network NetworkStats
-
-	GraphQLExecutor struct {
-		Engine *graphql.ExecutionEngine
-		Client *http.Client
-		Schema *graphql.Schema
-	}
+type OAuthManagerInterface interface {
+	Storage() ExtendedOsinStorageInterface
 }
 
-// Release re;leases all resources associated with API spec
-func (s *APISpec) Release() {
+// GetSessionLifetimeRespectsKeyExpiration returns a boolean to tell whether session lifetime should respect to key expiration or not.
+// The global config takes the precedence. If the global one is `true`, value of the one in api level doesn't matter.
+func (a *APISpec) GetSessionLifetimeRespectsKeyExpiration() bool {
+	if a.GlobalConfig.SessionLifetimeRespectsKeyExpiration {
+		return true
+	}
+
+	return a.SessionLifetimeRespectsKeyExpiration
+}
+
+// AddUnloadHook adds a function to be called when the API spec is unloaded
+func (s *APISpec) AddUnloadHook(hook func()) {
+	s.unloadHooks = append(s.unloadHooks, hook)
+}
+
+// Release releases all resources associated with API spec
+func (s *APISpec) Unload() {
+	s.Lock()
+	defer s.Unlock()
+
 	// release circuit breaker resources
 	for _, path := range s.RxPaths {
 		for _, urlSpec := range path {
@@ -206,11 +183,74 @@ func (s *APISpec) Release() {
 		}
 	}
 
+	// cancel execution contexts
+	if s.GraphEngine != nil {
+		s.GraphEngine.Cancel()
+	}
+
 	// release all other resources associated with spec
+
+	// JSVM object is a circular dependecy hell, but we can check if it initialized like this
+	if s.JSVM.VM != nil {
+		s.JSVM.DeInit()
+	}
+	if s.GojaJSVM.Initialized() {
+		s.GojaJSVM.DeInit()
+	}
+
+	if s.HTTPTransport != nil {
+		s.HTTPTransport.Retire()
+		s.HTTPTransport = nil
+	}
+
+	for _, hook := range s.unloadHooks {
+		hook()
+	}
+	s.unloadHooks = nil
+
+	// stop upstream certificate monitoring goroutine (after all hooks to ensure middleware cleanup completes first)
+	s.UnloadUpstreamCertMonitoring()
+
+	// Clear MCP primitives map
+	s.MCPPrimitives = nil
 }
 
 // Validate returns nil if s is a valid spec and an error stating why the spec is not valid.
-func (s *APISpec) Validate() error {
+func (s *APISpec) Validate(oasConfig config.OASConfig) error {
+	if s.IsOAS {
+		var err error
+		if s.IsMCPManaged() {
+			// MCP-aware path: empty-mode + no-resource PRM config
+			// resolves to mirror, so users can enable mirror by just
+			// marking the API as MCP without any static fields.
+			err = s.OAS.ValidateForMCP(context.Background(), oas.GetValidationOptionsFromConfig(oasConfig)...)
+		} else {
+			err = s.OAS.Validate(context.Background(), oas.GetValidationOptionsFromConfig(oasConfig)...)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if s.MCP != nil {
+		if !s.IsMCPManaged() {
+			if len(s.MCP.TrustedOrigins) > 0 || hasMCPOAuthBrokerConfiguration(s.MCP.OAuthBroker) {
+				return errors.New("mcp configuration is valid only for MCP APIs")
+			}
+		} else {
+			if err := s.MCP.Validate(); err != nil {
+				return err
+			}
+			if s.MCP.OAuthBroker != nil {
+				if err := s.MCP.OAuthBroker.Validate(s.Proxy.ListenPath); err != nil {
+					return err
+				}
+				if s.MCP.OAuthBroker.Enabled && s.UpstreamAuth.IsEnabled() {
+					return errors.New("MCP OAuth broker cannot be combined with generic upstream authentication")
+				}
+			}
+		}
+	}
+
 	// For tcp services we need to make sure we can bind to the port.
 	switch s.Protocol {
 	case "tcp", "tls":
@@ -218,6 +258,15 @@ func (s *APISpec) Validate() error {
 	default:
 		return s.validateHTTP()
 	}
+}
+
+func hasMCPOAuthBrokerConfiguration(config *apidef.MCPOAuthBrokerConfig) bool {
+	return config != nil && (config.Enabled ||
+		config.PublicOrigin != "" ||
+		config.PublicResource != "" ||
+		config.UpstreamResource != "" ||
+		len(config.TrustedEndpointOrigins) > 0 ||
+		config.AllowInsecureLoopback)
 }
 
 func (s *APISpec) validateTCP() error {
@@ -232,67 +281,101 @@ func (s *APISpec) validateHTTP() error {
 	return nil
 }
 
+func (s *APISpec) isStreamingAPI() bool {
+	if s.OAS.T.Extensions == nil {
+		return false
+	}
+
+	_, ok := s.OAS.T.Extensions[streams.ExtensionTykStreaming]
+	return ok
+}
+
 // APIDefinitionLoader will load an Api definition from a storage
 // system.
-type APIDefinitionLoader struct{}
-
-// Nonce to use when interacting with the dashboard service
-var ServiceNonce string
+type APIDefinitionLoader struct {
+	Gw *Gateway `json:"-"`
+}
 
 // MakeSpec will generate a flattened URLSpec from and APIDefinitions' VersionInfo data. paths are
 // keyed to the Api version name, which is determined during routing to speed up lookups
-func (a APIDefinitionLoader) MakeSpec(def *apidef.APIDefinition, logger *logrus.Entry) *APISpec {
-	spec := &APISpec{}
-
+func (a APIDefinitionLoader) MakeSpec(def *model.MergedAPI, logger *logrus.Entry) (*APISpec, error) {
 	if logger == nil {
-		logger = logrus.NewEntry(log)
+		logger = log.WithFields(logrus.Fields{
+			"api_id": def.APIID,
+			"org_id": def.OrgID,
+			"name":   def.Name,
+		})
 	}
 
+	spec := &APISpec{}
+	apiString, err := json.Marshal(def)
+	if err != nil {
+		logger.WithError(err).Error("Failed to JSON marshal API definition")
+		return nil, err
+	}
+
+	sha256hash := sha256.Sum256(apiString)
+	// Unique API content ID, to check if we already have if it changed from previous sync
+	spec.Checksum = base64.URLEncoding.EncodeToString(sha256hash[:])
+
+	spec.APIDefinition = def.APIDefinition
+	spec.Proxy.ListenPath = spec.ValidListenPath()
+
+	if currSpec := a.Gw.getApiSpec(def.APIID); !shouldReloadSpec(currSpec, spec) {
+		return currSpec, nil
+	}
+
+	// new expiration feature
+	if def.Expiration != "" {
+		if t, err := time.Parse(apidef.ExpirationTimeFormat, def.Expiration); err != nil {
+			logger.WithError(err).WithField("Expiration", def.Expiration).Error("Could not parse expiration date for API")
+		} else {
+			def.ExpirationTs = t
+		}
+	}
+
+	// Deprecated
 	// parse version expiration time stamps
 	for key, ver := range def.VersionData.Versions {
 		if ver.Expires == "" || ver.Expires == "-1" {
 			continue
 		}
 		// calculate the time
-		if t, err := time.Parse(expiredTimeFormat, ver.Expires); err != nil {
-			logger.WithError(err).WithField("Expires", ver.Expires).Error("Could not parse expiry date for API")
+		if t, err := time.Parse(apidef.ExpirationTimeFormat, ver.Expires); err != nil {
+			logger.WithError(err).WithField("expires", ver.Expires).Error("Could not parse expiry date for API")
 		} else {
 			ver.ExpiresTs = t
 			def.VersionData.Versions[key] = ver
 		}
 	}
 
-	spec.APIDefinition = def
-
 	// We'll push the default HealthChecker:
 	spec.Health = &DefaultHealthChecker{
+		Gw:    a.Gw,
 		APIID: spec.APIID,
 	}
 
 	// Add any new session managers or auth handlers here
-	spec.AuthManager = &DefaultAuthorisationManager{}
-
+	spec.AuthManager = &DefaultSessionManager{Gw: a.Gw}
 	spec.OrgSessionManager = &DefaultSessionManager{
 		orgID: spec.OrgID,
+		Gw:    a.Gw,
 	}
 
-	spec.GlobalConfig = config.Global()
+	spec.GlobalConfig = a.Gw.GetConfig()
 
-	// Create and init the virtual Machine
-	if config.Global().EnableJSVM {
-		mwPaths, _, _, _, _, _, _ := loadCustomMiddleware(spec)
+	if err = a.Gw.loadBundle(spec); err != nil {
+		logger.WithError(err).Error("Couldn't load bundle")
+		return nil, err
+	}
 
-		hasVirtualEndpoint := false
-
-		for _, version := range spec.VersionData.Versions {
-			if len(version.ExtendedPaths.Virtual) > 0 {
-				hasVirtualEndpoint = true
-				break
-			}
-		}
-
-		if spec.CustomMiddlewareBundle != "" || len(mwPaths) > 0 || hasVirtualEndpoint {
-			spec.JSVM.Init(spec, logger)
+	if a.Gw.GetConfig().EnableJSVM {
+		if spec.CustomMiddleware.Driver == apidef.JavaScriptDriver {
+			logger.Debug("Initializing GojaJSVM")
+			spec.GojaJSVM.Init(spec, logger, a.Gw)
+		} else if spec.hasVirtualEndpoint() || spec.CustomMiddleware.Driver == apidef.OttoDriver {
+			logger.Debug("Initializing JSVM")
+			spec.JSVM.Init(spec, logger, a.Gw)
 		}
 	}
 
@@ -305,7 +388,7 @@ func (a APIDefinitionLoader) MakeSpec(def *apidef.APIDefinition, logger *logrus.
 		logger.Debug("FOUND EVENTS TO INIT")
 		for _, handlerConf := range eventHandlerConfs {
 			logger.Debug("CREATING EVENT HANDLERS")
-			eventHandlerInstance, err := EventHandlerByName(handlerConf, spec)
+			eventHandlerInstance, err := a.Gw.EventHandlerByName(handlerConf, spec)
 
 			if err != nil {
 				logger.Error("Failed to init event handler: ", err)
@@ -313,7 +396,27 @@ func (a APIDefinitionLoader) MakeSpec(def *apidef.APIDefinition, logger *logrus.
 				logger.Debug("Init Event Handler: ", eventName)
 				spec.EventPaths[eventName] = append(spec.EventPaths[eventName], eventHandlerInstance)
 			}
+		}
+	}
 
+	// Initialize OAS before compiling path specs, as OAS middleware compilation
+	// needs access to the initialized OAS structure
+	if spec.IsOAS && def.OAS != nil {
+		loader := openapi3.NewLoader()
+		if err := loader.ResolveRefsIn(&def.OAS.T, nil); err != nil {
+			logger.WithError(err).Errorf("Dashboard loaded API's OAS reference resolve failed: %s", def.APIID)
+		}
+
+		spec.OAS = *def.OAS
+
+		// Eagerly initialize all OAS security schemes and extensions to prevent
+		// race conditions caused by lazy-initialization during request processing.
+		// See: https://github.com/TykTechnologies/tyk/issues/7573
+		spec.OAS.Initialize()
+
+		if spec.IsMCP() {
+			a.extractMCPPrimitivesToPaths(spec, def)
+			a.initMCPConfiguration(spec)
 		}
 	}
 
@@ -325,171 +428,446 @@ func (a APIDefinitionLoader) MakeSpec(def *apidef.APIDefinition, logger *logrus.
 
 		// If we have transitioned to extended path specifications, we should use these now
 		if v.UseExtendedPaths {
-			pathSpecs, whiteListSpecs = a.getExtendedPathSpecs(v, spec)
+			pathSpecs, whiteListSpecs = a.getExtendedPathSpecs(v, spec, a.Gw.GetConfig())
 		} else {
-			logger.Warning("Legacy path detected! Upgrade to extended.")
-			pathSpecs, whiteListSpecs = a.getPathSpecs(v)
+			pathSpecs, whiteListSpecs = a.getPathSpecs(v, a.Gw.GetConfig())
 		}
 		spec.RxPaths[v.Name] = pathSpecs
 		spec.WhiteListEnabled[v.Name] = whiteListSpecs
 	}
 
-	return spec
+	if err := httputil.ValidatePath(spec.Proxy.ListenPath); err != nil {
+		logger.WithError(err).Error("Invalid listen path when creating router")
+		return nil, err
+	}
+
+	oasSpec := spec.OAS.T
+	oasSpec.Servers = openapi3.Servers{
+		{URL: spec.Proxy.ListenPath},
+	}
+
+	spec.oasRouter, err = gorillamux.NewRouter(&oasSpec)
+	if err != nil {
+		logger.WithError(err).Error("Could not create OAS router")
+	}
+
+	return spec, nil
 }
 
 // FromDashboardService will connect and download ApiDefintions from a Tyk Dashboard instance.
-func (a APIDefinitionLoader) FromDashboardService(endpoint, secret string) ([]*APISpec, error) {
+func (a APIDefinitionLoader) FromDashboardService(endpoint string) ([]*APISpec, error) {
 	// Get the definitions
 	log.Debug("Calling: ", endpoint)
-	newRequest, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		log.Error("Failed to create request: ", err)
+
+	// Build request function for recovery helper
+	buildReq := func() (*http.Request, error) {
+		newRequest, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			log.Error("Failed to create request: ", err)
+			return nil, err
+		}
+
+		gwConfig := a.Gw.GetConfig()
+		newRequest.Header.Set("authorization", gwConfig.NodeSecret)
+		log.Debug("Using: NodeID: ", a.Gw.GetNodeID())
+		newRequest.Header.Set(header.XTykNodeID, a.Gw.GetNodeID())
+
+		a.Gw.ServiceNonceMutex.RLock()
+		newRequest.Header.Set(header.XTykNonce, a.Gw.ServiceNonce)
+		a.Gw.ServiceNonceMutex.RUnlock()
+
+		newRequest.Header.Set(header.XTykSessionID, a.Gw.SessionID)
+
+		return newRequest, nil
 	}
 
-	newRequest.Header.Set("authorization", secret)
-	log.Debug("Using: NodeID: ", GetNodeID())
-	newRequest.Header.Set(headers.XTykNodeID, GetNodeID())
-
-	newRequest.Header.Set(headers.XTykNonce, ServiceNonce)
-
-	c := initialiseClient()
-	resp, err := c.Do(newRequest)
+	// Execute request with automatic recovery
+	resp, err := a.Gw.executeDashboardRequestWithRecovery(buildReq, "API definitions fetch")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	// Handle 403 responses (auth errors already logged by helper)
 	if resp.StatusCode == http.StatusForbidden {
-		body, _ := ioutil.ReadAll(resp.Body)
-		reLogin()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			body = []byte("failed to read response body")
+		}
 		return nil, fmt.Errorf("login failure, Response was: %v", string(body))
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		reLogin()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			body = []byte("failed to read response body")
+		}
 		return nil, fmt.Errorf("dashboard API error, response was: %v", string(body))
 	}
 
 	// Extract tagged APIs#
-	var list struct {
-		Message []struct {
-			ApiDefinition *apidef.APIDefinition `bson:"api_definition" json:"api_definition"`
+	list := model.NewMergedAPIList()
+	inBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("Couldn't read api definition list")
+		// Check if this is a recoverable read error and retry if needed
+		if a.Gw.HandleDashboardResponseReadError(err, "API definitions read") {
+			return a.FromDashboardService(endpoint)
 		}
-		Nonce string
+		return nil, err
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to decode body: %v body was: %v", err, string(body))
+
+	inBytes = a.replaceSecrets(inBytes)
+
+	err = json.Unmarshal(inBytes, &list)
+	if err != nil {
+		log.Error("Couldn't unmarshal api definition list")
+		// JSON unmarshal errors are not network errors, so don't retry
+		return nil, err
 	}
 
 	// Extract tagged entries only
-	apiDefs := make([]*apidef.APIDefinition, 0)
-
-	if config.Global().DBAppConfOptions.NodeIsSegmented {
-		tagList := make(map[string]bool, len(config.Global().DBAppConfOptions.Tags))
-		toLoad := make(map[string]*apidef.APIDefinition)
-
-		for _, mt := range config.Global().DBAppConfOptions.Tags {
-			tagList[mt] = true
-		}
-
-		for _, apiEntry := range list.Message {
-			for _, t := range apiEntry.ApiDefinition.Tags {
-				if tagList[t] {
-					toLoad[apiEntry.ApiDefinition.APIID] = apiEntry.ApiDefinition
-				}
-			}
-		}
-
-		for _, apiDef := range toLoad {
-			apiDefs = append(apiDefs, apiDef)
-		}
-	} else {
-		for _, apiEntry := range list.Message {
-			apiDefs = append(apiDefs, apiEntry.ApiDefinition)
-		}
-	}
+	gwConfig := a.Gw.GetConfig()
+	apiDefs := list.Filter(gwConfig.DBAppConfOptions.NodeIsSegmented, gwConfig.DBAppConfOptions.Tags...)
 
 	// Process
-	var specs []*APISpec
-	for _, def := range apiDefs {
-		spec := a.MakeSpec(def, nil)
-		specs = append(specs, spec)
-	}
+	specs := a.prepareSpecs(apiDefs, gwConfig, false)
 
 	// Set the nonce
-	ServiceNonce = list.Nonce
-	log.Debug("Loading APIS Finished: Nonce Set: ", ServiceNonce)
+	a.Gw.ServiceNonceMutex.Lock()
+	a.Gw.ServiceNonce = list.Nonce
+	a.Gw.ServiceNonceMutex.Unlock()
+	log.Debug("Loading APIS Finished: Nonce Set: ", list.Nonce)
 
 	return specs, nil
 }
 
-// FromCloud will connect and download ApiDefintions from a Mongo DB instance.
-func (a APIDefinitionLoader) FromRPC(orgId string) ([]*APISpec, error) {
-	if rpc.IsEmergencyMode() {
-		return LoadDefinitionsFromRPCBackup()
+var envRegex = regexp.MustCompile(`env://([^"]+)`)
+var fileRegex = regexp.MustCompile(`file://([^"]+)`)
+
+const (
+	prefixEnv      = "env://"
+	prefixSecrets  = "secrets://"
+	prefixConsul   = "consul://"
+	prefixVault    = "vault://"
+	prefixFile     = "file://"
+	prefixKeys     = "tyk-apis"
+	prefixKV       = "kv://"
+	prefixKVInline = "$kv{"
+
+	// vaultSecretPath is the LOGICAL vault path of the fixed bulk secret.
+	// The vault provider applies the KV v1/v2 transform (inserting "data/" for
+	// v2) itself, so we must pass the logical path.
+	vaultSecretPath = "secret/" + prefixKeys
+)
+
+func (a APIDefinitionLoader) replaceSecrets(in []byte) []byte {
+	input := string(in)
+
+	if strings.Contains(input, prefixEnv) {
+		matches := envRegex.FindAllStringSubmatch(input, -1)
+		uniqueWords := map[string]bool{}
+		for _, m := range matches {
+			if uniqueWords[m[0]] {
+				continue
+			}
+
+			uniqueWords[m[0]] = true
+			val := os.Getenv(m[1])
+			if val != "" {
+				escaped := jsonEscapeString(val)
+				input = strings.ReplaceAll(input, m[0], escaped)
+			}
+		}
 	}
 
-	store := RPCStorageHandler{}
+	if strings.Contains(input, prefixSecrets) {
+		for k, v := range a.Gw.GetConfig().Secrets {
+			escaped := jsonEscapeString(v)
+			input = strings.ReplaceAll(input, prefixSecrets+k, escaped)
+		}
+	}
+
+	if strings.Contains(input, prefixConsul) {
+		if err := a.replaceConsulSecrets(&input); err != nil {
+			log.WithError(err).Error("Couldn't replace consul secrets")
+		}
+	}
+
+	if strings.Contains(input, prefixVault) {
+		if err := a.replaceVaultSecrets(&input); err != nil {
+			log.WithError(err).Error("Couldn't replace vault secrets")
+		}
+	}
+
+	if strings.Contains(input, prefixFile) {
+		if err := a.replaceFileSecrets(&input); err != nil {
+			log.WithError(err).Error("Couldn't replace file secrets")
+		}
+	}
+
+	if strings.Contains(input, prefixKV) || strings.Contains(input, prefixKVInline) {
+		if err := a.replaceKVReferences(&input); err != nil {
+			log.WithError(err).Error("Couldn't replace KV references")
+		}
+	}
+
+	return []byte(input)
+}
+
+func (a APIDefinitionLoader) replaceConsulSecrets(input *string) error {
+	store, err := a.Gw.kvRegistry.GetStore("consul")
+	if err != nil {
+		return fmt.Errorf("retrieve store: %w", err)
+	}
+
+	l, ok := kv.AsLister(store)
+	if !ok {
+		return errors.New("assign store to lister interface")
+	}
+
+	pairs, err := l.List(a.Gw.ctx, prefixKeys)
+	if err != nil {
+		return fmt.Errorf("list kv pairs: %w", err)
+	}
+
+	for k, v := range pairs {
+		key := strings.TrimPrefix(k, prefixKeys+"/")
+		escaped := jsonEscapeString(string(v))
+		*input = strings.ReplaceAll(*input, prefixConsul+key, escaped)
+	}
+
+	return nil
+}
+
+func (a APIDefinitionLoader) replaceVaultSecrets(input *string) error {
+	store, err := a.Gw.kvRegistry.GetStore("vault")
+	if err != nil {
+		return fmt.Errorf("retrieve store: %w", err)
+	}
+
+	pairsJson, err := store.Get(a.Gw.ctx, vaultSecretPath)
+	if err != nil {
+		var (
+			unavailableErr *kv.StoreUnavailableError
+			notFoundErr    *kv.KeyNotFoundError
+		)
+
+		switch {
+		case errors.As(err, &unavailableErr):
+			return fmt.Errorf("vault path unavailable: %s; vault references in API definitions will not be resolved", vaultSecretPath)
+		case errors.As(err, &notFoundErr):
+			return fmt.Errorf("vault path contains no data: %s; vault references in API definitions will not be resolved", vaultSecretPath)
+		}
+	}
+
+	var pairs map[string]any
+
+	err = json.Unmarshal([]byte(pairsJson), &pairs)
+	if err != nil {
+		return errors.New("data is not in the map format")
+	}
+
+	for k, v := range pairs {
+		escaped := jsonEscapeString(fmt.Sprintf("%v", v))
+		*input = strings.ReplaceAll(*input, prefixVault+k, escaped)
+	}
+
+	return nil
+}
+
+func (a APIDefinitionLoader) replaceFileSecrets(input *string) error {
+	store, err := a.Gw.kvRegistry.GetStore("file")
+	if err != nil {
+		return err
+	}
+
+	matches := fileRegex.FindAllStringSubmatch(*input, -1)
+	seen := map[string]bool{}
+
+	var firstErr error
+
+	for _, m := range matches {
+		if seen[m[0]] {
+			continue
+		}
+
+		seen[m[0]] = true
+
+		val, err := store.Get(a.Gw.ctx, m[1])
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		// JSON-escape the value before injecting it into the raw JSON document.
+		// Without this, multi-line content (e.g. PEM certificates) produces
+		// literal newlines inside a JSON string, which is invalid JSON.
+		jsonBytes, err := json.Marshal(val)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+
+			continue
+		}
+
+		// Strip the surrounding quotes since the replacement sits
+		// inside an existing JSON string already.
+		escaped := string(jsonBytes[1 : len(jsonBytes)-1])
+		*input = strings.ReplaceAll(*input, m[0], escaped)
+	}
+
+	return firstErr
+}
+
+// replaceKVReferences resolves new-syntax kv:// and $kv{} references via the
+// shared resolver. Unlike the legacy bulk ops, ResolveAll re-serializes the
+// document, so resolved values are JSON-escaped automatically — no manual
+// escaping here would be correct.
+func (a APIDefinitionLoader) replaceKVReferences(input *string) error {
+	resolved, err := a.Gw.kvResolver.ResolveAll(a.Gw.ctx, []byte(*input))
+	if err != nil {
+		return err
+	}
+
+	*input = string(resolved)
+
+	return nil
+}
+
+// FromCloud will connect and download ApiDefintions from a Mongo DB instance.
+func (a APIDefinitionLoader) FromRPC(store RPCDataLoader, orgId string, gw *Gateway) ([]*APISpec, error) {
+	if rpc.IsEmergencyMode() {
+		return gw.LoadDefinitionsFromRPCBackup()
+	}
+
 	if !store.Connect() {
 		return nil, errors.New("Can't connect RPC layer")
 	}
 
 	// enable segments
 	var tags []string
-	if config.Global().DBAppConfOptions.NodeIsSegmented {
-		log.Info("Segmented node, loading: ", config.Global().DBAppConfOptions.Tags)
-		tags = config.Global().DBAppConfOptions.Tags
+	if gw.GetConfig().DBAppConfOptions.NodeIsSegmented {
+		log.Info("Segmented node, loading: ", gw.GetConfig().DBAppConfOptions.Tags)
+		tags = gw.GetConfig().DBAppConfOptions.Tags
 	}
 
 	apiCollection := store.GetApiDefinitions(orgId, tags)
+	apiCollection = string(a.replaceSecrets([]byte(apiCollection)))
 
 	//store.Disconnect()
 
 	if rpc.LoadCount() > 0 {
-		if err := saveRPCDefinitionsBackup(apiCollection); err != nil {
-			return nil, err
+		if err := gw.saveRPCDefinitionsBackup(apiCollection); err != nil {
+			log.Error(err)
 		}
 	}
 
-	return a.processRPCDefinitions(apiCollection)
+	return a.processRPCDefinitions(apiCollection, gw)
 }
 
-func (a APIDefinitionLoader) processRPCDefinitions(apiCollection string) ([]*APISpec, error) {
-
-	var apiDefs []*apidef.APIDefinition
-	if err := json.Unmarshal([]byte(apiCollection), &apiDefs); err != nil {
+func (a APIDefinitionLoader) processRPCDefinitions(apiCollection string, gw *Gateway) ([]*APISpec, error) {
+	var payload []model.MergedAPI
+	if err := json.Unmarshal([]byte(apiCollection), &payload); err != nil {
 		return nil, err
 	}
 
-	var specs []*APISpec
-	for _, def := range apiDefs {
-		def.DecodeFromDB()
+	list := model.NewMergedAPIList(payload...)
 
-		if config.Global().SlaveOptions.BindToSlugsInsteadOfListenPaths {
-			newListenPath := "/" + def.Slug //+ "/"
-			log.Warning("Binding to ",
-				newListenPath,
-				" instead of ",
-				def.Proxy.ListenPath)
+	gwConfig := a.Gw.GetConfig()
 
-			def.Proxy.ListenPath = newListenPath
-		}
+	// Extract tagged entries only
+	apiDefs := list.Filter(gwConfig.DBAppConfOptions.NodeIsSegmented, gwConfig.DBAppConfOptions.Tags...)
 
-		spec := a.MakeSpec(def, nil)
-		specs = append(specs, spec)
-	}
+	specs := a.prepareSpecs(apiDefs, gwConfig, true)
 
 	return specs, nil
 }
 
-func (a APIDefinitionLoader) ParseDefinition(r io.Reader) *apidef.APIDefinition {
-	def := &apidef.APIDefinition{}
-	if err := json.NewDecoder(r).Decode(def); err != nil {
-		log.Error("[RPC] --> Couldn't unmarshal api configuration: ", err)
+func (a APIDefinitionLoader) prepareSpecs(apiDefs []model.MergedAPI, gwConfig config.Config, fromRPC bool) []*APISpec {
+	var specs []*APISpec
+
+	for _, def := range apiDefs {
+		if fromRPC {
+			def.DecodeFromDB()
+
+			if gwConfig.SlaveOptions.BindToSlugsInsteadOfListenPaths {
+				newListenPath := "/" + def.Slug //+ "/"
+				log.Warning("Binding to ",
+					newListenPath,
+					" instead of ",
+					def.Proxy.ListenPath)
+
+				def.Proxy.ListenPath = newListenPath
+			}
+		}
+
+		spec, err := a.MakeSpec(&def, nil)
+		if err != nil {
+			continue
+		}
+
+		specs = append(specs, spec)
 	}
-	return def
+
+	return specs
+}
+
+func (a APIDefinitionLoader) ParseDefinition(r io.Reader) (api apidef.APIDefinition) {
+	if err := json.NewDecoder(r).Decode(&api); err != nil {
+		log.Error("Couldn't unmarshal api configuration: ", err)
+	}
+
+	return
+}
+
+func (a APIDefinitionLoader) ParseOAS(r io.Reader) (oas oas.OAS) {
+	if err := json.NewDecoder(r).Decode(&oas); err != nil {
+		log.Error("Couldn't unmarshal oas configuration: ", err)
+	}
+
+	return
+}
+
+func (a APIDefinitionLoader) GetOASFilepath(path string) string {
+	return strings.TrimSuffix(path, ".json") + "-oas.json"
+}
+
+func (a APIDefinitionLoader) GetMCPFilepath(path string) string {
+	return strings.TrimSuffix(path, ".json") + "-mcp.json"
+}
+
+func (a APIDefinitionLoader) isOASCompanionFile(path string) bool {
+	var apiDefPath string
+	switch {
+	case strings.HasSuffix(path, "-oas.json"):
+		apiDefPath = strings.TrimSuffix(path, "-oas.json") + ".json"
+	case strings.HasSuffix(path, "-mcp.json"):
+		apiDefPath = strings.TrimSuffix(path, "-mcp.json") + ".json"
+	default:
+		return false
+	}
+
+	if _, err := os.Stat(apiDefPath); err != nil {
+		return false
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	var marker struct {
+		OpenAPI string `json:"openapi"`
+		Swagger string `json:"swagger"`
+	}
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return false
+	}
+	return marker.OpenAPI != "" || marker.Swagger != ""
 }
 
 // FromDir will load APIDefinitions from a directory on the filesystem. Definitions need
@@ -499,24 +877,83 @@ func (a APIDefinitionLoader) FromDir(dir string) []*APISpec {
 	// Grab json files from directory
 	paths, _ := filepath.Glob(filepath.Join(dir, "*.json"))
 	for _, path := range paths {
-		log.Info("Loading API Specification from ", path)
-		f, err := os.Open(path)
-		if err != nil {
-			log.Error("Couldn't open api configuration file: ", err)
+		// Skip companion files (loaded separately)
+		if a.isOASCompanionFile(path) {
 			continue
 		}
-		def := a.ParseDefinition(f)
-		f.Close()
-		spec := a.MakeSpec(def, nil)
+
+		spec, err := a.loadDefFromFilePath(path)
+
+		if err != nil {
+			continue
+		}
+
 		specs = append(specs, spec)
 	}
 	return specs
 }
+func (a APIDefinitionLoader) loadDefFromFilePath(filePath string) (*APISpec, error) {
+	log.Info("Loading API Specification from ", filePath)
 
-func (a APIDefinitionLoader) getPathSpecs(apiVersionDef apidef.VersionInfo) ([]URLSpec, bool) {
-	ignoredPaths := a.compilePathSpec(apiVersionDef.Paths.Ignored, Ignored)
-	blackListPaths := a.compilePathSpec(apiVersionDef.Paths.BlackList, BlackList)
-	whiteListPaths := a.compilePathSpec(apiVersionDef.Paths.WhiteList, WhiteList)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Error("Couldn't read api configuration file: ", err)
+		return nil, err
+	}
+
+	data = a.replaceSecrets(data)
+
+	var def apidef.APIDefinition
+	err = json.Unmarshal(data, &def)
+	if err != nil {
+		log.Error("Couldn't unmarshal read file: ", err)
+		return nil, err
+	}
+
+	nestDef := model.MergedAPI{APIDefinition: &def}
+	if def.IsOAS {
+		loader := openapi3.NewLoader()
+		// Apply replaceSecrets to OAS bytes before parsing so secret prefixes
+		// (vault://, env://, etc.) in the x-tyk-api-gateway extension are resolved.
+		// Scoped to local-file reads only — resolving remote $ref content would be
+		// an injection vector for operator-untrusted bytes.
+		loader.ReadFromURIFunc = func(l *openapi3.Loader, uri *url.URL) ([]byte, error) {
+			b, err := openapi3.ReadFromFile(l, uri)
+			if err != nil {
+				return nil, err
+			}
+			if uri == nil || uri.Scheme == "" || uri.Scheme == "file" {
+				return a.replaceSecrets(b), nil
+			}
+			return b, nil
+		}
+
+		var oasFilepath string
+		if def.IsMCPManaged() {
+			oasFilepath = a.GetMCPFilepath(filePath)
+		} else {
+			oasFilepath = a.GetOASFilepath(filePath)
+		}
+
+		oasDoc, err := loader.LoadFromFile(oasFilepath)
+		if err == nil {
+			oasObj := &oas.OAS{T: *oasDoc}
+
+			visitor := schema.NewVisitor()
+			visitor.AddSchemaManipulation(schema.TransformUnicodeEscapesToRE2Manipulation)
+			visitor.ProcessOAS(oasObj)
+
+			nestDef.OAS = oasObj
+		}
+	}
+
+	return a.MakeSpec(&nestDef, nil)
+}
+
+func (a APIDefinitionLoader) getPathSpecs(apiVersionDef apidef.VersionInfo, conf config.Config) ([]URLSpec, bool) {
+	ignoredPaths := a.compilePathSpec(apiVersionDef.Paths.Ignored, Ignored, conf)
+	blackListPaths := a.compilePathSpec(apiVersionDef.Paths.BlackList, BlackList, conf)
+	whiteListPaths := a.compilePathSpec(apiVersionDef.Paths.WhiteList, WhiteList, conf)
 
 	combinedPath := []URLSpec{}
 	combinedPath = append(combinedPath, ignoredPaths...)
@@ -526,57 +963,101 @@ func (a APIDefinitionLoader) getPathSpecs(apiVersionDef apidef.VersionInfo) ([]U
 	return combinedPath, len(whiteListPaths) > 0
 }
 
-func (a APIDefinitionLoader) generateRegex(stringSpec string, newSpec *URLSpec, specType URLStatus) {
-	apiLangIDsRegex := regexp.MustCompile(`{([^}]*)}`)
-	asRegexStr := apiLangIDsRegex.ReplaceAllString(stringSpec, `([^/]*)`)
+func (a APIDefinitionLoader) generateRegex(stringSpec string, newSpec *URLSpec, specType URLStatus, conf config.Config) {
+	var (
+		pattern string
+		err     error
+	)
+	// Hook per-api settings here via newSpec *URLSpec
+	isPrefixMatch := conf.HttpServerOptions.EnablePathPrefixMatching
+	isSuffixMatch := conf.HttpServerOptions.EnablePathSuffixMatching
+	isIgnoreCase := newSpec.IgnoreCase || conf.IgnoreEndpointCase
+
+	pattern = httputil.PreparePathRegexp(stringSpec, isPrefixMatch, isSuffixMatch)
+
 	// Case insensitive match
-	if newSpec.IgnoreCase || config.Global().IgnoreEndpointCase {
-		asRegexStr = "(?i)" + asRegexStr
+	if isIgnoreCase {
+		pattern = "(?i)" + pattern
 	}
-	asRegex, _ := regexp.Compile(asRegexStr)
+
+	asRegex, err := regexp.Compile(pattern)
+	log.WithError(err).Debugf("URLSpec: %s => %s type=%d", stringSpec, pattern, specType)
+
 	newSpec.Status = specType
-	newSpec.Spec = asRegex
+	newSpec.spec = asRegex
 }
 
-func (a APIDefinitionLoader) compilePathSpec(paths []string, specType URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compilePathSpec(paths []string, specType URLStatus, conf config.Config) []URLSpec {
 	// transform a configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec, &newSpec, specType)
+		a.generateRegex(stringSpec, &newSpec, specType, conf)
 		urlSpec = append(urlSpec, newSpec)
 	}
 
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileExtendedPathSpec(ignoreEndpointCase bool, paths []apidef.EndPointMeta, specType URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileExtendedPathSpec(ignoreEndpointCase bool, paths []apidef.EndPointMeta, specType URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{IgnoreCase: stringSpec.IgnoreCase || ignoreEndpointCase}
-		a.generateRegex(stringSpec.Path, &newSpec, specType)
+		a.generateRegex(stringSpec.Path, &newSpec, specType, conf)
+
+		switch specType {
+		case WhiteList:
+			newSpec.Whitelist = stringSpec
+		case BlackList:
+			newSpec.Blacklist = stringSpec
+		case Ignored:
+			newSpec.Ignored = stringSpec
+		}
 
 		// Extend with method actions
 		newSpec.MethodActions = stringSpec.MethodActions
+
 		urlSpec = append(urlSpec, newSpec)
 	}
 
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileCachedPathSpec(oldpaths []string, newpaths []apidef.CacheMeta) []URLSpec {
+func (a APIDefinitionLoader) compileMockResponsePathSpec(ignoreEndpointCase bool, paths []apidef.MockResponseMeta, specType URLStatus, conf config.Config) []URLSpec {
+	var urlSpec []URLSpec
+
+	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
+		newSpec := URLSpec{IgnoreCase: stringSpec.IgnoreCase || ignoreEndpointCase}
+		a.generateRegex(stringSpec.Path, &newSpec, specType, conf)
+
+		newSpec.MockResponse = stringSpec
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	return urlSpec
+}
+
+func (a APIDefinitionLoader) compileCachedPathSpec(oldpaths []string, newpaths []apidef.CacheMeta, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range oldpaths {
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec, &newSpec, Cached)
+		a.generateRegex(stringSpec, &newSpec, Cached, conf)
 		newSpec.CacheConfig.Method = SAFE_METHODS
 		newSpec.CacheConfig.CacheKeyRegex = ""
 		// Extend with method actions
@@ -584,11 +1065,16 @@ func (a APIDefinitionLoader) compileCachedPathSpec(oldpaths []string, newpaths [
 	}
 
 	for _, spec := range newpaths {
+		if spec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(spec.Path, &newSpec, Cached)
+		a.generateRegex(spec.Path, &newSpec, Cached, conf)
 		newSpec.CacheConfig.Method = spec.Method
 		newSpec.CacheConfig.CacheKeyRegex = spec.CacheKeyRegex
 		newSpec.CacheConfig.CacheOnlyResponseCodes = spec.CacheOnlyResponseCodes
+		newSpec.CacheConfig.Timeout = spec.Timeout
 		// Extend with method actions
 		urlSpec = append(urlSpec, newSpec)
 	}
@@ -596,21 +1082,75 @@ func (a APIDefinitionLoader) compileCachedPathSpec(oldpaths []string, newpaths [
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) filterSprigFuncs() template.FuncMap {
+func (a APIDefinitionLoader) filterSprigFuncs() texttemplate.FuncMap {
 	tmp := sprig.GenericFuncMap()
 	delete(tmp, "env")
 	delete(tmp, "expandenv")
 
-	return template.FuncMap(tmp)
+	return texttemplate.FuncMap(tmp)
 }
 
-func (a APIDefinitionLoader) loadFileTemplate(path string) (*template.Template, error) {
+// errUnsafeTemplatePath marks a body transform template path rejected by resolveTemplatePath.
+var errUnsafeTemplatePath = errors.New("unsafe template path")
+
+// resolveTemplatePath returns the body transform template path the gateway will read.
+// By default the path is confined to the configured TemplatePath root via the
+// gateway's osutil.Root, which also resolves symlinks and relative segments. A
+// relative path is tried against the root first, then against the working directory;
+// either way the result must lie inside the root. When
+// AllowUnsafeBodyTransformTemplatePaths is set the path is returned verbatim, without
+// any validation.
+func (a APIDefinitionLoader) resolveTemplatePath(path string) (string, error) {
+	if a.Gw == nil {
+		return "", errors.New("gateway is not initialized")
+	}
+
+	if a.Gw.GetConfig().AllowUnsafeBodyTransformTemplatePaths {
+		return path, nil
+	}
+
+	if a.Gw.OSRoot == nil {
+		return "", errors.New("OSRoot is not initialized")
+	}
+
+	resolved, err := a.Gw.OSRoot.Ensure(path)
+	if filepath.IsAbs(path) {
+		return resolved, err
+	}
+
+	if err == nil && fileExists(resolved) {
+		return resolved, nil
+	}
+
+	// Before paths were confined, relative paths resolved against the working
+	// directory, which is how the docs write them (templates/x.tmpl). Keep that
+	// working, but only when the file exists and lies inside the root.
+	if legacy, absErr := filepath.Abs(path); absErr == nil && fileExists(legacy) {
+		return a.Gw.OSRoot.Ensure(legacy)
+	}
+
+	return resolved, err
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func (a APIDefinitionLoader) loadFileTemplate(path string) (*texttemplate.Template, error) {
 	log.Debug("-- Loading template: ", path)
-	tmpName := filepath.Base(path)
-	return apidef.Template.New(tmpName).Funcs(a.filterSprigFuncs()).ParseFiles(path)
+
+	templatePath, err := a.resolveTemplatePath(path)
+	if err != nil {
+		log.WithError(err).Warning("Path escape detected or invalid template path")
+		return nil, fmt.Errorf("%w: %w", errUnsafeTemplatePath, err)
+	}
+
+	tmpName := filepath.Base(templatePath)
+	return apidef.Template.New(tmpName).Funcs(a.filterSprigFuncs()).ParseFiles(templatePath)
 }
 
-func (a APIDefinitionLoader) loadBlobTemplate(blob string) (*template.Template, error) {
+func (a APIDefinitionLoader) loadBlobTemplate(blob string) (*texttemplate.Template, error) {
 	log.Debug("-- Loading blob")
 	uDec, err := base64.StdEncoding.DecodeString(blob)
 	if err != nil {
@@ -619,33 +1159,36 @@ func (a APIDefinitionLoader) loadBlobTemplate(blob string) (*template.Template, 
 	return apidef.Template.New("").Funcs(a.filterSprigFuncs()).Parse(string(uDec))
 }
 
-func (a APIDefinitionLoader) compileTransformPathSpec(paths []apidef.TemplateMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileTransformPathSpec(paths []apidef.TemplateMeta, stat URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	log.Debug("Checking for transform paths...")
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		log.Debug("-- Generating path")
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with template actions
 
 		newTransformSpec := TransformSpec{TemplateMeta: stringSpec}
 
-		// Load the templates
-		var err error
-
 		switch stringSpec.TemplateData.Mode {
 		case apidef.UseFile:
 			log.Debug("-- Using File mode")
-			newTransformSpec.Template, err = a.loadFileTemplate(stringSpec.TemplateData.TemplateSource)
+			newTransformSpec.Template = result.New(a.loadFileTemplate(stringSpec.TemplateData.TemplateSource))
 		case apidef.UseBlob:
 			log.Debug("-- Blob mode")
-			newTransformSpec.Template, err = a.loadBlobTemplate(stringSpec.TemplateData.TemplateSource)
+			newTransformSpec.Template = result.New(a.loadBlobTemplate(stringSpec.TemplateData.TemplateSource))
 		default:
 			log.Warning("[Transform Templates] No template mode defined! Found: ", stringSpec.TemplateData.Mode)
-			err = errors.New("No valid template mode defined, must be either 'file' or 'blob'")
+			newTransformSpec.Template = result.Err[*texttemplate.Template](
+				errors.New("no valid template mode defined, must be either 'file' or 'blob'"),
+			)
 		}
 
 		if stat == Transformed {
@@ -654,26 +1197,24 @@ func (a APIDefinitionLoader) compileTransformPathSpec(paths []apidef.TemplateMet
 			newSpec.TransformResponseAction = newTransformSpec
 		}
 
-		if err == nil {
-			urlSpec = append(urlSpec, newSpec)
-			log.Debug("-- Loaded")
-		} else {
-			log.Error("Template load failure! Skipping transformation: ", err)
-		}
-
+		urlSpec = append(urlSpec, newSpec)
 	}
 
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileInjectedHeaderSpec(paths []apidef.HeaderInjectionMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileInjectedHeaderSpec(paths []apidef.HeaderInjectionMeta, stat URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		if stat == HeaderInjected {
 			newSpec.InjectHeaders = stringSpec
@@ -687,14 +1228,18 @@ func (a APIDefinitionLoader) compileInjectedHeaderSpec(paths []apidef.HeaderInje
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileMethodTransformSpec(paths []apidef.MethodTransformMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileMethodTransformSpec(paths []apidef.MethodTransformMeta, stat URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		newSpec.MethodTransform = stringSpec
 
 		urlSpec = append(urlSpec, newSpec)
@@ -703,14 +1248,18 @@ func (a APIDefinitionLoader) compileMethodTransformSpec(paths []apidef.MethodTra
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileTimeoutPathSpec(paths []apidef.HardTimeoutMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileTimeoutPathSpec(paths []apidef.HardTimeoutMeta, stat URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.HardTimeout = stringSpec
 
@@ -720,14 +1269,18 @@ func (a APIDefinitionLoader) compileTimeoutPathSpec(paths []apidef.HardTimeoutMe
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileRequestSizePathSpec(paths []apidef.RequestSizeMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileRequestSizePathSpec(paths []apidef.RequestSizeMeta, stat URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.RequestSize = stringSpec
 
@@ -737,44 +1290,46 @@ func (a APIDefinitionLoader) compileRequestSizePathSpec(paths []apidef.RequestSi
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileCircuitBreakerPathSpec(paths []apidef.CircuitBreakerMeta, stat URLStatus, apiSpec *APISpec) []URLSpec {
+func (a APIDefinitionLoader) compileCircuitBreakerPathSpec(paths []apidef.CircuitBreakerMeta, stat URLStatus, apiSpec *APISpec, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.CircuitBreaker = ExtendedCircuitBreakerMeta{CircuitBreakerMeta: stringSpec}
 		log.Debug("Initialising circuit breaker for: ", stringSpec.Path)
 		newSpec.CircuitBreaker.CB = circuit.NewRateBreaker(stringSpec.ThresholdPercent, stringSpec.Samples)
+
+		// override backoff algorithm when is not desired to recheck the upstream before the ReturnToServiceAfter happens
+		if stringSpec.DisableHalfOpenState {
+			newSpec.CircuitBreaker.CB.BackOff = &backoff.StopBackOff{}
+		}
+
 		events := newSpec.CircuitBreaker.CB.Subscribe()
 		go func(path string, spec *APISpec, breakerPtr *circuit.Breaker) {
-			timerActive := false
 			for e := range events {
 				switch e {
 				case circuit.BreakerTripped:
 					log.Warning("[PROXY] [CIRCUIT BREAKER] Breaker tripped for path: ", path)
 					log.Debug("Breaker tripped: ", e)
-					// Start a timer function
 
-					if !timerActive {
-						go func(timeout int, breaker *circuit.Breaker) {
-							log.Debug("-- Sleeping for (s): ", timeout)
-							time.Sleep(time.Duration(timeout) * time.Second)
-							log.Debug("-- Resetting breaker")
-							breaker.Reset()
-							timerActive = false
-						}(newSpec.CircuitBreaker.ReturnToServiceAfter, breakerPtr)
-						timerActive = true
-					}
+					go func(timeout int, breaker *circuit.Breaker) {
+						log.Debug("-- Sleeping for (s): ", timeout)
+						time.Sleep(time.Duration(timeout) * time.Second)
+						log.Debug("-- Resetting breaker")
+						breaker.Reset()
+					}(newSpec.CircuitBreaker.ReturnToServiceAfter, breakerPtr)
 
 					if spec.Proxy.ServiceDiscovery.UseDiscoveryService {
-						if ServiceCache != nil {
-							log.Warning("[PROXY] [CIRCUIT BREAKER] Refreshing host list")
-							ServiceCache.Delete(spec.APIID)
-						}
+						log.Warning("[PROXY] [CIRCUIT BREAKER] Refreshing host list")
+						a.Gw.ServiceCache.Delete(spec.APIID)
 					}
 
 					spec.FireEvent(EventBreakerTriggered, EventCurcuitBreakerMeta{
@@ -784,8 +1339,22 @@ func (a APIDefinitionLoader) compileCircuitBreakerPathSpec(paths []apidef.Circui
 						APIID:            spec.APIID,
 					})
 
+					spec.FireEvent(EventBreakerTripped, EventCurcuitBreakerMeta{
+						EventMetaDefault: EventMetaDefault{Message: "Breaker Tripped"},
+						CircuitEvent:     e,
+						Path:             path,
+						APIID:            spec.APIID,
+					})
+
 				case circuit.BreakerReset:
 					spec.FireEvent(EventBreakerTriggered, EventCurcuitBreakerMeta{
+						EventMetaDefault: EventMetaDefault{Message: "Breaker Reset"},
+						CircuitEvent:     e,
+						Path:             path,
+						APIID:            spec.APIID,
+					})
+
+					spec.FireEvent(EventBreakerReset, EventCurcuitBreakerMeta{
 						EventMetaDefault: EventMetaDefault{Message: "Breaker Reset"},
 						CircuitEvent:     e,
 						Path:             path,
@@ -805,15 +1374,19 @@ func (a APIDefinitionLoader) compileCircuitBreakerPathSpec(paths []apidef.Circui
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileURLRewritesPathSpec(paths []apidef.URLRewriteMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileURLRewritesPathSpec(paths []apidef.URLRewriteMeta, stat URLStatus, conf config.Config) []URLSpec {
 	// transform an extended configuration URL into an array of URLSpecs
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		curStringSpec := stringSpec
 		newSpec := URLSpec{}
-		a.generateRegex(curStringSpec.Path, &newSpec, stat)
+		a.generateRegex(curStringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.URLRewrite = &curStringSpec
 
@@ -823,8 +1396,8 @@ func (a APIDefinitionLoader) compileURLRewritesPathSpec(paths []apidef.URLRewrit
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileVirtualPathspathSpec(paths []apidef.VirtualMeta, stat URLStatus, apiSpec *APISpec) []URLSpec {
-	if !config.Global().EnableJSVM {
+func (a APIDefinitionLoader) compileVirtualPathsSpec(paths []apidef.VirtualMeta, stat URLStatus, apiSpec *APISpec, conf config.Config) []URLSpec {
+	if !conf.EnableJSVM {
 		return nil
 	}
 
@@ -832,12 +1405,20 @@ func (a APIDefinitionLoader) compileVirtualPathspathSpec(paths []apidef.VirtualM
 	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.VirtualPathSpec = stringSpec
 
-		preLoadVirtualMetaCode(&newSpec.VirtualPathSpec, &apiSpec.JSVM)
+		if apiSpec.CustomMiddleware.Driver == apidef.JavaScriptDriver {
+			a.Gw.preLoadVirtualMetaCodeGoja(&newSpec.VirtualPathSpec, &apiSpec.GojaJSVM)
+		} else {
+			a.Gw.preLoadVirtualMetaCode(&newSpec.VirtualPathSpec, &apiSpec.JSVM)
+		}
 
 		urlSpec = append(urlSpec, newSpec)
 	}
@@ -845,12 +1426,64 @@ func (a APIDefinitionLoader) compileVirtualPathspathSpec(paths []apidef.VirtualM
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileTrackedEndpointPathspathSpec(paths []apidef.TrackEndpointMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileGopluginPathsSpec(paths []apidef.GoPluginMeta, stat URLStatus, _ *APISpec, conf config.Config) []URLSpec {
+
+	// transform an extended configuration URL into an array of URLSpecs
+	// This way we can iterate the whole array once, on match we break with status
+	var urlSpec []URLSpec
+
+	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
+		newSpec := URLSpec{}
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
+		// Extend with method actions
+		newSpec.GoPluginMeta.Path = stringSpec.PluginPath
+		newSpec.GoPluginMeta.SymbolName = stringSpec.SymbolName
+		newSpec.GoPluginMeta.Meta.Method = stringSpec.Method
+		newSpec.GoPluginMeta.Meta.Path = stringSpec.Path
+
+		newSpec.GoPluginMeta.loadPlugin()
+
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	return urlSpec
+}
+
+func (a APIDefinitionLoader) compilePersistGraphQLPathSpec(paths []apidef.PersistGraphQLMeta, stat URLStatus, apiSpec *APISpec, conf config.Config) []URLSpec {
+	// transform an extended configuration URL into an array of URLSpecs
+	// This way we can iterate the whole array once, on match we break with status
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
+		// Extend with method actions
+		newSpec.PersistGraphQL.Path = stringSpec.Path
+		newSpec.PersistGraphQL.Method = stringSpec.Method
+		newSpec.PersistGraphQL.Operation = stringSpec.Operation
+		newSpec.PersistGraphQL.Variables = stringSpec.Variables
+
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	return urlSpec
+}
+
+func (a APIDefinitionLoader) compileTrackedEndpointPathsSpec(paths []apidef.TrackEndpointMeta, stat URLStatus, conf config.Config) []URLSpec {
+
+	urlSpec := []URLSpec{}
+
+	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
+		newSpec := URLSpec{}
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 
 		// set Path if it wasn't set
 		if stringSpec.Path == "" {
@@ -866,28 +1499,36 @@ func (a APIDefinitionLoader) compileTrackedEndpointPathspathSpec(paths []apidef.
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileValidateJSONPathspathSpec(paths []apidef.ValidatePathMeta, stat URLStatus) []URLSpec {
-	urlSpec := make([]URLSpec, len(paths))
+func (a APIDefinitionLoader) compileValidateJSONPathsSpec(paths []apidef.ValidatePathMeta, stat URLStatus, conf config.Config) []URLSpec {
+	var urlSpec []URLSpec
 
-	for i, stringSpec := range paths {
+	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 
 		stringSpec.SchemaCache = gojsonschema.NewGoLoader(stringSpec.Schema)
 		newSpec.ValidatePathMeta = stringSpec
-		urlSpec[i] = newSpec
+		urlSpec = append(urlSpec, newSpec)
 	}
 
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileUnTrackedEndpointPathspathSpec(paths []apidef.TrackEndpointMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileUnTrackedEndpointPathsSpec(paths []apidef.TrackEndpointMeta, stat URLStatus, conf config.Config) []URLSpec {
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.DoNotTrackEndpoint = stringSpec
 		urlSpec = append(urlSpec, newSpec)
@@ -896,12 +1537,16 @@ func (a APIDefinitionLoader) compileUnTrackedEndpointPathspathSpec(paths []apide
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) compileInternalPathspathSpec(paths []apidef.InternalMeta, stat URLStatus) []URLSpec {
+func (a APIDefinitionLoader) compileInternalPathsSpec(paths []apidef.InternalMeta, stat URLStatus, conf config.Config) []URLSpec {
 	urlSpec := []URLSpec{}
 
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		newSpec := URLSpec{}
-		a.generateRegex(stringSpec.Path, &newSpec, stat)
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
 		// Extend with method actions
 		newSpec.Internal = stringSpec
 		urlSpec = append(urlSpec, newSpec)
@@ -910,31 +1555,534 @@ func (a APIDefinitionLoader) compileInternalPathspathSpec(paths []apidef.Interna
 	return urlSpec
 }
 
-func (a APIDefinitionLoader) getExtendedPathSpecs(apiVersionDef apidef.VersionInfo, apiSpec *APISpec) ([]URLSpec, bool) {
+func (a APIDefinitionLoader) compileRateLimitPathsSpec(paths []apidef.RateLimitMeta, stat URLStatus, conf config.Config) []URLSpec {
+	urlSpec := []URLSpec{}
+
+	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
+		newSpec := URLSpec{}
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
+		// Extend with method actions
+		newSpec.RateLimit = stringSpec
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	return urlSpec
+}
+
+// compileOASValidateRequestPathSpec extracts ValidateRequest operations from OAS middleware
+// and converts them to URLSpec entries that use the standard regex-based path matching algorithm.
+// This ensures OAS validateRequest middleware respects gateway configurations like
+// EnablePathPrefixMatching, EnablePathSuffixMatching, and IgnoreEndpointCase.
+func (a APIDefinitionLoader) compileOASValidateRequestPathSpec(apiSpec *APISpec, conf config.Config) []URLSpec {
+	if !apiSpec.IsOAS {
+		return nil
+	}
+
+	middleware := apiSpec.OAS.GetTykMiddleware()
+	if middleware == nil || len(middleware.Operations) == 0 {
+		return nil
+	}
+
+	urlSpec := []URLSpec{}
+
+	// Iterate through all OAS operations and find those with ValidateRequest enabled
+	for operationID, operation := range middleware.Operations {
+		if operation.ValidateRequest == nil || !operation.ValidateRequest.Enabled {
+			continue
+		}
+
+		path, method := a.findPathAndMethodForOperation(apiSpec, operationID)
+		if path == "" || method == "" {
+			continue
+		}
+
+		newSpec := URLSpec{
+			OASValidateRequestMeta: operation.ValidateRequest,
+			OASMethod:              strings.ToUpper(method),
+			OASPath:                path,
+		}
+
+		a.generateRegex(path, &newSpec, OASValidateRequest, conf)
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	urlSpec = groupCollapsedValidateRequestSpecs(urlSpec, apiSpec.OAS.Paths)
+
+	urlSpec = a.addStaticPathShields(apiSpec, conf, urlSpec, OASValidateRequest, func(path, method string) URLSpec {
+		return URLSpec{
+			OASValidateRequestMeta: &oas.ValidateRequest{Enabled: false},
+			OASMethod:              method,
+			OASPath:                path,
+		}
+	})
+
+	sortURLSpecsByPathPriority(urlSpec)
+
+	return urlSpec
+}
+
+// groupCollapsedValidateRequestSpecs detects URLSpec entries that compile to the same
+// regex+method pair and groups them as candidates on a single representative URLSpec.
+// Candidates are sorted so that more restrictive path parameter schemas are tried first.
+func groupCollapsedValidateRequestSpecs(specs []URLSpec, oasPaths *openapi3.Paths) []URLSpec {
+	return groupCollapsedSpecs(specs, oasPaths, OASValidateRequest, func(indices []int, specs []URLSpec, toRemove map[int]bool) {
+		mergeGroupIntoPrimary(indices, specs, toRemove)
+	})
+}
+
+// groupCollapsedMockResponseSpecs is the mock response equivalent of
+// groupCollapsedValidateRequestSpecs.
+func groupCollapsedMockResponseSpecs(specs []URLSpec, oasPaths *openapi3.Paths) []URLSpec {
+	return groupCollapsedSpecs(specs, oasPaths, OASMockResponse, func(indices []int, specs []URLSpec, toRemove map[int]bool) {
+		mergeMockGroupIntoPrimary(indices, specs, toRemove)
+	})
+}
+
+// groupCollapsedSpecs is the shared grouping logic for both validate request and mock
+// response. It finds URLSpec entries with the same compiled regex+method, sorts them
+// by restrictiveness, and calls the provided merge function to build candidates.
+func groupCollapsedSpecs(
+	specs []URLSpec,
+	oasPaths *openapi3.Paths,
+	status URLStatus,
+	merge func(indices []int, specs []URLSpec, toRemove map[int]bool),
+) []URLSpec {
+	type key struct {
+		regex  string
+		method string
+	}
+
+	groups := make(map[key][]int)
+	var order []key
+	for i, s := range specs {
+		if s.Status != status || s.spec == nil {
+			continue
+		}
+		k := key{regex: s.spec.String(), method: s.OASMethod}
+		if _, exists := groups[k]; !exists {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], i)
+	}
+
+	toRemove := make(map[int]bool)
+	for _, k := range order {
+		indices := groups[k]
+		if len(indices) < 2 {
+			continue
+		}
+		sortByRestrictiveness(indices, specs, oasPaths)
+		merge(indices, specs, toRemove)
+	}
+
+	return removeIndices(specs, toRemove)
+}
+
+// mergeMockGroupIntoPrimary builds MockResponseCandidates from the sorted indices
+// and assigns them to the primary (first) spec.
+func mergeMockGroupIntoPrimary(indices []int, specs []URLSpec, toRemove map[int]bool) {
+	primary := indices[0]
+	candidates := make([]MockResponseCandidate, len(indices))
+	for ci, idx := range indices {
+		candidates[ci] = MockResponseCandidate{
+			OASMockResponseMeta: specs[idx].OASMockResponseMeta,
+			OASMethod:           specs[idx].OASMethod,
+			OASPath:             specs[idx].OASPath,
+		}
+		if idx != primary {
+			toRemove[idx] = true
+		}
+	}
+
+	specs[primary].OASMockResponseMeta = candidates[0].OASMockResponseMeta
+	specs[primary].OASMethod = candidates[0].OASMethod
+	specs[primary].OASPath = candidates[0].OASPath
+	specs[primary].OASMockResponseCandidates = candidates
+}
+
+// sortByRestrictiveness sorts spec indices so that more restrictive path parameter
+// schemas come first. Ties in restrictiveness score are broken by total pattern length
+// (longer patterns are more specific, e.g., ^\d+$ before .*), then alphabetically.
+func sortByRestrictiveness(indices []int, specs []URLSpec, oasPaths *openapi3.Paths) {
+	sort.Slice(indices, func(a, b int) bool {
+		scoreA := pathParamRestrictiveness(specs[indices[a]].OASPath, specs[indices[a]].OASMethod, oasPaths)
+		scoreB := pathParamRestrictiveness(specs[indices[b]].OASPath, specs[indices[b]].OASMethod, oasPaths)
+		if scoreA != scoreB {
+			return scoreA > scoreB
+		}
+		lenA := pathParamPatternLength(specs[indices[a]].OASPath, specs[indices[a]].OASMethod, oasPaths)
+		lenB := pathParamPatternLength(specs[indices[b]].OASPath, specs[indices[b]].OASMethod, oasPaths)
+		if lenA != lenB {
+			return lenA > lenB
+		}
+		return specs[indices[a]].OASPath < specs[indices[b]].OASPath
+	})
+}
+
+// mergeGroupIntoPrimary takes a sorted list of spec indices that share the same
+// regex+method, builds ValidateRequestCandidates from them, and assigns them to
+// the primary (first) spec. Non-primary indices are marked for removal.
+func mergeGroupIntoPrimary(indices []int, specs []URLSpec, toRemove map[int]bool) {
+	primary := indices[0]
+	candidates := make([]ValidateRequestCandidate, len(indices))
+	for ci, idx := range indices {
+		candidates[ci] = ValidateRequestCandidate{
+			OASValidateRequestMeta: specs[idx].OASValidateRequestMeta,
+			OASMethod:              specs[idx].OASMethod,
+			OASPath:                specs[idx].OASPath,
+		}
+		if idx != primary {
+			toRemove[idx] = true
+		}
+	}
+
+	specs[primary].OASValidateRequestMeta = candidates[0].OASValidateRequestMeta
+	specs[primary].OASMethod = candidates[0].OASMethod
+	specs[primary].OASPath = candidates[0].OASPath
+	specs[primary].OASValidateRequestCandidates = candidates
+}
+
+// removeIndices returns a new slice with entries at the given indices removed.
+func removeIndices(specs []URLSpec, toRemove map[int]bool) []URLSpec {
+	if len(toRemove) == 0 {
+		return specs
+	}
+	result := make([]URLSpec, 0, len(specs)-len(toRemove))
+	for i, s := range specs {
+		if !toRemove[i] {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// pathParamRestrictiveness returns a score indicating how restrictive the path parameter
+// schemas are for a given OAS path+method. Higher scores mean more restrictive. A plain
+// type:string with no constraints scores 0 (catch-all), while type:number, type:integer,
+// type:boolean, or any parameter with a pattern/enum/format scores higher.
+func pathParamRestrictiveness(oasPath, method string, oasPaths *openapi3.Paths) int {
+	if oasPaths == nil {
+		return 0
+	}
+	pathItem := oasPaths.Value(oasPath)
+	if pathItem == nil {
+		return 0
+	}
+	op := pathItem.GetOperation(method)
+	if op == nil {
+		return 0
+	}
+
+	score := 0
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil || paramRef.Value.In != "path" {
+			continue
+		}
+		param := paramRef.Value
+		if param.Schema == nil || param.Schema.Value == nil {
+			continue
+		}
+		score += schemaRestrictiveness(param.Schema.Value)
+	}
+	return score
+}
+
+// schemaRestrictiveness returns a score for how restrictive a single path parameter
+// schema is. The hierarchy from most to least restrictive:
+//
+//	integer (7) > number (6) > boolean (5) > array (4) > object (3)
+//	> string with constraints (2) > unconstrained string (0)
+//
+// This ensures that integer parameters are tried before number (since every integer
+// is a valid number but not vice versa), and all typed parameters are tried before
+// string which accepts everything.
+func schemaRestrictiveness(s *openapi3.Schema) int {
+	if s.Type != nil {
+		switch {
+		case s.Type.Is("integer"):
+			return 7
+		case s.Type.Is("number"):
+			return 6
+		case s.Type.Is("boolean"):
+			return 5
+		case s.Type.Is("array"):
+			return 4
+		case s.Type.Is("object"):
+			return 3
+		}
+	}
+
+	// type:string or untyped — check for constraints.
+	hasPattern := s.Pattern != ""
+	hasEnum := len(s.Enum) > 0
+	hasFormat := s.Format != ""
+	hasMinLen := s.MinLength != 0
+	hasMaxLen := s.MaxLength != nil
+
+	if hasPattern || hasEnum || hasFormat || hasMinLen || hasMaxLen {
+		return 2
+	}
+
+	// Unconstrained string — matches everything.
+	return 0
+}
+
+// pathParamPatternLength returns the total length of all path parameter pattern strings
+// for a given OAS path+method. Used as a tie-breaker when restrictiveness scores are
+// equal — longer patterns tend to be more specific (e.g., ^\d+$ vs .*).
+func pathParamPatternLength(oasPath, method string, oasPaths *openapi3.Paths) int {
+	if oasPaths == nil {
+		return 0
+	}
+	pathItem := oasPaths.Value(oasPath)
+	if pathItem == nil {
+		return 0
+	}
+	op := pathItem.GetOperation(method)
+	if op == nil {
+		return 0
+	}
+
+	total := 0
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil || paramRef.Value.In != "path" {
+			continue
+		}
+		if paramRef.Value.Schema != nil && paramRef.Value.Schema.Value != nil {
+			total += len(paramRef.Value.Schema.Value.Pattern)
+		}
+	}
+	return total
+}
+
+// compileOASMockResponsePathSpec extracts MockResponse operations from OAS middleware
+// and converts them to URLSpec entries that use the standard regex-based path matching algorithm.
+// This ensures OAS mockResponse middleware respects gateway configurations like
+// EnablePathPrefixMatching, EnablePathSuffixMatching, and IgnoreEndpointCase.
+func (a APIDefinitionLoader) compileOASMockResponsePathSpec(apiSpec *APISpec, conf config.Config) []URLSpec {
+	if !apiSpec.IsOAS {
+		return nil
+	}
+
+	middleware := apiSpec.OAS.GetTykMiddleware()
+	if middleware == nil || len(middleware.Operations) == 0 {
+		return nil
+	}
+
+	urlSpec := []URLSpec{}
+
+	// Iterate through all OAS operations and find those with MockResponse enabled
+	for operationID, operation := range middleware.Operations {
+		if operation.MockResponse == nil || !operation.MockResponse.Enabled {
+			continue
+		}
+
+		path, method := a.findPathAndMethodForOperation(apiSpec, operationID)
+		if path == "" || method == "" {
+			continue
+		}
+
+		newSpec := URLSpec{
+			OASMockResponseMeta: operation.MockResponse,
+			OASMethod:           strings.ToUpper(method),
+			OASPath:             path,
+		}
+
+		a.generateRegex(path, &newSpec, OASMockResponse, conf)
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	urlSpec = groupCollapsedMockResponseSpecs(urlSpec, apiSpec.OAS.Paths)
+
+	urlSpec = a.addStaticPathShields(apiSpec, conf, urlSpec, OASMockResponse, func(path, method string) URLSpec {
+		return URLSpec{
+			OASMockResponseMeta: &oas.MockResponse{Enabled: false},
+			OASMethod:           method,
+			OASPath:             path,
+		}
+	})
+
+	sortURLSpecsByPathPriority(urlSpec)
+
+	return urlSpec
+}
+
+// addStaticPathShields adds synthetic disabled URLSpec entries for static OAS paths
+// that don't already have an entry in urlSpec. These entries act as shields: when the
+// middleware scans the path list, a static shield entry matches before any parameterised
+// regex, and the middleware sees Enabled=false and skips it. This prevents parameterised
+// paths (e.g. /employees/{id}) from incorrectly matching static paths (e.g. /employees/static).
+//
+// Shield entries are only added when urlSpec contains at least one parameterised path,
+// since without parameterised paths there is no cross-matching risk.
+func (a APIDefinitionLoader) addStaticPathShields(
+	apiSpec *APISpec,
+	conf config.Config,
+	urlSpec []URLSpec,
+	status URLStatus,
+	newDisabledSpec func(path, method string) URLSpec,
+) []URLSpec {
+	if apiSpec.OAS.Paths == nil {
+		return urlSpec
+	}
+
+	existing, hasParameterised := indexURLSpecs(urlSpec)
+	if !hasParameterised {
+		return urlSpec
+	}
+
+	for path, pathItem := range apiSpec.OAS.Paths.Map() {
+		if httputil.IsMuxTemplate(path) {
+			continue
+		}
+		for method := range pathItem.Operations() {
+			method = strings.ToUpper(method)
+			if _, exists := existing[path+":"+method]; exists {
+				continue
+			}
+			newSpec := newDisabledSpec(path, method)
+			a.generateRegex(path, &newSpec, status, conf)
+			urlSpec = append(urlSpec, newSpec)
+		}
+	}
+
+	return urlSpec
+}
+
+// indexURLSpecs builds a set of "path:METHOD" keys from the given specs and reports
+// whether any spec uses a parameterised (mux-template) path.
+func indexURLSpecs(specs []URLSpec) (existing map[string]struct{}, hasParameterised bool) {
+	existing = make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		existing[spec.OASPath+":"+spec.OASMethod] = struct{}{}
+		if httputil.IsMuxTemplate(spec.OASPath) {
+			hasParameterised = true
+		}
+	}
+	return
+}
+
+// findPathAndMethodForOperation finds the path and method for a given operation ID
+// by searching through the OAS paths.
+func (a APIDefinitionLoader) findPathAndMethodForOperation(apiSpec *APISpec, operationID string) (string, string) {
+	if apiSpec.OAS.Paths == nil {
+		return "", ""
+	}
+
+	for path, pathItem := range apiSpec.OAS.Paths.Map() {
+		for method, operation := range pathItem.Operations() {
+			if operation.OperationID == operationID {
+				return path, method
+			}
+		}
+	}
+
+	return "", ""
+}
+
+// sortURLSpecsByPathPriority sorts URLSpec entries using the same path priority
+// rules as oasutil.SortByPathLength, ensuring consistent ordering across the gateway.
+func sortURLSpecsByPathPriority(specs []URLSpec) {
+	sort.Slice(specs, func(i, j int) bool {
+		return oasutil.PathLess(specs[i].OASPath, specs[j].OASPath)
+	})
+}
+
+// extractMCPPrimitivesToPaths extracts MCP primitives (tools, resources, prompts) from the OAS
+// definition and populates them into the ExtendedPaths structure for each API version.
+// It also adds built-in MCP operation paths (tools/call, resources/read, prompts/get) to
+// the Internal middleware configuration.
+func (a APIDefinitionLoader) extractMCPPrimitivesToPaths(spec *APISpec, def *model.MergedAPI) {
+	middleware := spec.OAS.GetTykMiddleware()
+	if middleware == nil {
+		return
+	}
+
+	for versionName := range def.VersionData.Versions {
+		versionInfo := def.VersionData.Versions[versionName]
+
+		// Extract MCP primitives to extended paths
+		middleware.ExtractPrimitivesToExtendedPaths(&versionInfo.ExtendedPaths)
+
+		// Add built-in MCP operation paths to Internal middleware
+		a.addInternalMWtoMCPOperations(spec, &versionInfo.ExtendedPaths)
+
+		def.VersionData.Versions[versionName] = versionInfo
+	}
+}
+
+// addInternalMWtoMCPOperations adds built-in MCP operation paths (tools/call, resources/read,
+// prompts/get) to the Internal middleware configuration if they exist in the OAS definition.
+func (a APIDefinitionLoader) addInternalMWtoMCPOperations(spec *APISpec, extendedPaths *apidef.ExtendedPathsSet) {
+	builtInOperationPaths := []string{
+		"/" + mcp.MethodToolsCall,
+		"/" + mcp.MethodResourcesRead,
+		"/" + mcp.MethodPromptsGet,
+	}
+
+	for _, path := range builtInOperationPaths {
+		if spec.OAS.Paths != nil && spec.OAS.Paths.Find(path) != nil {
+			extendedPaths.Internal = append(extendedPaths.Internal, apidef.InternalMeta{
+				Path:     path,
+				Method:   http.MethodPost,
+				Disabled: false,
+			})
+		}
+	}
+}
+
+// initMCPConfiguration initializes MCP-specific configuration for the API spec.
+// This includes registering VEM prefixes, populating the primitives map,
+// calculating allow-list flags, and setting up the JSON-RPC router if needed.
+func (a APIDefinitionLoader) initMCPConfiguration(spec *APISpec) {
+	mcp.RegisterVEMPrefixes()
+	a.populateMCPPrimitivesMap(spec)
+	a.calculateMCPAllowlistFlags(spec)
+
+	if spec.JsonRpcVersion == apidef.JsonRPC20 {
+		spec.JSONRPCRouter = mcp.NewRouter()
+	}
+}
+
+func (a APIDefinitionLoader) getExtendedPathSpecs(apiVersionDef apidef.VersionInfo, apiSpec *APISpec, conf config.Config) ([]URLSpec, bool) {
 	// TODO: New compiler here, needs to put data into a different structure
 
-	ignoredPaths := a.compileExtendedPathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.Ignored, Ignored)
-	blackListPaths := a.compileExtendedPathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.BlackList, BlackList)
-	whiteListPaths := a.compileExtendedPathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.WhiteList, WhiteList)
-	cachedPaths := a.compileCachedPathSpec(apiVersionDef.ExtendedPaths.Cached, apiVersionDef.ExtendedPaths.AdvanceCacheConfig)
-	transformPaths := a.compileTransformPathSpec(apiVersionDef.ExtendedPaths.Transform, Transformed)
-	transformResponsePaths := a.compileTransformPathSpec(apiVersionDef.ExtendedPaths.TransformResponse, TransformedResponse)
+	mockResponsePaths := a.compileMockResponsePathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.MockResponse, MockResponse, conf)
+	ignoredPaths := a.compileExtendedPathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.Ignored, Ignored, conf)
+	blackListPaths := a.compileExtendedPathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.BlackList, BlackList, conf)
+	whiteListPaths := a.compileExtendedPathSpec(apiVersionDef.IgnoreEndpointCase, apiVersionDef.ExtendedPaths.WhiteList, WhiteList, conf)
+	cachedPaths := a.compileCachedPathSpec(apiVersionDef.ExtendedPaths.Cached, apiVersionDef.ExtendedPaths.AdvanceCacheConfig, conf)
+	transformPaths := a.compileTransformPathSpec(apiVersionDef.ExtendedPaths.Transform, Transformed, conf)
+	transformResponsePaths := a.compileTransformPathSpec(apiVersionDef.ExtendedPaths.TransformResponse, TransformedResponse, conf)
 	transformJQPaths := a.compileTransformJQPathSpec(apiVersionDef.ExtendedPaths.TransformJQ, TransformedJQ)
 	transformJQResponsePaths := a.compileTransformJQPathSpec(apiVersionDef.ExtendedPaths.TransformJQResponse, TransformedJQResponse)
-	headerTransformPaths := a.compileInjectedHeaderSpec(apiVersionDef.ExtendedPaths.TransformHeader, HeaderInjected)
-	headerTransformPathsOnResponse := a.compileInjectedHeaderSpec(apiVersionDef.ExtendedPaths.TransformResponseHeader, HeaderInjectedResponse)
-	hardTimeouts := a.compileTimeoutPathSpec(apiVersionDef.ExtendedPaths.HardTimeouts, HardTimeout)
-	circuitBreakers := a.compileCircuitBreakerPathSpec(apiVersionDef.ExtendedPaths.CircuitBreaker, CircuitBreaker, apiSpec)
-	urlRewrites := a.compileURLRewritesPathSpec(apiVersionDef.ExtendedPaths.URLRewrite, URLRewrite)
-	virtualPaths := a.compileVirtualPathspathSpec(apiVersionDef.ExtendedPaths.Virtual, VirtualPath, apiSpec)
-	requestSizes := a.compileRequestSizePathSpec(apiVersionDef.ExtendedPaths.SizeLimit, RequestSizeLimit)
-	methodTransforms := a.compileMethodTransformSpec(apiVersionDef.ExtendedPaths.MethodTransforms, MethodTransformed)
-	trackedPaths := a.compileTrackedEndpointPathspathSpec(apiVersionDef.ExtendedPaths.TrackEndpoints, RequestTracked)
-	unTrackedPaths := a.compileUnTrackedEndpointPathspathSpec(apiVersionDef.ExtendedPaths.DoNotTrackEndpoints, RequestNotTracked)
-	validateJSON := a.compileValidateJSONPathspathSpec(apiVersionDef.ExtendedPaths.ValidateJSON, ValidateJSONRequest)
-	internalPaths := a.compileInternalPathspathSpec(apiVersionDef.ExtendedPaths.Internal, Internal)
+	headerTransformPaths := a.compileInjectedHeaderSpec(apiVersionDef.ExtendedPaths.TransformHeader, HeaderInjected, conf)
+	headerTransformPathsOnResponse := a.compileInjectedHeaderSpec(apiVersionDef.ExtendedPaths.TransformResponseHeader, HeaderInjectedResponse, conf)
+	hardTimeouts := a.compileTimeoutPathSpec(apiVersionDef.ExtendedPaths.HardTimeouts, HardTimeout, conf)
+	circuitBreakers := a.compileCircuitBreakerPathSpec(apiVersionDef.ExtendedPaths.CircuitBreaker, CircuitBreaker, apiSpec, conf)
+	urlRewrites := a.compileURLRewritesPathSpec(apiVersionDef.ExtendedPaths.URLRewrite, URLRewrite, conf)
+	virtualPaths := a.compileVirtualPathsSpec(apiVersionDef.ExtendedPaths.Virtual, VirtualPath, apiSpec, conf)
+	requestSizes := a.compileRequestSizePathSpec(apiVersionDef.ExtendedPaths.SizeLimit, RequestSizeLimit, conf)
+	methodTransforms := a.compileMethodTransformSpec(apiVersionDef.ExtendedPaths.MethodTransforms, MethodTransformed, conf)
+	trackedPaths := a.compileTrackedEndpointPathsSpec(apiVersionDef.ExtendedPaths.TrackEndpoints, RequestTracked, conf)
+	unTrackedPaths := a.compileUnTrackedEndpointPathsSpec(apiVersionDef.ExtendedPaths.DoNotTrackEndpoints, RequestNotTracked, conf)
+	validateJSON := a.compileValidateJSONPathsSpec(apiVersionDef.ExtendedPaths.ValidateJSON, ValidateJSONRequest, conf)
+	internalPaths := a.compileInternalPathsSpec(apiVersionDef.ExtendedPaths.Internal, Internal, conf)
+	goPlugins := a.compileGopluginPathsSpec(apiVersionDef.ExtendedPaths.GoPlugin, GoPlugin, apiSpec, conf)
+	persistGraphQL := a.compilePersistGraphQLPathSpec(apiVersionDef.ExtendedPaths.PersistGraphQL, PersistGraphQL, apiSpec, conf)
+	rateLimitPaths := a.compileRateLimitPathsSpec(apiVersionDef.ExtendedPaths.RateLimit, RateLimit, conf)
+
+	// OAS-specific middleware paths - compiled alongside Classic middleware
+	// The compile functions handle nil/empty OAS gracefully by returning empty slices
+	oasValidateRequestPaths := a.compileOASValidateRequestPathSpec(apiSpec, conf)
+	oasMockResponsePaths := a.compileOASMockResponsePathSpec(apiSpec, conf)
 
 	combinedPath := []URLSpec{}
+	combinedPath = append(combinedPath, mockResponsePaths...)
 	combinedPath = append(combinedPath, ignoredPaths...)
 	combinedPath = append(combinedPath, blackListPaths...)
 	combinedPath = append(combinedPath, whiteListPaths...)
@@ -949,20 +2097,56 @@ func (a APIDefinitionLoader) getExtendedPathSpecs(apiVersionDef apidef.VersionIn
 	combinedPath = append(combinedPath, circuitBreakers...)
 	combinedPath = append(combinedPath, urlRewrites...)
 	combinedPath = append(combinedPath, requestSizes...)
+	combinedPath = append(combinedPath, goPlugins...)
+	combinedPath = append(combinedPath, persistGraphQL...)
 	combinedPath = append(combinedPath, virtualPaths...)
 	combinedPath = append(combinedPath, methodTransforms...)
 	combinedPath = append(combinedPath, trackedPaths...)
 	combinedPath = append(combinedPath, unTrackedPaths...)
 	combinedPath = append(combinedPath, validateJSON...)
 	combinedPath = append(combinedPath, internalPaths...)
+	combinedPath = append(combinedPath, rateLimitPaths...)
+	combinedPath = append(combinedPath, oasValidateRequestPaths...)
+	combinedPath = append(combinedPath, oasMockResponsePaths...)
 
-	return combinedPath, len(whiteListPaths) > 0
+	// Enable whitelist mode if there are whitelist paths or operation-level allows.
+	// For MCP APIs, we disable global whitelist mode here (whiteListEnabled = false), but this
+	// does NOT mean whitelisting is disabled for MCP APIs. Instead, MCP APIs use a more complex
+	// whitelist enforcement strategy that happens in the VersionCheck middleware:
+	// 1. Setting whiteListEnabled=false prevents blocking the main listen path before JSON-RPC
+	//    routing can parse the request and determine the target primitive/operation.
+	// 2. After JSON-RPC routing, allowlist enforcement happens at the VEM level during sequential
+	//    routing in VersionCheck middleware (see handleMCPPrimitiveNotFound and VEM WhiteList checks).
+	// 3. VEM WhiteList entries are checked in both URLAllowedAndIgnored and VersionCheck.ProcessRequest
+	//    to enforce access control on individual primitives (tools/resources/prompts) and operations.
+	//
+	// This two-phase approach ensures:
+	// - Initial JSON-RPC requests reach the middleware for parsing
+	// - Subsequent internal VEM requests are properly whitelisted/blacklisted
+	// - Allow-list configuration works correctly at the primitive/operation level
+	whiteListEnabled := len(whiteListPaths) > 0 || apiSpec.OperationsAllowListEnabled
+	if apiSpec.IsMCP() {
+		whiteListEnabled = false
+	}
+
+	return combinedPath, whiteListEnabled
 }
 
-func (a *APISpec) Init(authStore, sessionStore, healthStore, orgStore storage.Handler) {
+func (a *APISpec) Init(authStore, healthStore, orgStore storage.Handler) {
 	a.AuthManager.Init(authStore)
 	a.Health.Init(healthStore)
 	a.OrgSessionManager.Init(orgStore)
+}
+
+func (a *APISpec) UnloadUpstreamCertMonitoring() {
+	if a.upstreamCertExpiryCancelFunc != nil {
+		log.
+			WithField("api_id", a.APIID).
+			WithField("api_name", a.Name).
+			Debug("Stopping upstream certificate expiry check batcher")
+
+		a.upstreamCertExpiryCancelFunc()
+	}
 }
 
 func (a *APISpec) StopSessionManagerPool() {
@@ -1009,9 +2193,18 @@ func (a *APISpec) getURLStatus(stat URLStatus) RequestStatus {
 		return StatusRequestNotTracked
 	case ValidateJSONRequest:
 		return StatusValidateJSON
+	case OASValidateRequest:
+		return StatusOASValidateRequest
+	case OASMockResponse:
+		return StatusOASMockResponse
 	case Internal:
 		return StatusInternal
-
+	case GoPlugin:
+		return StatusGoPlugin
+	case PersistGraphQL:
+		return StatusPersistGraphQL
+	case RateLimit:
+		return StatusRateLimit
 	default:
 		log.Error("URL Status was not one of Ignored, Blacklist or WhiteList! Blocking.")
 		return EndPointNotAllowed
@@ -1020,13 +2213,71 @@ func (a *APISpec) getURLStatus(stat URLStatus) RequestStatus {
 
 // URLAllowedAndIgnored checks if a url is allowed and ignored.
 func (a *APISpec) URLAllowedAndIgnored(r *http.Request, rxPaths []URLSpec, whiteListStatus bool) (RequestStatus, interface{}) {
-	// Check if ignored
+	// Skip Whitelist and Blocklist for CORS preflight requests when CORS is enabled and passthrough is disabled.
+	// Let CORS middleware process this request.
+	if a.CORS.Enable && !a.CORS.OptionsPassthrough && httputil.IsCORSPreflightRequest(r) {
+		return StatusOkAndIgnore, nil
+	}
+
 	for i := range rxPaths {
-		if !rxPaths[i].Spec.MatchString(r.URL.Path) {
+		if !rxPaths[i].matchesPath(r.URL.Path, a) {
 			continue
 		}
 
-		if rxPaths[i].MethodActions != nil {
+		if r.Method == rxPaths[i].Internal.Method && rxPaths[i].Status == Internal {
+			// MCP primitive VEMs return 404 to avoid exposing internal-only endpoints.
+			// They can only be accessed via JSON-RPC routing (MCP, A2A, etc.), not via generic looping.
+			if a.IsMCP() && mcp.IsPrimitiveVEMPath(rxPaths[i].Internal.Path) {
+				if !httpctx.IsJsonRPCRouting(r) {
+					return MCPPrimitiveNotFound, nil
+				}
+			} else if !ctxLoopingEnabled(r) {
+				// Regular internal endpoints require looping to be enabled.
+				return EndPointNotAllowed, nil
+			}
+		}
+	}
+
+	// Check if ignored
+	for i := range rxPaths {
+		if !rxPaths[i].matchesPath(r.URL.Path, a) {
+			continue
+		}
+
+		if rxPaths[i].MethodActions == nil {
+			switch rxPaths[i].Status {
+			case WhiteList:
+				if rxPaths[i].Whitelist.Method != "" {
+					if rxPaths[i].Whitelist.Method != r.Method {
+						continue
+					}
+
+					return a.getURLStatus(rxPaths[i].Status), nil
+				}
+			case BlackList:
+				if rxPaths[i].Blacklist.Method != "" {
+					if rxPaths[i].Blacklist.Method != r.Method {
+						continue
+					}
+
+					return a.getURLStatus(rxPaths[i].Status), nil
+				}
+			case Ignored:
+				if rxPaths[i].Ignored.Method != "" {
+					if rxPaths[i].Ignored.Method != r.Method {
+						continue
+					}
+				}
+
+				return a.getURLStatus(rxPaths[i].Status), nil
+			case MockResponse:
+				if rxPaths[i].MockResponse.Method != r.Method {
+					continue
+				}
+
+				return StatusRedirectFlowByReply, rxPaths[i].MockResponse
+			}
+		} else { // Deprecated
 			// We are using an extended path set, check for the method
 			methodMeta, matchMethodOk := rxPaths[i].MethodActions[r.Method]
 			if !matchMethodOk {
@@ -1047,24 +2298,35 @@ func (a *APISpec) URLAllowedAndIgnored(r *http.Request, rxPaths []URLSpec, white
 			}
 		}
 
-		if r.Method == rxPaths[i].Internal.Method && rxPaths[i].Status == Internal && !ctxLoopingEnabled(r) {
-			return EndPointNotAllowed, nil
+		// MCP primitive VEMs: continue checking for BlackList even outside whitelist mode.
+		// This allows explicit BlackList entries to block primitives without Allow.
+		if a.IsMCP() && rxPaths[i].Status == Internal && r.Method == rxPaths[i].Internal.Method {
+			if mcp.IsPrimitiveVEMPath(rxPaths[i].Internal.Path) {
+				if httpctx.IsJsonRPCRouting(r) {
+					continue // Keep looking for WhiteList/BlackList
+				}
+			}
 		}
 
 		if whiteListStatus {
 			// We have a whitelist, nothing gets through unless specifically defined
 			switch rxPaths[i].Status {
 			case WhiteList, BlackList, Ignored:
-			default:
-				if rxPaths[i].Status == Internal && r.Method == rxPaths[i].Internal.Method && ctxLoopingEnabled(r) {
-					return a.getURLStatus(rxPaths[i].Status), nil
-				} else {
-					return EndPointNotAllowed, nil
+				// These are handled in the switch above, continue to process them
+			case Internal:
+				if r.Method == rxPaths[i].Internal.Method {
+					if ctxLoopingEnabled(r) {
+						// Regular internal endpoints use generic looping check.
+						return a.getURLStatus(rxPaths[i].Status), nil
+					}
 				}
+				return EndPointNotAllowed, nil
+			default:
+				return EndPointNotAllowed, nil
 			}
 		}
 
-		if rxPaths[i].TransformAction.Template != nil {
+		if rxPaths[i].Status == Transformed {
 			return a.getURLStatus(rxPaths[i].Status), &rxPaths[i].TransformAction
 		}
 
@@ -1091,203 +2353,137 @@ func (a *APISpec) URLAllowedAndIgnored(r *http.Request, rxPaths []URLSpec, white
 	return StatusOk, nil
 }
 
-// CheckSpecMatchesStatus checks if a url spec has a specific status
-func (a *APISpec) CheckSpecMatchesStatus(r *http.Request, rxPaths []URLSpec, mode URLStatus) (bool, interface{}) {
-	var matchPath, method string
-
-	//If url-rewrite middleware was used, call response middleware of original path and not of rewritten path
-	// context variable UrlRewritePath is set by rewrite middleware
-	if mode == TransformedJQResponse || mode == HeaderInjectedResponse || mode == TransformedResponse {
-		matchPath = ctxGetUrlRewritePath(r)
-		method = ctxGetRequestMethod(r)
-		if matchPath == "" {
-			matchPath = r.URL.Path
-		}
-	} else {
-		matchPath = r.URL.Path
-		method = r.Method
-	}
-
-	if a.Proxy.ListenPath != "/" {
-		matchPath = strings.TrimPrefix(matchPath, a.Proxy.ListenPath)
-	}
-
-	if !strings.HasPrefix(matchPath, "/") {
-		matchPath = "/" + matchPath
-	}
-
-	// Check if ignored
-	for i := range rxPaths {
-		if mode != rxPaths[i].Status {
-			continue
-		}
-		if !rxPaths[i].Spec.MatchString(matchPath) {
-			continue
-		}
-
-		switch rxPaths[i].Status {
-		case Ignored, BlackList, WhiteList:
-			return true, nil
-		case Cached:
-			if method == rxPaths[i].CacheConfig.Method || (rxPaths[i].CacheConfig.Method == SAFE_METHODS && isSafeMethod(method)) {
-				return true, &rxPaths[i].CacheConfig
-			}
-		case Transformed:
-			if method == rxPaths[i].TransformAction.Method {
-				return true, &rxPaths[i].TransformAction
-			}
-		case TransformedJQ:
-			if method == rxPaths[i].TransformJQAction.Method {
-				return true, &rxPaths[i].TransformJQAction
-			}
-		case HeaderInjected:
-			if method == rxPaths[i].InjectHeaders.Method {
-				return true, &rxPaths[i].InjectHeaders
-			}
-		case HeaderInjectedResponse:
-			if method == rxPaths[i].InjectHeadersResponse.Method {
-				return true, &rxPaths[i].InjectHeadersResponse
-			}
-		case TransformedResponse:
-			if method == rxPaths[i].TransformResponseAction.Method {
-				return true, &rxPaths[i].TransformResponseAction
-			}
-		case TransformedJQResponse:
-			if method == rxPaths[i].TransformJQResponseAction.Method {
-				return true, &rxPaths[i].TransformJQResponseAction
-			}
-		case HardTimeout:
-			if r.Method == rxPaths[i].HardTimeout.Method {
-				return true, &rxPaths[i].HardTimeout.TimeOut
-			}
-		case CircuitBreaker:
-			if method == rxPaths[i].CircuitBreaker.Method {
-				return true, &rxPaths[i].CircuitBreaker
-			}
-		case URLRewrite:
-			if method == rxPaths[i].URLRewrite.Method {
-				return true, rxPaths[i].URLRewrite
-			}
-		case VirtualPath:
-			if method == rxPaths[i].VirtualPathSpec.Method {
-				return true, &rxPaths[i].VirtualPathSpec
-			}
-		case RequestSizeLimit:
-			if method == rxPaths[i].RequestSize.Method {
-				return true, &rxPaths[i].RequestSize
-			}
-		case MethodTransformed:
-			if method == rxPaths[i].MethodTransform.Method {
-				return true, &rxPaths[i].MethodTransform
-			}
-		case RequestTracked:
-			if method == rxPaths[i].TrackEndpoint.Method {
-				return true, &rxPaths[i].TrackEndpoint
-			}
-		case RequestNotTracked:
-			if method == rxPaths[i].DoNotTrackEndpoint.Method {
-				return true, &rxPaths[i].DoNotTrackEndpoint
-			}
-		case ValidateJSONRequest:
-			if method == rxPaths[i].ValidatePathMeta.Method {
-				return true, &rxPaths[i].ValidatePathMeta
-			}
-		case Internal:
-			if method == rxPaths[i].Internal.Method {
-				return true, &rxPaths[i].Internal
-			}
-		}
-	}
-	return false, nil
-}
-
 func (a *APISpec) getVersionFromRequest(r *http.Request) string {
-	if a.VersionData.NotVersioned {
+	if vName := ctxGetVersionName(r); vName != nil {
+		return *vName
+	}
+
+	if a.VersionData.NotVersioned && !a.VersionDefinition.Enabled {
 		return ""
 	}
 
+	var vName string
+	defer ctxSetVersionName(r, &vName)
+
 	switch a.VersionDefinition.Location {
-	case headerLocation:
-		return r.Header.Get(a.VersionDefinition.Key)
-	case urlParamLocation:
-		return r.URL.Query().Get(a.VersionDefinition.Key)
-	case urlLocation:
-		uPath := a.StripListenPath(r, r.URL.Path)
+	case apidef.HeaderLocation:
+		vName = r.Header.Get(a.VersionDefinition.Key)
+		if a.VersionDefinition.StripVersioningData {
+			log.Debug("Stripping version from header: ", vName)
+			defer r.Header.Del(a.VersionDefinition.Key)
+		}
+
+		return vName
+	case apidef.URLParamLocation:
+		vName = r.URL.Query().Get(a.VersionDefinition.Key)
+		if a.VersionDefinition.StripVersioningData {
+			log.Debug("Stripping version from query: ", vName)
+			q := r.URL.Query()
+			q.Del(a.VersionDefinition.Key)
+			r.URL.RawQuery = q.Encode()
+		}
+
+		return vName
+	case apidef.URLLocation:
+		uPath := a.StripListenPath(r.URL.Path)
 		uPath = strings.TrimPrefix(uPath, "/"+a.Slug)
 
 		// First non-empty part of the path is the version ID
 		for _, part := range strings.Split(uPath, "/") {
 			if part != "" {
+				matchesUrlVersioningPattern := true
+				if a.VersionDefinition.UrlVersioningPattern != "" {
+					re, err := regexp.Compile(a.VersionDefinition.UrlVersioningPattern)
+					if err != nil {
+						log.Error("Error compiling versioning pattern: ", err)
+					} else {
+						matchesUrlVersioningPattern = re.Match([]byte(part))
+					}
+				}
+
+				if (a.VersionDefinition.StripVersioningData || a.VersionDefinition.StripPath) && matchesUrlVersioningPattern {
+					log.Debug("Stripping version from url: ", part)
+
+					r.URL.Path = strings.Replace(r.URL.Path, part+"/", "", 1)
+					r.URL.RawPath = strings.Replace(r.URL.RawPath, part+"/", "", 1)
+				}
+
+				//never delete this line as there's an easy to miss defer statement above
+				vName = part
+
 				return part
 			}
 		}
 	}
+
 	return ""
-}
-
-// VersionExpired checks if an API version (during a proxied
-// request) is expired. If it isn't and the configured time was valid,
-// it also returns the expiration time.
-func (a *APISpec) VersionExpired(versionDef *apidef.VersionInfo) (bool, *time.Time) {
-	if a.VersionData.NotVersioned {
-		return false, nil
-	}
-
-	// Never expires
-	if versionDef.Expires == "" || versionDef.Expires == "-1" {
-		return false, nil
-	}
-
-	// otherwise use parsed timestamp
-	if versionDef.ExpiresTs.IsZero() {
-		log.Error("Could not parse expiry date for API, disallow")
-		return true, nil
-	}
-
-	// It's in the past, expire
-	// It's in the future, keep going
-	return time.Since(versionDef.ExpiresTs) >= 0, &versionDef.ExpiresTs
 }
 
 // RequestValid will check if an incoming request has valid version
 // data and return a RequestStatus that describes the status of the
 // request
-func (a *APISpec) RequestValid(r *http.Request) (bool, RequestStatus, interface{}) {
-	versionMetaData, versionPaths, whiteListStatus, vstat := a.Version(r)
+func (a *APISpec) RequestValid(r *http.Request) (bool, RequestStatus) {
+	versionInfo, status := a.Version(r)
 
 	// Screwed up version info - fail and pass through
-	if vstat != StatusOk {
-		return false, vstat, nil
+	if status != StatusOk {
+		return false, status
 	}
 
-	// Is the API version expired?
-	// TODO: Don't abuse the interface{} return value for both
-	// *apidef.EndpointMethodMeta and *time.Time. Probably need to
-	// redesign or entirely remove RequestValid. See discussion on
-	// https://github.com/TykTechnologies/tyk/pull/776
-	expired, expTime := a.VersionExpired(versionMetaData)
-	if expired {
-		return false, VersionExpired, nil
+	// Load path data and whitelist data for version
+	versionPaths, ok := a.RxPaths[versionInfo.Name]
+	if !ok {
+		log.Error("no RX Paths found for version ", versionInfo.Name)
+		return false, VersionDoesNotExist
+	}
+
+	whiteListStatus, ok := a.WhiteListEnabled[versionInfo.Name]
+	if !ok {
+		log.Error("no whitelist data found")
+		return false, VersionWhiteListStatusNotFound
+	}
+
+	if a.VersionData.NotVersioned && a.Expired() {
+		return false, APIExpired
+	} else if !a.VersionData.NotVersioned && versionInfo.Expired() { // Deprecated
+		return false, VersionExpired
 	}
 
 	// not expired, let's check path info
-	status, meta := a.URLAllowedAndIgnored(r, versionPaths, whiteListStatus)
+	status, _ = a.URLAllowedAndIgnored(r, versionPaths, whiteListStatus)
 	switch status {
 	case EndPointNotAllowed:
-		return false, status, expTime
+		return false, status
+	case MCPPrimitiveNotFound:
+		return false, status
 	case StatusRedirectFlowByReply:
-		return true, status, meta
+		return true, status
 	case StatusOkAndIgnore, StatusCached, StatusTransform,
 		StatusHeaderInjected, StatusMethodTransformed:
-		return true, status, expTime
+		return true, status
 	default:
-		return true, StatusOk, expTime
+		return true, StatusOk
 	}
+}
+
+func (a *APISpec) Expired() bool {
+	// Never expires
+	if a.Expiration == "" || a.Expiration == "-1" {
+		return false
+	}
+
+	// otherwise use parsed timestamp
+	if a.ExpirationTs.IsZero() {
+		log.Error("Could not parse expiration date, disallow")
+		return true
+	}
+
+	return time.Since(a.ExpirationTs) >= 0
 }
 
 // Version attempts to extract the version data from a request, depending on where it is stored in the
 // request (currently only "header" is supported)
-func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, []URLSpec, bool, RequestStatus) {
+func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, RequestStatus) {
 	var version apidef.VersionInfo
 
 	// try the context first
@@ -1296,10 +2492,15 @@ func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, []URLSpec, bool
 	} else {
 		// Are we versioned?
 		if a.VersionData.NotVersioned {
-			// Get the first one in the list
-			for _, v := range a.VersionData.Versions {
-				version = v
-				break
+			ambiguous := a.CheckForAmbiguousDefaultVersions()
+			if ambiguous {
+				return nil, VersionAmbiguousDefault
+			}
+
+			ok := false
+			version, ok = a.GetSingleOrDefaultVersion()
+			if !ok {
+				return nil, VersionDefaultForNotVersionedNotFound
 			}
 		} else {
 			// Extract Version Info
@@ -1307,7 +2508,7 @@ func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, []URLSpec, bool
 			vName := a.getVersionFromRequest(r)
 			if vName == "" {
 				if a.VersionData.DefaultVersion == "" {
-					return &version, nil, false, VersionNotFound
+					return &version, VersionNotFound
 				}
 				vName = a.VersionData.DefaultVersion
 				ctxSetDefaultVersion(r)
@@ -1315,7 +2516,14 @@ func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, []URLSpec, bool
 			// Load Version Data - General
 			var ok bool
 			if version, ok = a.VersionData.Versions[vName]; !ok {
-				return &version, nil, false, VersionDoesNotExist
+				if a.VersionDefinition.FallbackToDefault {
+					log.Debugf("fallback to default version: %s", a.VersionData.DefaultVersion)
+					if version, ok = a.VersionData.Versions[a.VersionData.DefaultVersion]; ok {
+						return &version, StatusOk
+					}
+				}
+
+				return &version, VersionDoesNotExist
 			}
 		}
 
@@ -1323,24 +2531,194 @@ func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, []URLSpec, bool
 		ctxSetVersionInfo(r, &version)
 	}
 
-	// Load path data and whitelist data for version
-	rxPaths, rxOk := a.RxPaths[version.Name]
-	if !rxOk {
-		log.Error("no RX Paths found for version ", version.Name)
-		return &version, nil, false, VersionDoesNotExist
-	}
-
-	whiteListStatus, wlOk := a.WhiteListEnabled[version.Name]
-	if !wlOk {
-		log.Error("No whitelist data found")
-		return &version, nil, false, VersionWhiteListStatusNotFound
-	}
-
-	return &version, rxPaths, whiteListStatus, StatusOk
+	return &version, StatusOk
 }
 
-func (a *APISpec) StripListenPath(r *http.Request, path string) string {
-	return stripListenPath(a.Proxy.ListenPath, path, mux.Vars(r))
+// GetSingleOrDefaultVersion determines and returns a single version or the default version if only one or a default exists.
+// Returns versionInfo and a boolean indicating success or failure.
+func (a *APISpec) GetSingleOrDefaultVersion() (versionInfo apidef.VersionInfo, ok bool) {
+	// If only one version exists, we can safely return this one
+	if len(a.VersionData.Versions) == 1 {
+		for _, v := range a.VersionData.Versions {
+			return v, true
+		}
+	}
+
+	// Now we check if a default version is defined and will look for it, when NotVersioned is set to false.
+	// Otherwise, we skip this check.
+	if !a.VersionData.NotVersioned && a.VersionData.DefaultVersion != "" {
+		versionInfo, ok = a.VersionData.Versions[a.VersionData.DefaultVersion]
+		return versionInfo, ok
+	}
+
+	// If no default version is defined, we try to find one named "Default", "default" or ""
+	if versionInfo, ok = a.VersionData.Versions["Default"]; ok {
+		return versionInfo, ok
+	}
+
+	if versionInfo, ok = a.VersionData.Versions["default"]; ok {
+		return versionInfo, ok
+	}
+
+	if versionInfo, ok = a.VersionData.Versions[""]; ok {
+		return versionInfo, ok
+	}
+
+	// If we reach this point, we tried everything to find a default version and failed
+	return apidef.VersionInfo{}, false
+}
+
+// CheckForAmbiguousDefaultVersions checks if there are multiple ambiguous default versions in the version data.
+func (a *APISpec) CheckForAmbiguousDefaultVersions() bool {
+	foundDefaultVersions := 0
+	for key := range a.VersionData.Versions {
+		switch key {
+		case "Default":
+			fallthrough
+		case "default":
+			fallthrough
+		case "":
+			foundDefaultVersions++
+		}
+	}
+
+	return foundDefaultVersions > 1
+}
+
+// StripListenPath will strip the listen path from the URL, keeping version in tact.
+func (a *APISpec) StripListenPath(reqPath string) string {
+	return httputil.StripListenPath(a.Proxy.ListenPath, reqPath)
+}
+
+// StripVersionPath will strip the version from the URL. The input URL
+// should already have listen path stripped.
+func (a *APISpec) StripVersionPath(reqPath string) string {
+	// First part of the url is the version fragment
+	part := strings.Split(strings.Trim(reqPath, "/"), "/")[0]
+
+	matchesUrlVersioningPattern := true
+	if a.VersionDefinition.UrlVersioningPattern != "" {
+		re, err := regexp.Compile(a.VersionDefinition.UrlVersioningPattern)
+		if err != nil {
+			log.Error("Error compiling versioning pattern: ", err)
+		} else {
+			matchesUrlVersioningPattern = re.Match([]byte(part))
+		}
+	}
+
+	if (a.VersionDefinition.StripVersioningData || a.VersionDefinition.StripPath) && matchesUrlVersioningPattern {
+		return strings.Replace(reqPath, "/"+part+"/", "/", 1)
+	}
+
+	return reqPath
+}
+
+func (a *APISpec) SanitizeProxyPaths(r *http.Request) {
+	if !a.Proxy.StripListenPath {
+		return
+	}
+
+	// Do not strip an already-final path selected by a rewrite-like middleware.
+	if !a.GlobalConfig.ApplyStripListenPathToURLRewrite && ctxGetUrlRewritePath(r) != "" {
+		return
+	}
+
+	log.Debug("Stripping proxy listen path: ", a.Proxy.ListenPath)
+
+	r.URL.Path = a.StripListenPath(r.URL.Path)
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = a.StripListenPath(r.URL.RawPath)
+	}
+
+	log.Debug("Upstream path is: ", r.URL.Path)
+}
+
+func (a *APISpec) PrepareRequestToLog(r *http.Request) *http.Request {
+	dup := r.Clone(r.Context())
+	a.PrepareRequestToLogInPlace(dup)
+	return dup
+}
+
+func (a *APISpec) PrepareRequestToLogShallowClone(r *http.Request) *http.Request {
+	dup := *r
+
+	if r.URL != nil {
+		dup.URL = new(*r.URL)
+	}
+
+	a.PrepareRequestToLogInPlace(&dup)
+	return &dup
+}
+
+func (a *APISpec) PrepareRequestToLogInPlace(r *http.Request) {
+	a.SanitizeProxyPaths(r)
+
+	// appends path if upstream ha path e.g. http://httpbin.org/anything
+	if a.target != nil && a.target.Path != "" {
+		r.URL.Path = singleJoiningSlash(a.target.Path, r.URL.Path, a.Proxy.DisableStripSlash)
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = singleJoiningSlash(a.target.Path, r.URL.RawPath, a.Proxy.DisableStripSlash)
+		}
+	}
+}
+
+func (a *APISpec) getRedirectTargetUrl(inputUrl *url.URL) (*url.URL, error) {
+	if inputUrl == nil {
+		return nil, errors.New("input url is nil")
+	}
+
+	cloneUrl := *inputUrl
+	newPath, err := url.JoinPath("/", a.target.Host, a.StripListenPath(cloneUrl.Path))
+
+	if err != nil {
+		return nil, err
+	}
+
+	cloneUrl.Path = newPath
+	cloneUrl.RawPath = newPath
+	return &cloneUrl, nil
+}
+
+// hasActiveMock checks if specification has at least one active mock.
+func (a *APISpec) hasActiveMock() bool {
+	if !a.IsOAS {
+		return false
+	}
+
+	middleware := a.OAS.GetTykMiddleware()
+	if middleware == nil {
+		return false
+	}
+
+	for _, operation := range middleware.Operations {
+		if operation.MockResponse != nil && operation.MockResponse.Enabled {
+			return true
+		}
+	}
+
+	// Check MCP primitives (tools, resources, prompts)
+	return middleware.HasMCPPrimitivesMocks()
+}
+
+func (a *APISpec) hasVirtualEndpoint() bool {
+	for _, version := range a.VersionData.Versions {
+		for _, virtual := range version.ExtendedPaths.Virtual {
+			if !virtual.Disabled {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isListeningOnPort checks whether the API listens on the given port.
+func (a *APISpec) isListeningOnPort(port int, gwConfig *config.Config) bool {
+	if a.ListenPort == 0 {
+		return gwConfig.ListenPort == port
+	}
+
+	return a.ListenPort == port
 }
 
 type RoundRobin struct {
@@ -1356,17 +2734,60 @@ func (r *RoundRobin) WithLen(len int) int {
 	return int(cur) % len
 }
 
-var listenPathVarsRE = regexp.MustCompile(`{[^:]+(:[^}]+)?}`)
-
-func stripListenPath(listenPath, path string, muxVars map[string]string) string {
-	if !strings.Contains(listenPath, "{") {
-		return strings.TrimPrefix(path, listenPath)
+func (a APIDefinitionLoader) populateMCPPrimitivesMap(spec *APISpec) {
+	if !spec.IsMCP() {
+		return
 	}
-	lp := listenPathVarsRE.ReplaceAllStringFunc(listenPath, func(match string) string {
-		match = strings.TrimLeft(match, "{")
-		match = strings.TrimRight(match, "}")
-		aliasVar := strings.Split(match, ":")[0]
-		return muxVars[aliasVar]
-	})
-	return strings.TrimPrefix(path, lp)
+
+	middleware := spec.OAS.GetTykMiddleware()
+	if middleware == nil {
+		return
+	}
+
+	spec.MCPPrimitives = make(map[string]string)
+
+	for name := range middleware.McpTools {
+		spec.MCPPrimitives["tool:"+name] = mcp.ToolPrefix + name
+	}
+
+	for name := range middleware.McpResources {
+		spec.MCPPrimitives["resource:"+name] = mcp.ResourcePrefix + name
+	}
+
+	for name := range middleware.McpPrompts {
+		spec.MCPPrimitives["prompt:"+name] = mcp.PromptPrefix + name
+	}
+
+	builtInOperations := map[string]string{
+		mcp.MethodToolsCall:     "/" + mcp.MethodToolsCall,
+		mcp.MethodResourcesRead: "/" + mcp.MethodResourcesRead,
+		mcp.MethodPromptsGet:    "/" + mcp.MethodPromptsGet,
+	}
+
+	for method, path := range builtInOperations {
+		if spec.OAS.Paths != nil && spec.OAS.Paths.Find(path) != nil {
+			spec.MCPPrimitives["operation:"+method] = path
+		}
+	}
+}
+
+func (a APIDefinitionLoader) calculateMCPAllowlistFlags(spec *APISpec) {
+	middleware := spec.OAS.GetTykMiddleware()
+	if middleware == nil {
+		return
+	}
+
+	operations := oas.Operations{}
+	if middleware.Operations != nil {
+		operations = middleware.Operations
+	}
+
+	spec.OperationsAllowListEnabled = hasOperationAllowEnabled(operations)
+	spec.ToolsAllowListEnabled = hasPrimitiveAllowEnabled(middleware.McpTools)
+	spec.ResourcesAllowListEnabled = hasPrimitiveAllowEnabled(middleware.McpResources)
+	spec.PromptsAllowListEnabled = hasPrimitiveAllowEnabled(middleware.McpPrompts)
+
+	spec.MCPAllowListEnabled = spec.ToolsAllowListEnabled ||
+		spec.ResourcesAllowListEnabled ||
+		spec.PromptsAllowListEnabled
 }

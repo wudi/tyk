@@ -1,0 +1,13 @@
+name: Trigger Force Merge
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  call_force_merge:
+    uses: TykTechnologies/github-actions/.github/workflows/force-merge.yaml@production
+    secrets:
+      PROBE_APP_ID: ${{ secrets.PROBE_APP_ID }}
+      PROBE_APP_PRIVATE_KEY: ${{ secrets.PROBE_APP_PRIVATE_KEY }}
+      SLACK_WEBHOOK_URL: ${{ secrets.FORCE_MERGE_SLACK_WEBHOOK }}

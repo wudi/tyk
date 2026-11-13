@@ -5,25 +5,21 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/robertkrimen/otto"
-	_ "github.com/robertkrimen/otto/underscore"
-
-	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/headers"
-	"github.com/TykTechnologies/tyk/user"
-
 	"github.com/sirupsen/logrus"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/middleware"
+	"github.com/TykTechnologies/tyk/user"
 )
 
 // RequestObject is marshalled to JSON string and passed into JSON middleware
@@ -43,12 +39,13 @@ type ResponseObject struct {
 
 type VMResponseObject struct {
 	Response    ResponseObject
-	SessionMeta map[string]string
+	SessionMeta map[string]interface{}
 }
 
-// DynamicMiddleware is a generic middleware that will execute JS code before continuing
+// VirtualEndpoint is a generic middleware that will execute JS code before continuing
 type VirtualEndpoint struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	sh SuccessHandler
 }
 
@@ -56,12 +53,12 @@ func (d *VirtualEndpoint) Name() string {
 	return "VirtualEndpoint"
 }
 
-func preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
+func (gw *Gateway) preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
 	// the only call site uses (&foo, &bar) so meta and j won't be
 	// nil.
 	var src interface{}
 	switch meta.FunctionSourceType {
-	case "file":
+	case apidef.UseFile:
 		j.Log.Debug("Loading JS Endpoint File: ", meta.FunctionSourceURI)
 		f, err := os.Open(meta.FunctionSourceURI)
 		if err != nil {
@@ -69,11 +66,12 @@ func preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
 			return
 		}
 		src = f
-	case "blob":
-		if config.Global().DisableVirtualPathBlobs {
+	case apidef.UseBlob:
+		if gw.GetConfig().DisableVirtualPathBlobs {
 			j.Log.Error("[JSVM] Blobs not allowed on this node")
 			return
 		}
+
 		j.Log.Debug("Loading JS blob")
 		js, err := base64.StdEncoding.DecodeString(meta.FunctionSourceURI)
 		if err != nil {
@@ -90,6 +88,38 @@ func preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
 	}
 }
 
+func (gw *Gateway) preLoadVirtualMetaCodeGoja(meta *apidef.VirtualMeta, j *GojaJSVM) {
+	var src string
+	switch meta.FunctionSourceType {
+	case apidef.UseFile:
+		j.Log.Debug("Loading JS Endpoint File: ", meta.FunctionSourceURI)
+		data, err := os.ReadFile(meta.FunctionSourceURI)
+		if err != nil {
+			j.Log.WithError(err).Error("Failed to open Endpoint JS")
+			return
+		}
+		src = string(data)
+	case apidef.UseBlob:
+		if gw.GetConfig().DisableVirtualPathBlobs {
+			j.Log.Error("[JSVM] Blobs not allowed on this node")
+			return
+		}
+		j.Log.Debug("Loading JS blob")
+		js, err := base64.StdEncoding.DecodeString(meta.FunctionSourceURI)
+		if err != nil {
+			j.Log.WithError(err).Error("Failed to load blob JS")
+			return
+		}
+		src = string(js)
+	default:
+		j.Log.Error("Type must be either file or blob (base64)!")
+		return
+	}
+	if err := j.LoadScript(src); err != nil {
+		j.Log.WithError(err).Error("Could not load virtual endpoint JS")
+	}
+}
+
 func (d *VirtualEndpoint) Init() {
 	d.sh = SuccessHandler{d.BaseMiddleware}
 }
@@ -98,16 +128,13 @@ func (d *VirtualEndpoint) EnabledForSpec() bool {
 	if !d.Spec.GlobalConfig.EnableJSVM {
 		return false
 	}
-	for _, version := range d.Spec.VersionData.Versions {
-		if len(version.ExtendedPaths.Virtual) > 0 {
-			return true
-		}
-	}
-	return false
+
+	return d.Spec.hasVirtualEndpoint()
 }
 
 func (d *VirtualEndpoint) getMetaFromRequest(r *http.Request) *apidef.VirtualMeta {
-	_, versionPaths, _, _ := d.Spec.Version(r)
+	version, _ := d.Spec.Version(r)
+	versionPaths := d.Spec.RxPaths[version.Name]
 	found, meta := d.Spec.CheckSpecMatchesStatus(r, versionPaths, VirtualPath)
 	if !found {
 		return nil
@@ -121,20 +148,18 @@ func (d *VirtualEndpoint) getMetaFromRequest(r *http.Request) *apidef.VirtualMet
 	return vmeta
 }
 
-func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Request, vmeta *apidef.VirtualMeta) *http.Response {
-	t1 := time.Now().UnixNano()
-
+func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Request, vmeta *apidef.VirtualMeta) (*http.Response, error) {
+	t1 := time.Now()
 	if vmeta == nil {
 		if vmeta = d.getMetaFromRequest(r); vmeta == nil {
-			return nil
+			return nil, errors.New("no request info")
 		}
 	}
 
 	// Create the proxy object
-	originalBody, err := ioutil.ReadAll(r.Body)
+	originalBody, err := io.ReadAll(r.Body)
 	if err != nil {
-		d.Logger().WithError(err).Error("Failed to read request body!")
-		return nil
+		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 	defer r.Body.Close()
 
@@ -150,14 +175,13 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 	}
 
 	// We need to copy the body _back_ for the decode
-	r.Body = ioutil.NopCloser(bytes.NewReader(originalBody))
+	r.Body = io.NopCloser(bytes.NewReader(originalBody))
 	parseForm(r)
 	requestData.Params = r.Form
 
 	requestAsJson, err := json.Marshal(requestData)
 	if err != nil {
-		d.Logger().WithError(err).Error("Failed to encode request object for virtual endpoint")
-		return nil
+		return nil, fmt.Errorf("failed to encode request object for virtual endpoint: %w", err)
 	}
 
 	// Encode the configuration data too
@@ -172,83 +196,69 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 
 	sessionAsJson, err := json.Marshal(session)
 	if err != nil {
-		d.Logger().WithError(err).Error("Failed to encode session for VM")
-		return nil
+		return nil, fmt.Errorf("failed to encode session for VM: %w", err)
 	}
 
 	// Run the middleware
-	vm := d.Spec.JSVM.VM.Copy()
-	vm.Interrupt = make(chan func(), 1)
+	expr := vmeta.ResponseFunctionName + `(` + string(requestAsJson) + `, ` + string(sessionAsJson) + `, ` + specAsJson + `);`
 	d.Logger().Debug("Running: ", vmeta.ResponseFunctionName)
-	// buffered, leaving no chance of a goroutine leak since the
-	// spawned goroutine will send 0 or 1 values.
-	ret := make(chan otto.Value, 1)
-	errRet := make(chan error, 1)
-	go func() {
-		defer func() {
-			// the VM executes the panic func that gets it
-			// to stop, so we must recover here to not crash
-			// the whole Go program.
-			recover()
-		}()
-		returnRaw, err := vm.Run(vmeta.ResponseFunctionName + `(` + string(requestAsJson) + `, ` + string(sessionAsJson) + `, ` + specAsJson + `);`)
-		ret <- returnRaw
-		errRet <- err
-	}()
-	var returnRaw otto.Value
-	t := time.NewTimer(d.Spec.JSVM.Timeout)
-	select {
-	case returnRaw = <-ret:
-		if err := <-errRet; err != nil {
-			d.Logger().WithError(err).Error("Failed to run JS middleware")
-			return nil
-		}
-		t.Stop()
-	case <-t.C:
-		t.Stop()
-		d.Logger().Error("JS middleware timed out after ", d.Spec.JSVM.Timeout)
-		vm.Interrupt <- func() {
-			// only way to stop the VM is to send it a func
-			// that panics.
-			panic("stop")
-		}
-		return nil
+
+	runner := d.Spec.GetJSRunner()
+	if runner == nil {
+		return nil, errors.New("JSVM isn't initialized")
 	}
-	returnDataStr, _ := returnRaw.ToString()
+	returnDataStr, err := runner.Run(expr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run JS middleware: %w", err)
+	}
 
 	// Decode the return object
 	newResponseData := VMResponseObject{}
 	if err := json.Unmarshal([]byte(returnDataStr), &newResponseData); err != nil {
-		d.Logger().WithError(err).Error("Failed to decode virtual endpoint response data on return from VM: ",
-			"; Returned: ", returnDataStr)
-		return nil
+		d.Logger().WithError(err).WithField("return_data", returnDataStr).Errorf("Failed to decode virtual endpoint response data on return from VM")
+		return nil, fmt.Errorf("failed to decode virtual endpoint response: %w", err)
 	}
 
 	// Save the sesison data (if modified)
 	if vmeta.UseSession {
-		newMeta := mapStrsToIfaces(newResponseData.SessionMeta)
+		newMeta := newResponseData.SessionMeta
 		if !reflect.DeepEqual(session.MetaData, newMeta) {
 			session.MetaData = newMeta
-			ctxSetSession(r, session, "", true)
+			ctxSetSession(r, session, true, d.Gw.GetConfig().HashKeys)
 		}
 	}
 
-	d.Logger().Debug("JSVM Virtual Endpoint execution took: (ns) ", time.Now().UnixNano()-t1)
+	copiedResponse := d.Gw.forceResponse(w, r, &newResponseData, d.Spec, session, false, d.Logger())
+	ms := DurationToMillisecond(time.Since(t1))
+	d.Logger().Debug("JSVM Virtual Endpoint execution took: (ms) ", ms)
 
-	copiedResponse := forceResponse(w, r, &newResponseData, d.Spec, session, false, d.Logger())
-
-	if copiedResponse != nil {
-		d.sh.RecordHit(r, Latency{}, copiedResponse.StatusCode, copiedResponse)
+	// Skip recording intermediate VEM hits for MCP requests — the final
+	// SuccessHandler/ErrorHandler records the hit with proper MCPStats.
+	// Without this guard, each VEM continuation step produces a non-MCP
+	// analytics record that leaks internal routing paths into the endpoints table.
+	if copiedResponse != nil && !d.Spec.IsMCP() {
+		logRequest := d.Spec.PrepareRequestToLogShallowClone(r)
+		d.sh.RecordHit(
+			logRequest,
+			analytics.Latency{Total: int64(ms), Upstream: 0, Gateway: int64(ms)},
+			copiedResponse.StatusCode,
+			copiedResponse,
+			false,
+		)
 	}
 
-	return copiedResponse
+	return copiedResponse, nil
 }
 
-func forceResponse(w http.ResponseWriter,
+func (gw *Gateway) forceResponse(
+	w http.ResponseWriter,
 	r *http.Request,
 	newResponseData *VMResponseObject,
 	spec *APISpec,
-	session *user.SessionState, isPre bool, logger *logrus.Entry) *http.Response {
+	session *user.SessionState,
+	isPre bool,
+	logger *logrus.Entry,
+) *http.Response {
 	responseMessage := []byte(newResponseData.Response.Body)
 
 	// Create an http.Response object so we can send it tot he cache middleware
@@ -256,9 +266,9 @@ func forceResponse(w http.ResponseWriter,
 	newResponse.Header = make(map[string][]string)
 
 	requestTime := time.Now().UTC().Format(http.TimeFormat)
-
+	ignoreCanonical := gw.GetConfig().IgnoreCanonicalMIMEHeaderKey
 	for header, value := range newResponseData.Response.Headers {
-		newResponse.Header.Set(header, value)
+		setCustomHeader(newResponse.Header, header, value, ignoreCanonical)
 	}
 
 	newResponse.ContentLength = int64(len(responseMessage))
@@ -266,9 +276,9 @@ func forceResponse(w http.ResponseWriter,
 		ReadSeeker: bytes.NewReader(responseMessage),
 	}
 	newResponse.StatusCode = newResponseData.Response.Code
-	newResponse.Proto = "HTTP/1.0"
-	newResponse.ProtoMajor = 1
-	newResponse.ProtoMinor = 0
+	newResponse.Proto = r.Proto
+	newResponse.ProtoMajor = r.ProtoMajor
+	newResponse.ProtoMinor = r.ProtoMinor
 	newResponse.Header.Set("Server", "tyk")
 	newResponse.Header.Set("Date", requestTime)
 
@@ -293,7 +303,7 @@ func forceResponse(w http.ResponseWriter,
 		}
 	}
 
-	handleForcedResponse(w, newResponse, session, spec)
+	gw.handleForcedResponse(w, newResponse, session, spec)
 
 	// Record analytics
 	return newResponse
@@ -307,23 +317,26 @@ func (d *VirtualEndpoint) ProcessRequest(w http.ResponseWriter, r *http.Request,
 		return nil, http.StatusOK
 	}
 
-	if res := d.ServeHTTPForCache(w, r, vmeta); res == nil {
+	if _, err := d.ServeHTTPForCache(w, r, vmeta); err != nil {
+		message := "Error during virtual endpoint execution. Contact Administrator for more details."
+		d.Logger().WithError(err).WithField("vmeta", vmeta).Error(message)
+
 		if vmeta.ProxyOnError {
 			return nil, http.StatusOK
-		} else {
-			return errors.New("Error during virtual endpoint execution. Contact Administrator for more details."), http.StatusInternalServerError
 		}
+
+		return errors.New(message), http.StatusInternalServerError
 	}
 
-	return nil, mwStatusRespond
+	return nil, middleware.StatusRespond
 }
 
 func (d *VirtualEndpoint) HandleResponse(rw http.ResponseWriter, res *http.Response, ses *user.SessionState) {
 	// Externalising this from the MW so we can re-use it elsewhere
-	handleForcedResponse(rw, res, ses, d.Spec)
+	d.Gw.handleForcedResponse(rw, res, ses, d.Spec)
 }
 
-func handleForcedResponse(rw http.ResponseWriter, res *http.Response, ses *user.SessionState, spec *APISpec) {
+func (gw *Gateway) handleForcedResponse(rw http.ResponseWriter, res *http.Response, ses *user.SessionState, spec *APISpec) {
 	defer res.Body.Close()
 
 	// Close connections
@@ -331,16 +344,9 @@ func handleForcedResponse(rw http.ResponseWriter, res *http.Response, ses *user.
 		res.Header.Set("Connection", "close")
 	}
 
-	// Add resource headers
-	if ses != nil {
-		// We have found a session, lets report back
-		quotaMax, quotaRemaining, _, quotaRenews := ses.GetQuotaLimitByAPIID(spec.APIID)
-		res.Header.Set(headers.XRateLimitLimit, strconv.Itoa(int(quotaMax)))
-		res.Header.Set(headers.XRateLimitRemaining, strconv.Itoa(int(quotaRemaining)))
-		res.Header.Set(headers.XRateLimitReset, strconv.Itoa(int(quotaRenews)))
-	}
+	gw.limitHeaderFactory(res.Header).SendQuotas(ses, spec.APIID)
 
-	copyHeader(rw.Header(), res.Header)
+	copyHeader(rw.Header(), res.Header, gw.GetConfig().IgnoreCanonicalMIMEHeaderKey)
 
 	rw.WriteHeader(res.StatusCode)
 	io.Copy(rw, res.Body)

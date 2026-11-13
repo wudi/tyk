@@ -2,7 +2,6 @@ package test
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"reflect"
 	"regexp"
@@ -16,7 +15,6 @@ import (
 )
 
 var (
-	muDefaultResolver  sync.RWMutex
 	DomainsToAddresses = map[string][]string{
 		"host1.": {"127.0.0.1"},
 		"host2.": {"127.0.0.1"},
@@ -76,9 +74,11 @@ func (d *dnsMockHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 		var addresses []string
 
+		// Longest match wins: the map is process-wide and iteration order is random.
+		matched := ""
 		for d, ips := range d.domainsToAddresses {
-			if strings.HasPrefix(domain, d) {
-				addresses = ips
+			if strings.HasPrefix(domain, d) && len(d) > len(matched) {
+				matched, addresses = d, ips
 			}
 		}
 
@@ -89,7 +89,11 @@ func (d *dnsMockHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			// [[:alnum:]]+\.	match single character in [a-zA-Z0-9] minimum one time and ending in . literally
 			reg := regexp.MustCompile(`^localhost\.([[:alnum:]]+\.)*`)
 			if matched := reg.MatchString(domain); !matched {
-				panic(fmt.Sprintf("domain not mocked: %s", domain))
+				// On the server's goroutine: a panic aborts the binary.
+				m := new(dns.Msg)
+				m.SetRcode(r, dns.RcodeNameError)
+				w.WriteMsg(m)
+				return
 			}
 
 			addresses = []string{"127.0.0.1"}
@@ -111,54 +115,95 @@ type DnsMockHandle struct {
 	ShutdownDnsMock func() error
 }
 
+var (
+	mockOnce   sync.Once
+	sharedMock *DnsMockHandle
+	sharedErr  error
+)
+
+// PushDomains returns a function restoring what was registered before.
 func (h *DnsMockHandle) PushDomains(domainsMap map[string][]string, domainsErrorMap map[string]int) func() {
 	handler := h.mockServer.Handler.(*dnsMockHandler)
 	handler.muDomainsToAddresses.Lock()
 	defer handler.muDomainsToAddresses.Unlock()
 
-	dta := handler.domainsToAddresses
-	dte := handler.domainsToErrors
-
-	prevDta := map[string][]string{}
-	prevDte := map[string]int{}
-
-	for key, value := range dta {
-		prevDta[key] = value
+	// Key by key, or registrations made by others in this window are lost.
+	priorAddrs := make(map[string][]string, len(domainsMap))
+	addedAddrs := make(map[string]struct{}, len(domainsMap))
+	for key, ips := range domainsMap {
+		if existing, ok := handler.domainsToAddresses[key]; ok {
+			priorAddrs[key] = existing
+		} else {
+			addedAddrs[key] = struct{}{}
+		}
+		handler.domainsToAddresses[key] = ips
 	}
 
-	for key, value := range dte {
-		prevDte[key] = value
+	priorErrs := make(map[string]int, len(domainsErrorMap))
+	addedErrs := make(map[string]struct{}, len(domainsErrorMap))
+	for key, rCode := range domainsErrorMap {
+		if existing, ok := handler.domainsToErrors[key]; ok {
+			priorErrs[key] = existing
+		} else {
+			addedErrs[key] = struct{}{}
+		}
+		handler.domainsToErrors[key] = rCode
 	}
 
-	pullDomainsFunc := func() {
+	return func() {
 		handler := h.mockServer.Handler.(*dnsMockHandler)
 		handler.muDomainsToAddresses.Lock()
 		defer handler.muDomainsToAddresses.Unlock()
 
-		handler.domainsToAddresses = prevDta
-		handler.domainsToErrors = prevDte
-	}
+		for key := range addedAddrs {
+			delete(handler.domainsToAddresses, key)
+		}
+		for key, ips := range priorAddrs {
+			handler.domainsToAddresses[key] = ips
+		}
 
-	for key, ips := range domainsMap {
-		addr, ok := dta[key]
-		if !ok {
-			dta[key] = ips
-		} else {
-			dta[key] = append(addr, ips...)
+		for key := range addedErrs {
+			delete(handler.domainsToErrors, key)
+		}
+		for key, rCode := range priorErrs {
+			handler.domainsToErrors[key] = rCode
 		}
 	}
-
-	for key, rCode := range domainsErrorMap {
-		dte[key] = rCode
-	}
-
-	return pullDomainsFunc
 }
 
 // InitDNSMock initializes dns server on udp:0 address and replaces net.DefaultResolver in order
 // to route all dns queries within tests to this server.
 // InitDNSMock returns handle, which can be used to add/remove dns query mock responses or initialization error.
+//
+// One mock server per process; use PushDomains for a scoped override.
 func InitDNSMock(domainsMap map[string][]string, domainsErrorMap map[string]int) (*DnsMockHandle, error) {
+	mockOnce.Do(func() {
+		sharedMock, sharedErr = startDNSMock()
+	})
+	if sharedErr != nil {
+		return sharedMock, sharedErr
+	}
+
+	if domainsMap == nil {
+		domainsMap = DomainsToAddresses
+	}
+
+	handler := sharedMock.mockServer.Handler.(*dnsMockHandler)
+	handler.muDomainsToAddresses.Lock()
+	defer handler.muDomainsToAddresses.Unlock()
+
+	for domain, addresses := range domainsMap {
+		handler.domainsToAddresses[domain] = addresses
+	}
+	for domain, rcode := range domainsErrorMap {
+		handler.domainsToErrors[domain] = rcode
+	}
+
+	return sharedMock, nil
+}
+
+// startDNSMock points net.DefaultResolver at the process-wide mock server.
+func startDNSMock() (*DnsMockHandle, error) {
 	addr, _ := net.ResolveUDPAddr("udp", ":0")
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
@@ -173,16 +218,10 @@ func InitDNSMock(domainsMap map[string][]string, domainsErrorMap map[string]int)
 	mockServer := &dns.Server{PacketConn: conn, NotifyStartedFunc: started}
 	handle := &DnsMockHandle{id: time.Now().String(), mockServer: mockServer}
 
-	dnsMux := &dnsMockHandler{muDomainsToAddresses: sync.RWMutex{}}
-
-	if domainsMap != nil {
-		dnsMux.domainsToAddresses = domainsMap
-	} else {
-		dnsMux.domainsToAddresses = DomainsToAddresses
-	}
-
-	if domainsErrorMap != nil {
-		dnsMux.domainsToErrors = domainsErrorMap
+	// Non-nil for the life of the server: callers register into them.
+	dnsMux := &dnsMockHandler{
+		domainsToAddresses: map[string][]string{},
+		domainsToErrors:    map[string]int{},
 	}
 
 	mockServer.Handler = dnsMux
@@ -197,31 +236,21 @@ func InitDNSMock(domainsMap map[string][]string, domainsErrorMap map[string]int)
 		return handle, err
 	}
 
-	muDefaultResolver.RLock()
-	defaultResolver := net.DefaultResolver
-	muDefaultResolver.RUnlock()
 	mockResolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{}
-
-			//Use write lock to prevent unsafe d.DialContext update of net.DefaultResolver
-			muDefaultResolver.Lock()
-			defer muDefaultResolver.Unlock()
 			return d.DialContext(ctx, network, mockServer.PacketConn.LocalAddr().String())
 		},
 	}
 
-	muDefaultResolver.Lock()
 	net.DefaultResolver = mockResolver
-	muDefaultResolver.Unlock()
 
 	handle.ShutdownDnsMock = func() error {
-		muDefaultResolver.Lock()
-		net.DefaultResolver = defaultResolver
-		muDefaultResolver.Unlock()
-
-		return mockServer.Shutdown()
+		// We run tests against O(1) packages, we can
+		// afford a dirty shutdown, if it means less
+		// flaky tests.
+		return nil // mockServer.Shutdown()
 	}
 
 	return handle, nil

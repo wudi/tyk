@@ -1,17 +1,16 @@
 package gateway
 
 import (
+	"context"
 	"errors"
-	"net"
-	"net/url"
-	"time"
-
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"net/url"
+	"strings"
 
 	"github.com/TykTechnologies/tyk/apidef"
-	"github.com/TykTechnologies/tyk/config"
 	"github.com/TykTechnologies/tyk/coprocess"
 )
 
@@ -25,8 +24,8 @@ type GRPCDispatcher struct {
 	coprocess.Dispatcher
 }
 
-func dialer(addr string, timeout time.Duration) (net.Conn, error) {
-	grpcURL, err := url.Parse(config.Global().CoProcessOptions.CoProcessGRPCServer)
+func (gw *Gateway) GetCoProcessGrpcServerTargetURL() (*url.URL, error) {
+	grpcURL, err := url.Parse(gw.GetConfig().CoProcessOptions.CoProcessGRPCServer)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"prefix": "coprocess",
@@ -34,21 +33,28 @@ func dialer(addr string, timeout time.Duration) (net.Conn, error) {
 		return nil, err
 	}
 
-	if grpcURL == nil || config.Global().CoProcessOptions.CoProcessGRPCServer == "" {
+	if grpcURL == nil || gw.GetConfig().CoProcessOptions.CoProcessGRPCServer == "" {
 		errString := "No gRPC URL is set!"
 		log.WithFields(logrus.Fields{
 			"prefix": "coprocess",
 		}).Error(errString)
-		return nil, errors.New(errString)
+		return nil, err
 	}
+	return grpcURL, nil
+}
 
-	grpcURLString := config.Global().CoProcessOptions.CoProcessGRPCServer[len(grpcURL.Scheme)+3:]
-	return net.DialTimeout(grpcURL.Scheme, grpcURLString, timeout)
+func GetCoProcessGrpcServerTargetUrlAsString(targetUrl *url.URL) string {
+	return strings.TrimPrefix(targetUrl.String(), "tcp://")
 }
 
 // Dispatch takes a CoProcessMessage and sends it to the CP.
 func (d *GRPCDispatcher) Dispatch(object *coprocess.Object) (*coprocess.Object, error) {
-	return grpcClient.Dispatch(context.Background(), object)
+	return d.DispatchWithContext(context.Background(), object)
+}
+
+// DispatchWithContext takes a context and CoProcessMessage and sends it to the CP with trace propagation.
+func (d *GRPCDispatcher) DispatchWithContext(ctx context.Context, object *coprocess.Object) (*coprocess.Object, error) {
+	return grpcClient.Dispatch(ctx, object)
 }
 
 // DispatchEvent dispatches a Tyk event.
@@ -58,7 +64,6 @@ func (d *GRPCDispatcher) DispatchEvent(eventJSON []byte) {
 	}
 
 	_, err := grpcClient.DispatchEvent(context.Background(), eventObject)
-
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"prefix": "coprocess",
@@ -72,9 +77,9 @@ func (d *GRPCDispatcher) Reload() {}
 // HandleMiddlewareCache isn't used by gRPC.
 func (d *GRPCDispatcher) HandleMiddlewareCache(b *apidef.BundleManifest, basePath string) {}
 
-func grpcCallOpts() grpc.DialOption {
-	recvSize := config.Global().CoProcessOptions.GRPCRecvMaxSize
-	sendSize := config.Global().CoProcessOptions.GRPCSendMaxSize
+func (gw *Gateway) grpcCallOpts() grpc.DialOption {
+	recvSize := gw.GetConfig().CoProcessOptions.GRPCRecvMaxSize
+	sendSize := gw.GetConfig().CoProcessOptions.GRPCSendMaxSize
 	var opts []grpc.CallOption
 	if recvSize > 0 {
 		opts = append(opts, grpc.MaxCallRecvMsgSize(recvSize))
@@ -86,23 +91,43 @@ func grpcCallOpts() grpc.DialOption {
 }
 
 // NewGRPCDispatcher wraps all the actions needed for this CP.
-func NewGRPCDispatcher() (coprocess.Dispatcher, error) {
-	if config.Global().CoProcessOptions.CoProcessGRPCServer == "" {
+func (gw *Gateway) NewGRPCDispatcher() (coprocess.Dispatcher, error) {
+	if gw.GetConfig().CoProcessOptions.CoProcessGRPCServer == "" {
 		return nil, errors.New("No gRPC URL is set")
 	}
-	var err error
-	grpcConnection, err = grpc.Dial("",
-		grpcCallOpts(),
-		grpc.WithInsecure(),
-		grpc.WithDialer(dialer),
-	)
-	grpcClient = coprocess.NewDispatcherClient(grpcConnection)
 
+	var err error
+	grpcUrl, err := gw.GetCoProcessGrpcServerTargetURL()
+	if err != nil {
+		return nil, err
+	}
+
+	dialOptions := []grpc.DialOption{
+		gw.grpcCallOpts(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	}
+	authority := gw.GetConfig().CoProcessOptions.GRPCAuthority
+	if authority != "" {
+		dialOptions = append(dialOptions, grpc.WithAuthority(authority))
+	}
+
+	isRoundRobinEnabled := gw.GetConfig().CoProcessOptions.GRPCRoundRobinLoadBalancing
+	if isRoundRobinEnabled {
+		dialOptions = append(dialOptions, grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`))
+	}
+
+	grpcConnection, err = grpc.NewClient(
+		GetCoProcessGrpcServerTargetUrlAsString(grpcUrl),
+		dialOptions...,
+	)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"prefix": "coprocess",
 		}).Error(err)
 		return nil, err
 	}
+
+	grpcClient = coprocess.NewDispatcherClient(grpcConnection)
 	return &GRPCDispatcher{}, nil
 }

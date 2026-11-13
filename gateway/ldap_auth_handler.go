@@ -139,6 +139,16 @@ func (l *LDAPStorageHandler) SetRawKey(cn, session string, timeout int64) error 
 	return nil
 }
 
+func (l *LDAPStorageHandler) SetKeyEx(_key string, _value string, _duration int64) error {
+	l.notifyReadOnly()
+	return nil
+}
+
+func (l *LDAPStorageHandler) SetRawKeyEx(_key string, _value string, _duration int64) error {
+	l.notifyReadOnly()
+	return nil
+}
+
 func (l *LDAPStorageHandler) DeleteKey(cn string) bool {
 	return l.notifyReadOnly()
 }
@@ -151,6 +161,8 @@ func (r *LDAPStorageHandler) DeleteAllKeys() bool {
 func (l *LDAPStorageHandler) DeleteRawKey(cn string) bool {
 	return l.notifyReadOnly()
 }
+
+func (l *LDAPStorageHandler) DeleteRawKeys([]string) bool { return l.notifyReadOnly() }
 
 func (l *LDAPStorageHandler) DeleteKeys(keys []string) bool {
 	return l.notifyReadOnly()

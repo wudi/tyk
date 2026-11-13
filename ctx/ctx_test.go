@@ -1,0 +1,305 @@
+package ctx_test
+
+import (
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/apidef/oas"
+	"github.com/TykTechnologies/tyk/ctx"
+	"github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/uuid"
+)
+
+// Test for GetDefinition
+func TestGetDefinition(t *testing.T) {
+	apiDef := &apidef.APIDefinition{
+		APIID: uuid.New(),
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+
+	assert.Nil(t, ctx.GetDefinition(req))
+
+	ctx.SetDefinition(req, apiDef)
+	cloned := ctx.GetDefinition(req)
+
+	assert.Equal(t, apiDef, cloned)
+}
+
+// Test for GetOASDefinition
+func TestGetOASDefinition(t *testing.T) {
+	oasDef := &oas.OAS{}
+	oasDef.Info = &openapi3.Info{
+		Title:   uuid.New(),
+		Version: "1",
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+
+	assert.Nil(t, ctx.GetOASDefinition(req))
+
+	ctx.SetOASDefinition(req, oasDef)
+	cloned := ctx.GetOASDefinition(req)
+
+	assert.Equal(t, oasDef, cloned)
+}
+
+func TestGetOASConfigData(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+
+	// Test when OAS definition is not in context
+	configData, err := ctx.GetOASConfigData(req)
+	assert.Nil(t, configData)
+	assert.Error(t, err)
+	assert.Equal(t, "OAS definition not found in request context", err.Error())
+
+	// Test when OAS definition is in context but no config data
+	oasDef := &oas.OAS{}
+	ctx.SetOASDefinition(req, oasDef)
+	configData, err = ctx.GetOASConfigData(req)
+	assert.Nil(t, configData)
+	assert.Error(t, err)
+	assert.Equal(t, "config data is nil", err.Error())
+
+	// Test when config data is present
+	expectedConfigData := map[string]any{
+		"key": "value",
+	}
+	oasDefWithConfig := &oas.OAS{}
+	oasDefWithConfig.SetTykExtension(&oas.XTykAPIGateway{
+		Middleware: &oas.Middleware{
+			Global: &oas.Global{
+				PluginConfig: &oas.PluginConfig{
+					Data: &oas.PluginConfigData{
+						Value: expectedConfigData,
+					},
+				},
+			},
+		},
+	})
+	ctx.SetOASDefinition(req, oasDefWithConfig)
+	configData, err = ctx.GetOASConfigData(req)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedConfigData, configData)
+}
+
+func TestGetOASConfigData_ReturnsDeepCopy(t *testing.T) {
+	newConfigData := func() map[string]any {
+		return map[string]any{
+			"key": "value",
+			"nested": map[string]any{
+				"inner": "value",
+			},
+			"list": []any{"a", "b"},
+		}
+	}
+
+	oasDef := &oas.OAS{}
+	oasDef.SetTykExtension(&oas.XTykAPIGateway{
+		Middleware: &oas.Middleware{
+			Global: &oas.Global{
+				PluginConfig: &oas.PluginConfig{
+					Data: &oas.PluginConfigData{
+						Value: newConfigData(),
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+	ctx.SetOASDefinition(req, oasDef)
+
+	configData, err := ctx.GetOASConfigData(req)
+	assert.NoError(t, err)
+	assert.Equal(t, newConfigData(), configData)
+
+	configData["key"] = "modified"
+	configData["added"] = "new"
+	configData["nested"].(map[string]any)["inner"] = "modified"
+	configData["list"].([]any)[0] = "modified"
+
+	original := oasDef.GetTykMiddleware().Global.PluginConfig.Data.Value
+	assert.Equal(t, newConfigData(), original, "modifying returned config data must not affect the API definition")
+
+	configData, err = ctx.GetOASConfigData(req)
+	assert.NoError(t, err)
+	assert.Equal(t, newConfigData(), configData, "subsequent calls must return unmodified config data")
+}
+
+// Benchmark for GetDefinition
+func BenchmarkGetDefinition(b *testing.B) {
+	apiDef := &apidef.APIDefinition{
+		APIID: uuid.New(),
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+
+	ctx.SetDefinition(req, apiDef)
+
+	b.ResetTimer()
+	for b.Loop() {
+		cloned := ctx.GetDefinition(req)
+		assert.Equal(b, apiDef, cloned)
+	}
+}
+
+// Benchmark for GetOASDefinition
+func BenchmarkGetOASDefinition(b *testing.B) {
+	oasDef := &oas.OAS{}
+	oasDef.Info = &openapi3.Info{
+		Title:   uuid.New(),
+		Version: "1",
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+
+	ctx.SetOASDefinition(req, oasDef)
+
+	b.ResetTimer()
+	for b.Loop() {
+		cloned := ctx.GetOASDefinition(req)
+		assert.Equal(b, oasDef, cloned)
+	}
+}
+
+// Benchmark for GetOASConfigData
+func BenchmarkGetOASConfigData(b *testing.B) {
+	expectedConfigData := map[string]interface{}{
+		"key": "value",
+	}
+	oasDefWithConfig := &oas.OAS{}
+	oasDefWithConfig.SetTykExtension(&oas.XTykAPIGateway{
+		Middleware: &oas.Middleware{
+			Global: &oas.Global{
+				PluginConfig: &oas.PluginConfig{
+					Data: &oas.PluginConfigData{
+						Value: expectedConfigData,
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+	ctx.SetOASDefinition(req, oasDefWithConfig)
+
+	b.ResetTimer()
+	for b.Loop() {
+		configData, err := ctx.GetOASConfigData(req)
+		assert.NoError(b, err)
+		assert.Equal(b, expectedConfigData, configData)
+	}
+}
+
+// TestContextKeyUniqueness verifies all context keys have unique values
+func TestContextKeyUniqueness(t *testing.T) {
+	keys := map[ctx.Key]string{
+		ctx.SessionData:               "SessionData",
+		ctx.UpdateSession:             "UpdateSession",
+		ctx.AuthToken:                 "AuthToken",
+		ctx.HashedAuthToken:           "HashedAuthToken",
+		ctx.VersionData:               "VersionData",
+		ctx.VersionName:               "VersionName",
+		ctx.VersionDefault:            "VersionDefault",
+		ctx.OrgSessionContext:         "OrgSessionContext",
+		ctx.ContextData:               "ContextData",
+		ctx.RetainHost:                "RetainHost",
+		ctx.TrackThisEndpoint:         "TrackThisEndpoint",
+		ctx.DoNotTrackThisEndpoint:    "DoNotTrackThisEndpoint",
+		ctx.UrlRewritePath:            "UrlRewritePath",
+		ctx.InternalRedirectTarget:    "InternalRedirectTarget",
+		ctx.RequestMethod:             "RequestMethod",
+		ctx.OrigRequestURL:            "OrigRequestURL",
+		ctx.LoopLevel:                 "LoopLevel",
+		ctx.LoopLevelLimit:            "LoopLevelLimit",
+		ctx.ThrottleLevel:             "ThrottleLevel",
+		ctx.ThrottleLevelLimit:        "ThrottleLevelLimit",
+		ctx.Trace:                     "Trace",
+		ctx.CheckLoopLimits:           "CheckLoopLimits",
+		ctx.UrlRewriteTarget:          "UrlRewriteTarget",
+		ctx.TransformedRequestMethod:  "TransformedRequestMethod",
+		ctx.Definition:                "Definition",
+		ctx.RequestStatus:             "RequestStatus",
+		ctx.GraphQLRequest:            "GraphQLRequest",
+		ctx.GraphQLIsWebSocketUpgrade: "GraphQLIsWebSocketUpgrade",
+		ctx.CacheOptions:              "CacheOptions",
+		ctx.OASDefinition:             "OASDefinition",
+		ctx.SelfLooping:               "SelfLooping",
+		ctx.RequestStartTime:          "RequestStartTime",
+		ctx.ErrorClassification:       "ErrorClassification",
+		ctx.JsonRPCRouting:            "JsonRPCRouting",
+		ctx.JSONRPCRequest:            "JSONRPCRequest",
+		ctx.JSONRPCRoutingState:       "JSONRPCRoutingState",
+		ctx.MCPRouting:                "MCPRouting",
+		ctx.MCPMethod:                 "MCPMethod",
+		ctx.MCPPrimitiveType:          "MCPPrimitiveType",
+		ctx.MCPPrimitiveName:          "MCPPrimitiveName",
+		ctx.JSONRPCErrorCode:          "JSONRPCErrorCode",
+		ctx.MCPProtocolContext:        "MCPProtocolContext",
+	}
+
+	seen := make(map[ctx.Key]bool)
+	for key, name := range keys {
+		if seen[key] {
+			t.Errorf("Duplicate context key value %d for %s", key, name)
+		}
+		seen[key] = true
+	}
+}
+
+// Test for GetErrorClassification
+func TestErrorClassificationContext(t *testing.T) {
+	t.Run("get returns nil when not set", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com", nil)
+		assert.Nil(t, ctx.GetErrorClassification(req))
+	})
+
+	t.Run("get returns set value", func(t *testing.T) {
+		errClass := errors.NewErrorClassification(errors.UCF, "connection_refused").
+			WithSource("ReverseProxy").
+			WithTarget("api.backend.com:443")
+
+		req := httptest.NewRequest("GET", "http://example.com", nil)
+		ctx.SetErrorClassification(req, errClass)
+		result := ctx.GetErrorClassification(req)
+
+		assert.Equal(t, errClass, result)
+		assert.Equal(t, errors.UCF, result.Flag)
+		assert.Equal(t, "connection_refused", result.Details)
+		assert.Equal(t, "ReverseProxy", result.Source)
+		assert.Equal(t, "api.backend.com:443", result.Target)
+	})
+
+	t.Run("TLS error with cert info", func(t *testing.T) {
+		expiry := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+		errClass := errors.NewErrorClassification(errors.TLE, "tls_certificate_expired").
+			WithSource("ReverseProxy").
+			WithTarget("api.backend.com:443").
+			WithTLSInfo(expiry, "CN=api.backend.com")
+
+		req := httptest.NewRequest("GET", "http://example.com", nil)
+		ctx.SetErrorClassification(req, errClass)
+		result := ctx.GetErrorClassification(req)
+
+		assert.Equal(t, errors.TLE, result.Flag)
+		assert.Equal(t, expiry, result.TLSCertExpiry)
+		assert.Equal(t, "CN=api.backend.com", result.TLSCertSubject)
+	})
+}
+
+func TestErrorClassificationContext_NilSafe(t *testing.T) {
+	t.Run("set nil does not panic", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com", nil)
+		assert.NotPanics(t, func() {
+			ctx.SetErrorClassification(req, nil)
+		})
+		// After setting nil, get should return nil
+		assert.Nil(t, ctx.GetErrorClassification(req))
+	})
+}

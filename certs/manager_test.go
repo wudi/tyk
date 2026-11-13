@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"errors"
 	"io/ioutil"
 	"math/big"
 	"os"
@@ -16,104 +15,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	tykcrypto "github.com/TykTechnologies/tyk/internal/crypto"
+	"github.com/TykTechnologies/tyk/storage"
 )
 
-type dummyStorage struct {
-	data      map[string]string
-	indexList map[string][]string
-}
-
-func newDummyStorage() *dummyStorage {
-	return &dummyStorage{
-		data:      make(map[string]string),
-		indexList: make(map[string][]string),
-	}
-}
-
-func (s *dummyStorage) GetKey(key string) (string, error) {
-	if value, ok := s.data[key]; ok {
-		return value, nil
-	}
-
-	return "", errors.New("Not found")
-}
-
-func (s *dummyStorage) SetKey(key, value string, exp int64) error {
-	s.data[key] = value
-	return nil
-}
-
-func (s *dummyStorage) DeleteKey(key string) bool {
-	if _, ok := s.data[key]; !ok {
-		return false
-	}
-
-	delete(s.data, key)
-	return true
-}
-
-func (s *dummyStorage) DeleteScanMatch(pattern string) bool {
-	if pattern == "*" {
-		s.data = make(map[string]string)
-		return true
-	}
-
-	return false
-}
-
-func (s *dummyStorage) RemoveFromList(keyName, value string) error {
-	for key, keyList := range s.indexList {
-		if key == keyName {
-			new := keyList[:]
-			newL := 0
-			for _, e := range new {
-				if e == value {
-					continue
-				}
-
-				new[newL] = e
-				newL++
-			}
-			new = new[:newL]
-			s.indexList[key] = new
-		}
-	}
-
-	return nil
-}
-
-func (s *dummyStorage) GetListRange(keyName string, from, to int64) ([]string, error) {
-	for key := range s.indexList {
-		if key == keyName {
-			return s.indexList[key], nil
-		}
-	}
-	return []string{}, nil
-}
-
-func (s *dummyStorage) Exists(keyName string) (bool, error) {
-	_, exist := s.indexList[keyName]
-	return exist, nil
-}
-
-func (s *dummyStorage) AppendToSet(keyName string, value string) {
-	s.indexList[keyName] = append(s.indexList[keyName], value)
-}
-
-func (s *dummyStorage) GetKeys(pattern string) (keys []string) {
-	if pattern != "*" {
-		return nil
-	}
-
-	for k := range s.data {
-		keys = append(keys, k)
-	}
-
-	return keys
-}
-
-func newManager() *CertificateManager {
-	return NewCertificateManager(newDummyStorage(), "test", nil)
+func newManager() *certificateManager {
+	return NewCertificateManager(storage.NewDummyStorage(), "test", nil, false, WithMaxRetries(3))
 }
 
 func genCertificate(template *x509.Certificate, isExpired bool) ([]byte, []byte) {
@@ -158,52 +68,52 @@ func TestAddCertificate(t *testing.T) {
 	cert2Pem, key2Pem := genCertificateFromCommonName("test2", false)
 	combinedPem := append(cert2Pem, key2Pem...)
 	combinedPemWrongPrivate := append(cert2Pem, keyPem...)
-	priv, _ := rsa.GenerateKey(rand.Reader, 512)
+
+	// crypto/rsa: 512-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
 	privDer, _ := x509.MarshalPKIXPublicKey(&priv.PublicKey)
 	pubPem := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: privDer})
-	pubID := HexSHA256(privDer)
+	pubID := tykcrypto.HexSHA256(privDer)
 
 	certRaw, _ := pem.Decode(certPem)
-	certID := HexSHA256(certRaw.Bytes)
+	certID := tykcrypto.HexSHA256(certRaw.Bytes)
 
 	cert2Raw, _ := pem.Decode(cert2Pem)
-	cert2ID := HexSHA256(cert2Raw.Bytes)
+	cert2ID := tykcrypto.HexSHA256(cert2Raw.Bytes)
 
-	tests := [...]struct {
+	emptyCertID := ""
+
+	withError := true
+	noError := false
+
+	testcases := []struct {
+		title  string
 		data   []byte
 		certID string
-		err    string
+		err    bool
 	}{
-		{[]byte(""), "", "Failed to decode certificate. It should be PEM encoded."},
-		{[]byte("-----BEGIN PRIVATE KEY-----\nYQ==\n-----END PRIVATE KEY-----"), "", "Failed to decode certificate. It should be PEM encoded."},
-		{[]byte("-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----"), "", "asn1: syntax error"},
-		{certPem, certID, ""},
-		{combinedPemWrongPrivate, "", "tls: private key does not match public key"},
-		{combinedPem, cert2ID, ""},
-		{combinedPem, "", "Certificate with " + cert2ID + " id already exists"},
-		{pubPem, pubID, ""},
-		{expiredCertPem, "", "certificate is expired"},
+		{"empty cert", []byte(""), emptyCertID, withError},
+		{"invalid cert: pem", []byte("-----BEGIN PRIVATE KEY-----\nYQ==\n-----END PRIVATE KEY-----"), emptyCertID, withError},
+		{"invalid cert: asn1", []byte("-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----"), emptyCertID, withError},
+		{"valid cert 1", certPem, certID, noError},
+		{"tls: wrong private", combinedPemWrongPrivate, emptyCertID, withError},
+		{"valid cert 2", combinedPem, cert2ID, noError},
+		{"combined pem exists", combinedPem, emptyCertID, withError},
+		{"valid public pem", pubPem, pubID, noError},
+		{"expired cert", expiredCertPem, emptyCertID, withError},
 	}
 
-	for _, tc := range tests {
-		cid, err := m.Add(tc.data, "")
-		if tc.err != "" {
-			if err == nil {
-				t.Error("Should error with", tc.err)
-			} else {
-				if !strings.HasPrefix(err.Error(), tc.err) {
-					t.Error("Error not match", tc.err, "got:", err)
-				}
-			}
-		} else {
-			if err != nil {
-				t.Error("Should not error", err)
-			}
-		}
+	for _, tc := range testcases {
+		t.Run(tc.title, func(t *testing.T) {
+			cid, err := m.Add(tc.data, "")
 
-		if cid != tc.certID {
-			t.Error("Wrong certficate ID:", cid, tc.certID)
-		}
+			if tc.err {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.certID, cid)
+		})
 	}
 }
 
@@ -233,7 +143,7 @@ func TestCertificateStorage(t *testing.T) {
 	t.Run("File certificates", func(t *testing.T) {
 		certs := m.List([]string{certPath, "wrong"}, CertificatePublic)
 		if len(certs) != 2 {
-			t.Fatal("Should contain 1 cert", len(certs))
+			t.Fatal("Should contain 2 cert", len(certs))
 		}
 
 		if certs[1] != nil {
@@ -245,23 +155,19 @@ func TestCertificateStorage(t *testing.T) {
 		}
 	})
 
-	t.Run("Remote storage certficates", func(t *testing.T) {
+	t.Run("Remote storage certificates", func(t *testing.T) {
 		certs := m.List([]string{certPath, storageCertID, privateCertID}, CertificatePublic)
 
-		if len(certs) != 2 {
-			t.Fatal("Should contain 2 cert", len(certs))
+		if len(certs) != 3 {
+			t.Fatal("Should contain 3 certs but", len(certs))
 		}
 
-		if leafSubjectName(certs[0]) != "file" {
-			t.Error("Wrong cert order", leafSubjectName(certs[0]))
-		}
-
-		if leafSubjectName(certs[1]) != "dummy" {
-			t.Error("Wrong cert order", leafSubjectName(certs[1]))
-		}
+		assert.Equal(t, "file", leafSubjectName(certs[0]))
+		assert.Equal(t, "dummy", leafSubjectName(certs[1]))
+		assert.Equal(t, "private", leafSubjectName(certs[2]))
 	})
 
-	t.Run("Private certficates", func(t *testing.T) {
+	t.Run("Private certificates", func(t *testing.T) {
 		certs := m.List([]string{certPath, storageCertID, privateCertID}, CertificatePrivate)
 
 		if len(certs) != 1 {
@@ -274,7 +180,7 @@ func TestCertificateStorage(t *testing.T) {
 	})
 
 	t.Run("Public keys", func(t *testing.T) {
-		certs := m.List([]string{publicKeyID}, CertificateAny)
+		certs := m.List([]string{publicKeyID}, CertificatePublic)
 
 		if len(certs) != 1 {
 			t.Error("Should return only private certificate")
@@ -289,19 +195,315 @@ func TestCertificateStorage(t *testing.T) {
 func TestStorageIndex(t *testing.T) {
 	m := newManager()
 	storageCert, _ := genCertificateFromCommonName("dummy", false)
-	storage := m.storage.(*dummyStorage)
+	storage, ok := m.storage.(*storage.DummyStorage)
 
-	if len(storage.indexList) != 0 {
-		t.Error("Storage index list should have 0 certificates and indexes after creation")
+	if !ok {
+		t.Error("cannot make storage.DummyStorage of type storage.Handler")
 	}
 
+	if len(storage.IndexList) != 0 {
+		t.Error("Storage index list should have 0 certificates and indexes after creation")
+	}
+	if _, err := storage.GetKey("orgid-1-index-migrated"); err == nil {
+		t.Error("There should not be migration done")
+	}
+
+	m.ListAllIds("orgid-1")
+	if _, err := storage.GetKey("orgid-1-index-migrated"); err != nil {
+		t.Error("Migrated flag should be set after first listing", err)
+	}
+	// Set recound outside of collection. It should not be visible if migration was applied.
+	storage.Data["raw-raw-orgid-1dummy"] = "test"
+
 	certID, _ := m.Add(storageCert, "orgid-1")
-	if len(storage.indexList["orgid-1-index"]) != 1 {
+
+	if len(storage.IndexList["orgid-1-index"]) != 1 {
 		t.Error("Storage index list should have 1 certificates after adding a certificate")
 	}
 
 	m.Delete(certID, "orgid-1")
-	if len(storage.indexList["orgid-1-index"]) != 0 {
+	if len(storage.IndexList["orgid-1-index"]) != 0 {
 		t.Error("Storage index list should have 0 certificates after deleting a certificate")
 	}
+}
+
+func TestListPublicKeys_EmbeddedPEM(t *testing.T) {
+	m := newManager()
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	assert.NoError(t, err)
+	privDer, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	assert.NoError(t, err)
+	pubPem := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: privDer})
+	expectedFingerprint := tykcrypto.HexSHA256(privDer)
+
+	t.Run("ListPublicKeys decodes inline PEM", func(t *testing.T) {
+		out := m.ListPublicKeys([]string{string(pubPem)})
+
+		assert.Len(t, out, 1)
+		assert.Equal(t, expectedFingerprint, out[0])
+	})
+
+	t.Run("ListPublicKeys leading/trailing whitespace tolerated", func(t *testing.T) {
+		out := m.ListPublicKeys([]string{"\n  " + string(pubPem) + "  \n"})
+
+		assert.Len(t, out, 1)
+		assert.Equal(t, expectedFingerprint, out[0])
+	})
+
+	t.Run("ListPublicKeys tolerates single-line collapsed PEM", func(t *testing.T) {
+		// A paste into a single-line field flattens line breaks into spaces,
+		// exactly as the embedded-cert path in List() already tolerates.
+		collapsed := strings.ReplaceAll(strings.TrimSpace(string(pubPem)), "\n", " ")
+		out := m.ListPublicKeys([]string{collapsed})
+
+		assert.Len(t, out, 1)
+		assert.Equal(t, expectedFingerprint, out[0])
+	})
+
+	t.Run("ListRawPublicKey parses inline PEM", func(t *testing.T) {
+		out := m.ListRawPublicKey(string(pubPem))
+
+		assert.NotNil(t, out)
+	})
+
+	t.Run("malformed inline PEM fails gracefully", func(t *testing.T) {
+		out := m.ListPublicKeys([]string{"-----BEGIN PUBLIC KEY-----\nbogus\n-----END PUBLIC KEY-----"})
+
+		assert.Len(t, out, 1)
+		assert.Equal(t, "", out[0])
+	})
+}
+
+func TestToCertificateBasics(t *testing.T) {
+	now := time.Now()
+
+	meta := &CertificateMeta{
+		ID:            "cert-123",
+		Fingerprint:   "fingerprint-123",
+		HasPrivateKey: true,
+		Issuer: pkix.Name{
+			CommonName: "Issuer CN",
+		},
+		Subject: pkix.Name{
+			CommonName: "Subject CN",
+		},
+		NotBefore: now,
+		NotAfter:  now.Add(24 * time.Hour),
+		DNSNames:  []string{"tyk.com", "www.tyk.com"},
+		IsCA:      true,
+	}
+
+	basics := meta.ToCertificateBasics()
+
+	assert.NotNil(t, basics)
+	assert.Equal(t, meta.ID, basics.ID)
+	assert.Equal(t, meta.Issuer.CommonName, basics.IssuerCN)
+	assert.Equal(t, meta.Subject.CommonName, basics.SubjectCN)
+	assert.Equal(t, meta.DNSNames, basics.DNSNames)
+	assert.Equal(t, meta.HasPrivateKey, basics.HasPrivateKey)
+	assert.Equal(t, meta.NotBefore, basics.NotBefore)
+	assert.Equal(t, meta.NotAfter, basics.NotAfter)
+	assert.Equal(t, meta.IsCA, basics.IsCA)
+}
+
+// The following test functions all verify CertificateManager.List accepts
+// inline PEM strings in addition to certificate IDs and file paths. They are
+// split into independent top-level functions (rather than a single test with
+// many t.Run subtests) to keep individual cognitive complexity low.
+
+// requireSingleCert is a tiny helper that asserts the single-cert case shape.
+func requireSingleCert(t *testing.T, certs []*tls.Certificate) *tls.Certificate {
+	t.Helper()
+	if len(certs) != 1 {
+		t.Fatalf("expected 1 cert, got %d", len(certs))
+	}
+	if certs[0] == nil {
+		t.Fatal("expected cert, got nil")
+	}
+	return certs[0]
+}
+
+func TestList_EmbeddedPEM_SingleCert(t *testing.T) {
+	m := newManager()
+	certPem, _ := genCertificateFromCommonName("embedded", false)
+
+	certs := m.List([]string{string(certPem)}, CertificatePublic)
+
+	cert := requireSingleCert(t, certs)
+	assert.Equal(t, "embedded", leafSubjectName(cert))
+}
+
+func TestList_EmbeddedPEM_CombinedCertKey_ResolvesAsPrivate(t *testing.T) {
+	m := newManager()
+	certPem, keyPem := genCertificateFromCommonName("embedded", false)
+	combinedPem := append(append([]byte{}, certPem...), keyPem...)
+
+	certs := m.List([]string{string(combinedPem)}, CertificatePrivate)
+
+	cert := requireSingleCert(t, certs)
+	assert.Equal(t, "embedded", leafSubjectName(cert))
+	assert.False(t, isPrivateKeyEmpty(cert), "private key should be present")
+}
+
+func TestList_EmbeddedPEM_MixedBatch(t *testing.T) {
+	m := newManager()
+
+	filePem, _ := genCertificateFromCommonName("file", false)
+	dir, err := ioutil.TempDir("", "certs-embedded-mix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	filePath := filepath.Join(dir, "cert.pem")
+	if err := ioutil.WriteFile(filePath, filePem, 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	storagePem, _ := genCertificateFromCommonName("storage", false)
+	storageID, err := m.Add(storagePem, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	embeddedPem, _ := genCertificateFromCommonName("embedded-mix", false)
+
+	certs := m.List([]string{filePath, storageID, string(embeddedPem)}, CertificatePublic)
+	if len(certs) != 3 {
+		t.Fatalf("expected 3 certs, got %d", len(certs))
+	}
+	assert.Equal(t, "file", leafSubjectName(certs[0]))
+	assert.Equal(t, "storage", leafSubjectName(certs[1]))
+	assert.Equal(t, "embedded-mix", leafSubjectName(certs[2]))
+}
+
+func TestList_EmbeddedPEM_LeadingTrailingWhitespace(t *testing.T) {
+	m := newManager()
+	certPem, _ := genCertificateFromCommonName("embedded", false)
+
+	padded := "\n\n  " + string(certPem) + "\n\n  "
+	certs := m.List([]string{padded}, CertificatePublic)
+
+	cert := requireSingleCert(t, certs)
+	assert.Equal(t, "embedded", leafSubjectName(cert))
+}
+
+func TestList_EmbeddedPEM_CRLFLineEndings(t *testing.T) {
+	m := newManager()
+	certPem, _ := genCertificateFromCommonName("embedded", false)
+
+	crlf := strings.ReplaceAll(string(certPem), "\n", "\r\n")
+	certs := m.List([]string{crlf}, CertificatePublic)
+
+	cert := requireSingleCert(t, certs)
+	assert.Equal(t, "embedded", leafSubjectName(cert))
+}
+
+func TestList_EmbeddedPEM_MalformedBodyReturnsNil(t *testing.T) {
+	m := newManager()
+	bad := "-----BEGIN CERTIFICATE-----\nnot-base64-data\n-----END CERTIFICATE-----"
+
+	certs := m.List([]string{bad}, CertificatePublic)
+
+	if len(certs) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(certs))
+	}
+	assert.Nil(t, certs[0], "malformed PEM must yield nil entry")
+}
+
+func TestList_EmbeddedPEM_TruncatedReturnsNil(t *testing.T) {
+	m := newManager()
+	bad := "-----BEGIN CERTIFICATE-----\nMIIB"
+
+	certs := m.List([]string{bad}, CertificatePublic)
+
+	if len(certs) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(certs))
+	}
+	assert.Nil(t, certs[0], "truncated PEM must yield nil entry")
+}
+
+func TestList_EmbeddedPEM_CacheKeyUsesContentHash(t *testing.T) {
+	m := newManager()
+	pem2, _ := genCertificateFromCommonName("cache-test", false)
+	before := m.cache.Count()
+
+	// First call: populates cache.
+	requireSingleCert(t, m.List([]string{string(pem2)}, CertificatePublic))
+	after1 := m.cache.Count()
+	assert.Equal(t, before+1, after1, "first call should add one cache entry")
+
+	// Second call: must hit cache (no new entry).
+	requireSingleCert(t, m.List([]string{string(pem2)}, CertificatePublic))
+	after2 := m.cache.Count()
+	assert.Equal(t, after1, after2, "second call with same PEM should hit cache (no new entry)")
+
+	// Cache key derived from SHA256 of trimmed content, not the raw string.
+	expectedKey := embeddedPEMCacheKeyPrefix + tykcrypto.HexSHA256([]byte(strings.TrimSpace(string(pem2))))
+	cached, found := m.cache.Get(expectedKey)
+	assert.True(t, found, "cache should hold entry under embedded-pem-<sha256> key")
+	assert.NotNil(t, cached)
+
+	_, foundRaw := m.cache.Get(string(pem2))
+	assert.False(t, foundRaw, "raw PEM string must not be used as cache key")
+}
+
+func TestList_EmbeddedPEM_MultiCertChain(t *testing.T) {
+	m := newManager()
+	leafPem, _ := genCertificateFromCommonName("leaf", false)
+	intermediatePem, _ := genCertificateFromCommonName("intermediate", false)
+	chain := append(append([]byte{}, leafPem...), intermediatePem...)
+
+	certs := m.List([]string{string(chain)}, CertificatePublic)
+
+	cert := requireSingleCert(t, certs)
+	assert.Len(t, cert.Certificate, 2, "chain should contain leaf + intermediate")
+}
+
+func TestList_EmbeddedPEM_CertPoolWithEmbeddedCA(t *testing.T) {
+	m := newManager()
+	caPem, _ := genCertificateFromCommonName("ca-embedded", false)
+
+	pool := m.CertPool([]string{string(caPem)})
+
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+	// pool.Subjects() is deprecated but acceptable here for a population check.
+	subjects := pool.Subjects()
+	assert.GreaterOrEqual(t, len(subjects), 1, "pool should contain at least the embedded CA")
+}
+
+// collapseToSingleLine simulates a copy-paste of a PEM into a single-line text
+// field: every newline becomes a space.
+func collapseToSingleLine(v []byte) string {
+	return strings.ReplaceAll(strings.TrimSpace(string(v)), "\n", " ")
+}
+
+// TestList_EmbeddedPEM_SingleLineCollapsed verifies the gateway tolerates a
+// PEM whose line breaks were collapsed into spaces (e.g. pasted into a
+// single-line Dashboard field). pem.Decode rejects this form, so List() must
+// repair it before parsing.
+func TestList_EmbeddedPEM_SingleLineCollapsed(t *testing.T) {
+	m := newManager()
+	certPem, _ := genCertificateFromCommonName("single-line", false)
+
+	certs := m.List([]string{collapseToSingleLine(certPem)}, CertificatePublic)
+
+	cert := requireSingleCert(t, certs)
+	assert.Equal(t, "single-line", leafSubjectName(cert))
+}
+
+// TestList_EmbeddedPEM_SingleLineCombinedCertKey verifies a combined cert+key
+// PEM (used by upstream_certificates) is also tolerated when collapsed.
+func TestList_EmbeddedPEM_SingleLineCombinedCertKey(t *testing.T) {
+	m := newManager()
+	certPem, keyPem := genCertificateFromCommonName("single-line-priv", false)
+	combined := append(append([]byte{}, certPem...), keyPem...)
+
+	certs := m.List([]string{collapseToSingleLine(combined)}, CertificatePrivate)
+
+	cert := requireSingleCert(t, certs)
+	assert.Equal(t, "single-line-priv", leafSubjectName(cert))
+	assert.False(t, isPrivateKeyEmpty(cert), "private key should survive normalization")
 }

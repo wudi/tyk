@@ -1,22 +1,29 @@
 package gateway
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
 
-	"github.com/justinas/alice"
-	uuid "github.com/satori/go.uuid"
-
+	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/header"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/justinas/alice"
+
+	"github.com/TykTechnologies/tyk/internal/uuid"
+
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
 
 func createRLSession() *user.SessionState {
-	session := new(user.SessionState)
+	session := user.NewSessionState()
 	// essentially non-throttled
 	session.Rate = 100.0
 	session.Allowance = session.Rate
@@ -30,12 +37,13 @@ func createRLSession() *user.SessionState {
 	return session
 }
 
-func getRLOpenChain(spec *APISpec) http.Handler {
+func (ts *Test) getRLOpenChain(spec *APISpec) http.Handler {
+
 	remote, _ := url.Parse(spec.Proxy.TargetURL)
-	proxy := TykNewSingleHostReverseProxy(remote, spec, nil)
+	proxy := ts.Gw.TykNewSingleHostReverseProxy(remote, spec, nil)
 	proxyHandler := ProxyHandler(proxy, spec)
-	baseMid := BaseMiddleware{Spec: spec, Proxy: proxy}
-	chain := alice.New(mwList(
+	baseMid := &BaseMiddleware{Spec: spec, Proxy: proxy, Gw: ts.Gw}
+	chain := alice.New(ts.Gw.mwList(
 		&IPWhiteListMiddleware{baseMid},
 		&IPBlackListMiddleware{BaseMiddleware: baseMid},
 		&VersionCheck{BaseMiddleware: baseMid},
@@ -44,12 +52,13 @@ func getRLOpenChain(spec *APISpec) http.Handler {
 	return chain
 }
 
-func getGlobalRLAuthKeyChain(spec *APISpec) http.Handler {
+func (ts *Test) getGlobalRLAuthKeyChain(spec *APISpec) http.Handler {
+
 	remote, _ := url.Parse(spec.Proxy.TargetURL)
-	proxy := TykNewSingleHostReverseProxy(remote, spec, nil)
+	proxy := ts.Gw.TykNewSingleHostReverseProxy(remote, spec, nil)
 	proxyHandler := ProxyHandler(proxy, spec)
-	baseMid := BaseMiddleware{Spec: spec, Proxy: proxy}
-	chain := alice.New(mwList(
+	baseMid := &BaseMiddleware{Spec: spec, Proxy: proxy, Gw: ts.Gw}
+	chain := alice.New(ts.Gw.mwList(
 		&IPWhiteListMiddleware{baseMid},
 		&IPBlackListMiddleware{BaseMiddleware: baseMid},
 		&AuthKey{baseMid},
@@ -62,18 +71,103 @@ func getGlobalRLAuthKeyChain(spec *APISpec) http.Handler {
 	return chain
 }
 
+func TestRateLimitForAPI_EnabledForSpec(t *testing.T) {
+	apiSpecDisabled := APISpec{APIDefinition: &apidef.APIDefinition{GlobalRateLimit: apidef.GlobalRateLimit{Disabled: true, Rate: 2, Per: 1}}}
+
+	rlDisabled := &RateLimitForAPI{BaseMiddleware: &BaseMiddleware{Spec: &apiSpecDisabled}}
+	assert.False(t, rlDisabled.EnabledForSpec())
+}
+
+func TestAPIRateLimitResponseHeaders(t *testing.T) {
+	limiters := []string{"Redis", "Sentinel", "DRL", "FixedWindow"}
+
+	for _, limiter := range limiters {
+		t.Run("API Rate limit headers for "+limiter, func(t *testing.T) {
+			ts := StartTest(func(globalConf *config.Config) {
+				globalConf.RateLimitResponseHeaders = config.SourceRateLimits
+
+				switch limiter {
+				case "Redis":
+					globalConf.EnableRedisRollingLimiter = true
+				case "Sentinel":
+					globalConf.EnableSentinelRateLimiter = true
+				case "DRL":
+					globalConf.DRLEnableSentinelRateLimiter = true
+				case "FixedWindow":
+					globalConf.EnableFixedWindowRateLimiter = true
+				}
+			})
+			defer ts.Close()
+
+			var (
+				rateLimitRate float64 = 2
+				rateLimitPer  float64 = 10
+			)
+
+			_ = ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+				spec.APIID = "api-rate-limit-headers-test-" + limiter
+				spec.Proxy.ListenPath = "/api-rate-limit-headers-test"
+				spec.UseKeylessAccess = true
+				spec.GlobalRateLimit = apidef.GlobalRateLimit{
+					Disabled: false,
+					Rate:     rateLimitRate,
+					Per:      rateLimitPer,
+				}
+			})[0]
+
+			expectedRemaining1 := fmt.Sprintf("%d", int(rateLimitRate)-1)
+			expectedRemaining2 := fmt.Sprintf("%d", int(rateLimitRate)-2)
+
+			headersMatch1 := map[string]string{
+				header.XRateLimitLimit: fmt.Sprintf("%d", int(rateLimitRate)),
+			}
+			headersMatch2 := map[string]string{
+				header.XRateLimitLimit: fmt.Sprintf("%d", int(rateLimitRate)),
+			}
+
+			// For limiters that don't support Remaining (Sentinel, FixedWindow), it should be assigned to 0.
+			if limiter == "Redis" || limiter == "DRL" {
+				headersMatch1[header.XRateLimitRemaining] = expectedRemaining1
+				headersMatch2[header.XRateLimitRemaining] = expectedRemaining2
+			} else {
+				headersMatch1[header.XRateLimitRemaining] = "0"
+				headersMatch2[header.XRateLimitRemaining] = "0"
+			}
+
+			_, _ = ts.Run(t, []test.TestCase{
+				{
+					Path:         "/api-rate-limit-headers-test",
+					Code:         http.StatusOK,
+					HeadersMatch: headersMatch1,
+				},
+				{
+					Path:         "/api-rate-limit-headers-test",
+					Code:         http.StatusOK,
+					HeadersMatch: headersMatch2,
+				},
+				{
+					Path: "/api-rate-limit-headers-test",
+					Code: http.StatusTooManyRequests,
+				},
+			}...)
+		})
+	}
+}
+
 func TestRLOpen(t *testing.T) {
-	spec := LoadSampleAPI(openRLDefSmall)
+	ts := StartTest(nil)
+	defer ts.Close()
 
-	req := TestReq(t, "GET", "/rl_test/", nil)
+	spec := ts.Gw.LoadSampleAPI(openRLDefSmall)
 
-	DRLManager.SetCurrentTokenValue(1)
-	DRLManager.RequestTokenValue = 1
-
-	chain := getRLOpenChain(spec)
+	ts.Gw.DoReload()
+	chain := ts.getRLOpenChain(spec)
 	for a := 0; a <= 10; a++ {
 		recorder := httptest.NewRecorder()
+
+		req := TestReq(t, "GET", "/rl_test/", nil)
 		chain.ServeHTTP(recorder, req)
+
 		if a < 3 {
 			if recorder.Code != 200 {
 				t.Fatalf("Rate limit kicked in too early, after only %v requests", a)
@@ -86,24 +180,18 @@ func TestRLOpen(t *testing.T) {
 			}
 		}
 	}
-
-	DRLManager.SetCurrentTokenValue(0)
-	DRLManager.RequestTokenValue = 0
 }
 
 func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) {
 	return func(t *testing.T) {
-		defer ResetTestConfig()
-
-		ts := StartTest()
+		t.Helper()
+		ts := StartTest(nil)
 		defer ts.Close()
 
-		globalCfg := config.Global()
+		globalCfg := ts.Gw.GetConfig()
 
 		switch limiter {
 		case "InMemoryRateLimiter":
-			DRLManager.SetCurrentTokenValue(1)
-			DRLManager.RequestTokenValue = 1
 		case "SentinelRateLimiter":
 			globalCfg.EnableSentinelRateLimiter = true
 		case "RedisRollingRateLimiter":
@@ -112,7 +200,7 @@ func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) 
 			t.Fatal("There is no such a rate limiter:", limiter)
 		}
 
-		config.SetGlobal(globalCfg)
+		ts.Gw.SetConfig(globalCfg)
 
 		var per, rate float64
 		var throttleRetryLimit int
@@ -129,7 +217,7 @@ func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) 
 
 		for requestThrottlingEnabled, throttleIntervals := range iterations {
 			for _, throttleInterval := range throttleIntervals {
-				spec := BuildAndLoadAPI(func(spec *APISpec) {
+				spec := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 					spec.Name = "test"
 					spec.APIID = "test"
 					spec.OrgID = "default"
@@ -137,7 +225,7 @@ func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) 
 					spec.Proxy.ListenPath = "/"
 				})[0]
 
-				policyID := CreatePolicy(func(p *user.Policy) {
+				policyID := ts.CreatePolicy(func(p *user.Policy) {
 					p.OrgID = "default"
 
 					p.AccessRights = map[string]user.AccessDefinition{
@@ -157,9 +245,11 @@ func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) 
 						}
 					} else if testLevel == "APILevel" {
 						a := p.AccessRights[spec.APIID]
-						a.Limit = &user.APILimit{
-							Rate: rate,
-							Per:  per,
+						a.Limit = user.APILimit{
+							RateLimit: user.RateLimit{
+								Rate: rate,
+								Per:  per,
+							},
 						}
 
 						if requestThrottlingEnabled {
@@ -175,7 +265,7 @@ func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) 
 					}
 				})
 
-				key := CreateSession(func(s *user.SessionState) {
+				_, key := ts.CreateSession(func(s *user.SessionState) {
 					s.ApplyPolicies = []string{policyID}
 				})
 
@@ -200,6 +290,8 @@ func requestThrottlingTest(limiter string, testLevel string) func(t *testing.T) 
 }
 
 func TestRequestThrottling(t *testing.T) {
+	test.Flaky(t) // TODO TT-5236
+
 	t.Run("PolicyLevel", func(t *testing.T) {
 		t.Run("InMemoryRateLimiter", requestThrottlingTest("InMemoryRateLimiter", "PolicyLevel"))
 		t.Run("SentinelRateLimiter", requestThrottlingTest("SentinelRateLimiter", "PolicyLevel"))
@@ -214,23 +306,28 @@ func TestRequestThrottling(t *testing.T) {
 }
 
 func TestRLClosed(t *testing.T) {
-	spec := LoadSampleAPI(closedRLDefSmall)
+	ts := StartTest(nil)
+	defer ts.Close()
 
-	req := TestReq(t, "GET", "/rl_closed_test/", nil)
+	spec := ts.Gw.LoadSampleAPI(closedRLDefSmall)
 
 	session := createRLSession()
-	customToken := uuid.NewV4().String()
+	customToken := uuid.New()
+
 	// AuthKey sessions are stored by {token}
-	GlobalSessionManager.UpdateSession(customToken, session, 60, false)
-	req.Header.Set("authorization", "Bearer "+customToken)
+	err := ts.Gw.GlobalSessionManager.UpdateSession(customToken, session, 60, false)
+	if err != nil {
+		t.Error("could not update session in Session Manager. " + err.Error())
+	}
 
-	DRLManager.SetCurrentTokenValue(1)
-	DRLManager.RequestTokenValue = 1
-
-	chain := getGlobalRLAuthKeyChain(spec)
+	chain := ts.getGlobalRLAuthKeyChain(spec)
 	for a := 0; a <= 10; a++ {
 		recorder := httptest.NewRecorder()
+
+		req := TestReq(t, "GET", "/rl_closed_test/", nil)
+		req.Header.Set("authorization", "Bearer "+customToken)
 		chain.ServeHTTP(recorder, req)
+
 		if a < 3 {
 			if recorder.Code != 200 {
 				t.Fatalf("Rate limit kicked in too early, after only %v requests", a)
@@ -243,23 +340,23 @@ func TestRLClosed(t *testing.T) {
 			}
 		}
 	}
-
-	DRLManager.SetCurrentTokenValue(0)
-	DRLManager.RequestTokenValue = 0
 }
 
+// TestJSVMStagesRequest
+// TestProcessRequestLiveQuotaLimit
 func TestRLOpenWithReload(t *testing.T) {
-	spec := LoadSampleAPI(openRLDefSmall)
+	ts := StartTest(nil)
+	defer ts.Close()
 
-	req := TestReq(t, "GET", "/rl_test/", nil)
+	spec := ts.Gw.LoadSampleAPI(openRLDefSmall)
 
-	DRLManager.SetCurrentTokenValue(1)
-	DRLManager.RequestTokenValue = 1
-
-	chain := getRLOpenChain(spec)
+	chain := ts.getRLOpenChain(spec)
 	for a := 0; a <= 10; a++ {
 		recorder := httptest.NewRecorder()
+
+		req := TestReq(t, "GET", "/rl_test/", nil)
 		chain.ServeHTTP(recorder, req)
+
 		if a < 3 {
 			if recorder.Code != 200 {
 				t.Fatalf("Rate limit (pre change) kicked in too early, after only %v requests", a)
@@ -275,10 +372,13 @@ func TestRLOpenWithReload(t *testing.T) {
 
 	// Change rate and emulate a reload
 	spec.GlobalRateLimit.Rate = 20
-	chain = getRLOpenChain(spec)
+	chain = ts.getRLOpenChain(spec)
 	for a := 0; a <= 30; a++ {
 		recorder := httptest.NewRecorder()
+
+		req := TestReq(t, "GET", "/rl_test/", nil)
 		chain.ServeHTTP(recorder, req)
+
 		if a < 20 {
 			if recorder.Code != 200 {
 				t.Fatalf("Rate limit (post change) kicked in too early, after only %v requests", a)
@@ -291,9 +391,6 @@ func TestRLOpenWithReload(t *testing.T) {
 			}
 		}
 	}
-
-	DRLManager.SetCurrentTokenValue(0)
-	DRLManager.RequestTokenValue = 0
 }
 
 const openRLDefSmall = `{

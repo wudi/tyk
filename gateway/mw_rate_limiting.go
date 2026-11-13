@@ -7,18 +7,17 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/TykTechnologies/tyk/ctx"
+	tykerrors "github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/event"
+	"github.com/TykTechnologies/tyk/internal/httpctx"
 	"github.com/TykTechnologies/tyk/request"
-
-	gql "github.com/jensneuse/graphql-go-tools/pkg/graphql"
 )
-
-var sessionLimiter = SessionLimiter{}
-var sessionMonitor = Monitor{}
 
 // RateLimitAndQuotaCheck will check the incomming request and key whether it is within it's quota and
 // within it's rate limit, it makes use of the SessionLimiter object to do this
 type RateLimitAndQuotaCheck struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (k *RateLimitAndQuotaCheck) Name() string {
@@ -29,25 +28,11 @@ func (k *RateLimitAndQuotaCheck) EnabledForSpec() bool {
 	return !k.Spec.DisableRateLimit || !k.Spec.DisableQuota
 }
 
-func (k *RateLimitAndQuotaCheck) handleRateLimitFailure(r *http.Request, token string) (error, int) {
-	k.Logger().WithField("key", obfuscateKey(token)).Info("Key rate limit exceeded.")
-
-	// Fire a rate limit exceeded event
-	k.FireEvent(EventRateLimitExceeded, EventKeyFailureMeta{
-		EventMetaDefault: EventMetaDefault{Message: "Key Rate Limit Exceeded", OriginatingRequest: EncodeRequestToEvent(r)},
-		Path:             r.URL.Path,
-		Origin:           request.RealIP(r),
-		Key:              token,
-	})
-
-	// Report in health check
-	reportHealthValue(k.Spec, Throttle, "-1")
-
-	return errors.New("Rate limit exceeded"), http.StatusTooManyRequests
-}
-
 func (k *RateLimitAndQuotaCheck) handleQuotaFailure(r *http.Request, token string) (error, int) {
-	k.Logger().WithField("key", obfuscateKey(token)).Info("Key quota limit exceeded.")
+	k.Logger().WithField("key", k.Gw.obfuscateKey(token)).Info("Key quota limit exceeded.")
+
+	// Set error classification for access logs
+	ctx.SetErrorClassification(r, tykerrors.ClassifyQuotaExceededError(k.Name()))
 
 	// Fire a quota exceeded event
 	k.FireEvent(EventQuotaExceeded, EventKeyFailureMeta{
@@ -75,35 +60,46 @@ func (k *RateLimitAndQuotaCheck) ProcessRequest(w http.ResponseWriter, r *http.R
 	}
 
 	session := ctxGetSession(r)
-	token := ctxGetAuthToken(r)
-
-	// If MaxQueryDepth is -1 or 0, it means unlimited and no need for depth limiting.
-	if k.Spec.GraphQL.Enabled && session.MaxQueryDepth > 0 {
-		gqlRequest := ctxGetGraphQLRequest(r)
-
-		complexityRes, err := gqlRequest.CalculateComplexity(gql.DefaultComplexityCalculator, k.Spec.GraphQLExecutor.Schema)
-		if err != nil {
-			k.Logger().Errorf("Error while calculating complexity of GraphQL request: '%s'", err)
-			return errors.New("there was a problem proxying the request"), http.StatusInternalServerError
+	mcpVirtualEndpoint := isMCPJSONRPCVirtualEndpointLoop(k.Spec, r)
+	if mcpVirtualEndpoint {
+		// Public ingress already consumed the credential's global rate and
+		// quota. VEM hops must still enforce matching credential endpoint limits;
+		// RateLimitForAPI only enforces API-owned middleware limits.
+		if k.Spec.DisableRateLimit {
+			return nil, http.StatusOK
 		}
+		accessDef, _, err := GetAccessDefinitionByAPIIDOrSession(session, k.Spec)
+		if err == nil {
+			if _, matched := k.Gw.SessionLimiter.RateLimitInfo(r, k.Spec, accessDef.Endpoints); !matched {
+				return nil, http.StatusOK
+			}
+		}
+	}
+	enableQuota := !k.Spec.DisableQuota && !mcpVirtualEndpoint
+	rateLimitKey := ctxGetAuthToken(r)
+	quotaKey := ""
 
-		if complexityRes.Depth > session.MaxQueryDepth {
-			k.Logger().Debugf("Complexity of the request is higher than the allowed limit '%d'", session.MaxQueryDepth)
-			return errors.New("depth limit exceeded"), http.StatusForbidden
+	if pattern, found := session.MetaData["rate_limit_pattern"]; found {
+		if patternString, ok := pattern.(string); ok && patternString != "" {
+			if customKeyValue := k.Gw.ReplaceTykVariables(r, patternString, false); customKeyValue != "" {
+				rateLimitKey = customKeyValue
+				quotaKey = customKeyValue
+			}
 		}
 	}
 
-	storeRef := GlobalSessionManager.Store()
-	reason := sessionLimiter.ForwardMessage(
+	limitHeader := k.Gw.limitHeaderFactory(w.Header())
+
+	reason := k.Gw.SessionLimiter.ForwardMessage(
 		r,
 		session,
-		token,
-		storeRef,
+		rateLimitKey,
+		quotaKey,
 		!k.Spec.DisableRateLimit,
-		!k.Spec.DisableQuota,
-		&k.Spec.GlobalConfig,
-		k.Spec.APIID,
+		enableQuota,
+		k.Spec,
 		false,
+		limitHeader,
 	)
 
 	throttleRetryLimit := session.ThrottleRetryLimit
@@ -111,32 +107,37 @@ func (k *RateLimitAndQuotaCheck) ProcessRequest(w http.ResponseWriter, r *http.R
 
 	if len(session.AccessRights) > 0 {
 		if rights, ok := session.AccessRights[k.Spec.APIID]; ok {
-			if rights.Limit != nil {
+			if !rights.Limit.IsEmpty() {
 				throttleInterval = rights.Limit.ThrottleInterval
 				throttleRetryLimit = rights.Limit.ThrottleRetryLimit
 			}
 		}
 	}
 
+	k.emitRateLimitEvents(r, rateLimitKey)
+	headerSender := k.Gw.limitHeaderFactory(w.Header())
+
 	switch reason {
 	case sessionFailNone:
 	case sessionFailRateLimit:
-		err, errCode := k.handleRateLimitFailure(r, token)
+		// Set error classification for access logs
+		ctx.SetErrorClassification(r, tykerrors.ClassifyRateLimitError(tykerrors.ErrTypeSessionRateLimit, k.Name()))
+		err, errCode := k.handleRateLimitFailure(r, event.RateLimitExceeded, "Rate Limit Exceeded", rateLimitKey)
 		if throttleRetryLimit > 0 {
 			for {
 				ctxIncThrottleLevel(r, throttleRetryLimit)
 				time.Sleep(time.Duration(throttleInterval * float64(time.Second)))
 
-				reason = sessionLimiter.ForwardMessage(
+				reason = k.Gw.SessionLimiter.ForwardMessage(
 					r,
 					session,
-					token,
-					storeRef,
+					rateLimitKey,
+					quotaKey,
 					!k.Spec.DisableRateLimit,
-					!k.Spec.DisableQuota,
-					&k.Spec.GlobalConfig,
-					k.Spec.APIID,
+					enableQuota,
+					k.Spec,
 					true,
+					headerSender,
 				)
 
 				log.WithFields(logrus.Fields{
@@ -156,16 +157,24 @@ func (k *RateLimitAndQuotaCheck) ProcessRequest(w http.ResponseWriter, r *http.R
 		return err, errCode
 
 	case sessionFailQuota:
-		return k.handleQuotaFailure(r, token)
+		return k.handleQuotaFailure(r, rateLimitKey)
+	case sessionFailInternalServerError:
+		ctx.SetErrorClassification(r, tykerrors.ClassifyRateLimitError(tykerrors.ErrTypeOtherRateLimit, k.Name()))
+		return ProxyingRequestFailedErr, http.StatusInternalServerError
 	default:
+		ctx.SetErrorClassification(r, tykerrors.ClassifyRateLimitError(tykerrors.ErrTypeOtherRateLimit, k.Name()))
 		// Other reason? Still not allowed
 		return errors.New("Access denied"), http.StatusForbidden
 	}
 	// Run the trigger monitor
 	if k.Spec.GlobalConfig.Monitor.MonitorUserKeys {
-		sessionMonitor.Check(session, token)
+		k.Gw.SessionMonitor.Check(session, rateLimitKey)
 	}
 
 	// Request is valid, carry on
 	return nil, http.StatusOK
+}
+
+func isMCPJSONRPCVirtualEndpointLoop(spec *APISpec, r *http.Request) bool {
+	return spec != nil && spec.IsMCP() && httpctx.IsSelfLooping(r) && httpctx.GetJSONRPCRoutingState(r) != nil
 }

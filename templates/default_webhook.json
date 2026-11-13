@@ -34,6 +34,50 @@
     "path": "{{.Meta.Path}}",
     "Status": "{{.Meta.CircuitEvent}}"
 }
+{{ else if eq .Type "BreakerTripped"}}
+{
+    "event": "{{.Type}}",
+    "message": "{{.Meta.Message}}",
+    "api_id": "{{.Meta.APIID}}",
+    "path": "{{.Meta.Path}}"
+}
+{{ else if eq .Type "BreakerReset"}}
+{
+    "event": "{{.Type}}",
+    "message": "{{.Meta.Message}}",
+    "api_id": "{{.Meta.APIID}}",
+    "path": "{{.Meta.Path}}"
+}
+{{ else if eq .Type "UpstreamOAuthError"}}
+{
+    "event": "{{.Type}}",
+    "message": "{{.Meta.Message}}",
+    "api_id": "{{.Meta.APIID}}",
+}
+{{ else if eq .Type "CertificateExpiringSoon"}}
+{
+  "event": "{{.Type}}",
+  "message": "{{.Meta.Message}}",
+  "cert_id": "{{.Meta.CertID}}",
+  "cert_name": "{{.Meta.CertName}}",
+  "expires_at": "{{.Meta.ExpiresAt | as_rfc3339}}",
+  "days_remaining": {{.Meta.DaysRemaining}},
+  "cert_role": "{{.Meta.CertRole}}",{{if .Meta.APIID}}
+  "api_id": "{{.Meta.APIID}}",{{end}}
+  "timestamp": "{{.TimeStamp | as_rfc3339_from_string}}"
+}
+{{ else if eq .Type "CertificateExpired"}}
+{
+  "event": "{{.Type}}",
+  "message": "{{.Meta.Message}}",
+  "cert_id": "{{.Meta.CertID}}",
+  "cert_name": "{{.Meta.CertName}}",
+  "expired_at": "{{.Meta.ExpiredAt | as_rfc3339}}",
+  "days_since_expiry": {{.Meta.DaysSinceExpiry}},
+  "cert_role": "{{.Meta.CertRole}}",{{if .Meta.APIID}}
+  "api_id": "{{.Meta.APIID}}",{{end}}
+  "timestamp": "{{.TimeStamp | as_rfc3339_from_string}}"
+}
 {{ else}}
 {
     "event": "{{.Type}}",

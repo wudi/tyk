@@ -1,22 +1,120 @@
 package gateway
 
-// appendIfMissing appends the given new item to the given slice.
-func appendIfMissing(slice []string, newSlice ...string) []string {
-	for _, new := range newSlice {
-		found := false
-		for _, item := range slice {
-			if item == new {
-				continue
-			}
-			found = true
-		}
+import (
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
 
-		if !found {
-			slice = append(slice, new)
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/internal/middleware"
+)
+
+// jsonEscapeString encodes s as a JSON string and strips the surrounding
+// quotes, producing a value safe to splice into an existing JSON string
+// literal. This is necessary when substituting secret values (which may
+// contain newlines, quotes, or other special characters) directly into a
+// raw JSON document.
+func jsonEscapeString(s string) string {
+	const hex = "0123456789abcdef"
+
+	escapeIdx := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' {
+			escapeIdx = i
+			break
 		}
 	}
 
-	return slice
+	if escapeIdx == -1 {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	b.WriteString(s[:escapeIdx])
+
+	for i := escapeIdx; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 {
+
+				b.WriteString(`\u00`)
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&0xF])
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+
+	return b.String()
+}
+
+// appendIfMissing ensures dest slice is unique with new items.
+func appendIfMissing(src []string, in ...string) []string {
+	// Use map for uniqueness
+	srcMap := map[string]bool{}
+	for _, v := range src {
+		srcMap[v] = true
+	}
+	for _, v := range in {
+		srcMap[v] = true
+	}
+
+	// Produce unique []string, maintain sort order
+	uniqueSorted := func(src []string, keys map[string]bool) []string {
+		result := make([]string, 0, len(keys))
+		for _, v := range src {
+			// append missing value
+			if val := keys[v]; val {
+				result = append(result, v)
+				delete(keys, v)
+			}
+		}
+		return result
+	}
+
+	// no new items from `in`
+	if len(srcMap) == len(src) {
+		return src
+	}
+
+	src = uniqueSorted(src, srcMap)
+	in = uniqueSorted(in, srcMap)
+
+	return append(src, in...)
+}
+
+// intersection gets intersection of the given two slices.
+func intersection(a []string, b []string) (inter []string) {
+	m := make(map[string]bool)
+
+	for _, item := range a {
+		m[item] = true
+	}
+
+	for _, item := range b {
+		if _, ok := m[item]; ok {
+			inter = append(inter, item)
+		}
+	}
+
+	return
 }
 
 // contains checks whether the given slice contains the given item.
@@ -69,4 +167,152 @@ func greaterThanInt(first, second int) bool {
 	}
 
 	return first > second
+}
+
+func getAPIURL(apiDef apidef.APIDefinition, gwConfig config.Config) string {
+	var result = url.URL{
+		Scheme: "http",
+		Host:   apiDef.GetAPIDomain(),
+		Path:   apiDef.Proxy.ListenPath,
+	}
+
+	if gwConfig.HttpServerOptions.UseSSL {
+		result.Scheme = "https"
+	}
+
+	// apiDef has priority
+	if result.Host != "" {
+		return result.String()
+	}
+
+	result.Host = gwConfig.ListenAddress
+	if gwConfig.HostName != "" {
+		result.Host = gwConfig.HostName
+	}
+
+	if result.Host == "" {
+		result.Host = "127.0.0.1"
+	}
+
+	// Skip adding ListenPort for http/80, https/443
+	if result.Scheme == "http" && gwConfig.ListenPort == 80 ||
+		result.Scheme == "https" && gwConfig.ListenPort == 443 {
+		return result.String()
+	}
+
+	result.Host = net.JoinHostPort(result.Host, strconv.Itoa(gwConfig.ListenPort))
+
+	return result.String()
+}
+
+func shouldReloadSpec(existingSpec, newSpec *APISpec) bool {
+	if existingSpec == nil {
+		return true
+	}
+
+	if newSpec.IsSyntheticMCPAdapter() {
+		return true
+	}
+
+	if existingSpec.Checksum != newSpec.Checksum {
+		return true
+	}
+
+	if newSpec.hasVirtualEndpoint() {
+		return true
+	}
+
+	if !newSpec.CustomMiddlewareBundleDisabled && newSpec.CustomMiddlewareBundle != "" {
+		return true
+	}
+
+	if newSpec.CustomMiddleware.Driver == apidef.GrpcDriver {
+		return false
+	}
+
+	if middleware.Enabled(newSpec.CustomMiddleware.AuthCheck) {
+		return true
+	}
+
+	if middleware.Enabled(newSpec.CustomMiddleware.Pre...) {
+		return true
+	}
+
+	if middleware.Enabled(newSpec.CustomMiddleware.PostKeyAuth...) {
+		return true
+	}
+
+	if middleware.Enabled(newSpec.CustomMiddleware.Post...) {
+		return true
+	}
+
+	if middleware.Enabled(newSpec.CustomMiddleware.Response...) {
+		return true
+	}
+
+	return false
+}
+
+// check if 2 maps are the same
+func areMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// checks if a string contains escaped characters
+func containsEscapedChars(str string) bool {
+	unescaped, err := url.PathUnescape(str)
+	if err != nil {
+		return true
+	}
+
+	return str != unescaped
+}
+
+func resolveTLSVersions(userMin, userMax uint16) (uint16, uint16, error) {
+	const defaultMin = tls.VersionTLS12
+	const defaultMax = tls.VersionTLS13
+
+	resMin := userMin
+	resMax := userMax
+
+	if resMin == 0 {
+		resMin = defaultMin
+	}
+
+	if resMax == 0 {
+		resMax = defaultMax
+	}
+
+	switch {
+	case userMin != 0 && userMax == 0 && resMin > defaultMax:
+		return 0, 0, fmt.Errorf(
+			"provided minTLS (%s) exceeds the default maximum TLS version (%s); provide both versions explicitly",
+			tls.VersionName(userMin),
+			tls.VersionName(defaultMax),
+		)
+
+	case userMax != 0 && userMin == 0 && resMax < defaultMin:
+		return 0, 0, fmt.Errorf(
+			"provided maxTLS (%s) is lower than the default minimum TLS version (%s); provide both versions explicitly",
+			tls.VersionName(userMax),
+			tls.VersionName(defaultMin),
+		)
+
+	case userMin != 0 && userMax != 0 && userMin > userMax:
+		return 0, 0, fmt.Errorf(
+			"TLS validation error: minTLS (0x%X / %s) cannot be greater than maxTLS (0x%X / %s)",
+			userMin, tls.VersionName(userMin),
+			userMax, tls.VersionName(userMax),
+		)
+	}
+
+	return resMin, resMax, nil
 }
